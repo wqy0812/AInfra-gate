@@ -1,0 +1,461 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AI Gate Management",
+    "version": "0.4.0",
+    "description": "独立管理监听器；必须使用管理 Bearer 密钥。操作异步执行，浏览器断开不取消。维护锁成功后才可进行实际重启。 后端新增/编辑同步保存，不自动预热或切流；只允许编辑已排空的非活动端。"
+  },
+  "security": [
+    {
+      "adminBearer": []
+    }
+  ],
+  "paths": {
+    "/admin/v1/status": {
+      "get": {
+        "summary": "查看当前路由、占用、维护锁及操作历史",
+        "responses": {
+          "200": {
+            "description": "管理状态或操作摘要"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/operations/{id}": {
+      "get": {
+        "summary": "查询最近 100 个操作之一",
+        "responses": {
+          "200": {
+            "description": "管理状态或操作摘要"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/warmups": {
+      "post": {
+        "summary": "定向预热，不切流",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/OperationRequest"
+                  },
+                  {
+                    "required": [
+                      "target"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已受理或返回相同 operation_id 的既有结果"
+          },
+          "409": {
+            "description": "路由版本过期、操作冲突或后端未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/switches": {
+      "post": {
+        "summary": "预热、切流并等待排空",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/OperationRequest"
+                  },
+                  {
+                    "required": [
+                      "target"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已受理或返回相同 operation_id 的既有结果"
+          },
+          "409": {
+            "description": "路由版本过期、操作冲突或后端未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/backends/{id}/maintenance": {
+      "post": {
+        "summary": "排空后锁定后端，不执行重启",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已受理或返回相同 operation_id 的既有结果"
+          },
+          "409": {
+            "description": "路由版本过期、操作冲突或后端未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/backends/{id}/restore": {
+      "post": {
+        "summary": "验证并解除维护锁，不切流",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已受理或返回相同 operation_id 的既有结果"
+          },
+          "409": {
+            "description": "路由版本过期、操作冲突或后端未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/backends/{id}/confirm-drain": {
+      "post": {
+        "summary": "人工核对下游后确认旧请求已结束",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已受理或返回相同 operation_id 的既有结果"
+          },
+          "409": {
+            "description": "路由版本过期、操作冲突或后端未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/admin/v1/backends": {
+      "get": {
+        "summary": "读取脱敏后端配置、凭据来源、顺序和配置版本",
+        "responses": {
+          "200": {
+            "description": "revision、config_version、order、backends；静态请求头不返回值，环境变量返回引用与前缀。"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "summary": "在线新增后端，保存后尚未验证",
+        "description": "最大 64 KiB。新增 target 必填，backend 中必须包含 url 和 models_url。相同 operation_id 和请求可重试；保留最近 100 个操作。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackendWriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "配置已持久化并生效，返回已完成操作摘要"
+          },
+          "409": {
+            "description": "版本过期、操作冲突、名称重复、当前接流或未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/admin/v1/backends/{id}": {
+      "patch": {
+        "summary": "在线编辑已排空的非活动后端",
+        "description": "最大 64 KiB；清除旧预热结果与该端自动回切资格，保留维护锁；请求不触发预热或切流。省略 credentials 或其中的请求头即保留原值。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackendWriteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "配置已持久化并生效，返回已完成操作摘要"
+          },
+          "409": {
+            "description": "版本过期、操作冲突、名称重复、当前接流或未排空"
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "adminBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "OperationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "expected_revision"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "target": {
+            "type": "string"
+          }
+        }
+      },
+      "HeaderChange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "action"
+        ],
+        "description": "keep 保留，delete 删除，replace 替换。替换时仅提供 value 或 env；prefix 仅用于 env。静态值只写不读。",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "keep",
+              "replace",
+              "delete"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "env": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string"
+          }
+        }
+      },
+      "BackendPatch": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "PATCH 省略字段保持不变；提供的顶层字段整体替换。创建时必须给出 url 和 models_url。",
+        "properties": {
+          "adapter": {
+            "type": "string",
+            "enum": [
+              "openai"
+            ],
+            "default": "openai"
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "models_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "preferred_model": {
+            "type": "string",
+            "nullable": true
+          },
+          "models_list_path": {
+            "type": "string"
+          },
+          "model_id_path": {
+            "type": "string"
+          },
+          "overrides": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "compatibility": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "metadata_values": {
+                "type": "string",
+                "enum": [
+                  "",
+                  "preserve",
+                  "json_string",
+                  "workspace_object_json_string"
+                ]
+              },
+              "drop_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "BackendWriteRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "expected_revision",
+          "backend"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "target": {
+            "type": "string",
+            "description": "新增必填；编辑可省略，提供时必须与路径一致。"
+          },
+          "backend": {
+            "$ref": "#/components/schemas/BackendPatch"
+          },
+          "credentials": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/HeaderChange"
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "脱敏错误，包含 error.code/message/request_id/operation_id"
+      }
+    }
+  }
+}

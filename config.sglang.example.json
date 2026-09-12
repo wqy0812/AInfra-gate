@@ -1,0 +1,19 @@
+{
+  "public_model_name": "my-model",
+  "timeout_seconds": 1860,
+  "discovery_timeout_seconds": 10,
+  "model_cache_seconds": 60,
+  "discovery_retry_seconds": 5,
+  "routing": {"mode": "single", "backend": "sglang"},
+  "backends": {
+    "sglang": {
+      "adapter": "openai",
+      "url": "http://127.0.0.1:10017/v1/chat/completions",
+      "models_url": "http://127.0.0.1:10017/v1/models",
+      "compatibility": {
+        "metadata_values": "workspace_object_json_string",
+        "drop_fields": []
+      }
+    }
+  }
+}

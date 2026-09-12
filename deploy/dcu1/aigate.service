@@ -1,0 +1,21 @@
+[Unit]
+Description=AI Gate DCU gateway
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/data4/aigate
+EnvironmentFile=/data4/aigate/admin.env
+ExecStart=/data4/aigate/current/aigate serve --config /data4/aigate/config.json --listen 0.0.0.0:10015 --shutdown-timeout 32m
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=33min
+KillSignal=SIGTERM
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
