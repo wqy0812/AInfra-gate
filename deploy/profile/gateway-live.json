@@ -1,0 +1,82 @@
+{
+  "active_backend": "dcu",
+  "route_version": 1,
+  "binary_sha256": "4276248060794022dc3ee9fe90814d84d4f6ade04763fdf7cb6014f9986f0742",
+  "protocol": [
+    {
+      "stream": false,
+      "usage": {
+        "prompt_tokens": 7,
+        "total_tokens": 9,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "seconds": 0.445,
+      "semantic_output": true
+    },
+    {
+      "stream": true,
+      "usage": {
+        "prompt_tokens": 7,
+        "total_tokens": 9,
+        "completion_tokens": 2,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 0
+      },
+      "seconds": 0.38,
+      "semantic_output": true
+    }
+  ],
+  "profile": {
+    "domains": [
+      {
+        "backend": "dcu",
+        "model": "DeepSeek-V4-Flash-FP8-Channel"
+      }
+    ],
+    "dropped_events": 0,
+    "index_entries": 1,
+    "index_lookback_seconds": 3600,
+    "index_ready": false,
+    "max_analysis_seconds": 86400,
+    "prefix_unit": "messages",
+    "queue_events": 0,
+    "retained_end": 1789267348.6466768,
+    "retained_start": 1789264570.7984867,
+    "schema": "gateway-profile-v1",
+    "started_at": 1789267122.884802,
+    "stored_bytes": 7501,
+    "write_errors": 0
+  },
+  "baseline_smoke": {
+    "start": 1789267609.9680717,
+    "completed_at": 1789267610.7263265,
+    "protocol": [
+      {
+        "stream": false,
+        "usage": {
+          "prompt_tokens": 7,
+          "total_tokens": 9,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "reasoning_tokens": 0
+        },
+        "semantic_output": true,
+        "seconds": 0.379
+      },
+      {
+        "stream": true,
+        "usage": {
+          "prompt_tokens": 7,
+          "total_tokens": 9,
+          "completion_tokens": 2,
+          "prompt_tokens_details": null,
+          "reasoning_tokens": 0
+        },
+        "semantic_output": true,
+        "seconds": 0.379
+      }
+    ]
+  }
+}

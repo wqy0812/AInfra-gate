@@ -1,0 +1,847 @@
+package main
+
+// Request profiling is observational. No profile failure changes a business response.
+import (
+	"bufio"
+	"container/list"
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var profileLevels = []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
+var profileLengthBuckets = []float64{256, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576}
+var profileTimeBuckets = []float64{.01, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
+var profileCountBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
+
+type ProfileConfig struct {
+	Enabled         bool   `json:"enabled"`
+	Listen          string `json:"listen"`
+	APIKeyEnv       string `json:"api_key_env"`
+	Directory       string `json:"directory"`
+	RetentionHours  int    `json:"retention_hours"`
+	MaxDiskBytes    int64  `json:"max_disk_bytes"`
+	MaxIndexEntries int    `json:"max_index_entries"`
+	QueueEvents     int    `json:"queue_events"`
+	MaxPayloadBytes int    `json:"max_payload_bytes"`
+}
+
+func (c *ProfileConfig) defaults(path string) {
+	if c.Listen == "" {
+		c.Listen = "127.0.0.1:18082"
+	}
+	if c.APIKeyEnv == "" {
+		c.APIKeyEnv = "AIGATE_PROFILE_KEY"
+	}
+	if c.Directory == "" {
+		c.Directory = "request-profile"
+	}
+	if !filepath.IsAbs(c.Directory) {
+		p, _ := filepath.Abs(path)
+		c.Directory = filepath.Join(filepath.Dir(p), c.Directory)
+	}
+	if c.RetentionHours == 0 {
+		c.RetentionHours = 72
+	}
+	if c.MaxDiskBytes == 0 {
+		c.MaxDiskBytes = 10 << 30
+	}
+	if c.MaxIndexEntries == 0 {
+		c.MaxIndexEntries = 100000
+	}
+	if c.QueueEvents == 0 {
+		c.QueueEvents = 2048
+	}
+	if c.MaxPayloadBytes == 0 {
+		c.MaxPayloadBytes = 4 << 20
+	}
+}
+func (c ProfileConfig) validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if _, _, e := net.SplitHostPort(c.Listen); e != nil {
+		return fmt.Errorf("profile.listen: %w", e)
+	}
+	if os.Getenv(c.APIKeyEnv) == "" {
+		return fmt.Errorf("profile requires %s", c.APIKeyEnv)
+	}
+	if c.Directory == "" || c.RetentionHours < 1 || c.RetentionHours > 720 || c.MaxDiskBytes < 1<<20 || c.MaxIndexEntries < 1 || c.MaxIndexEntries > 1000000 || c.QueueEvents < 1 || c.QueueEvents > 8192 || c.MaxPayloadBytes < 1024 || c.MaxPayloadBytes > 16<<20 {
+		return fmt.Errorf("invalid profile resource limits")
+	}
+	return nil
+}
+
+type profileSegmentMeta struct {
+	Min   float64 `json:"min_arrival"`
+	Max   float64 `json:"max_arrival"`
+	Bytes int64   `json:"bytes"`
+}
+
+type profileMark struct {
+	Level  int    `json:"level"`
+	Bytes  int    `json:"bytes"`
+	Digest string `json:"digest"`
+}
+type profileEvent struct {
+	Kind     string          `json:"kind"`
+	ID       string          `json:"request_id"`
+	Boot     string          `json:"boot"`
+	Seq      uint64          `json:"sequence"`
+	At       float64         `json:"at"`
+	Arrived  float64         `json:"arrived"`
+	Backend  string          `json:"backend,omitempty"`
+	Model    string          `json:"model,omitempty"`
+	Domain   string          `json:"domain,omitempty"`
+	Stream   bool            `json:"stream,omitempty"`
+	Bytes    int             `json:"bytes,omitempty"`
+	Messages int             `json:"messages,omitempty"`
+	Tools    int             `json:"tools,omitempty"`
+	Marks    []profileMark   `json:"marks,omitempty"`
+	Outcome  string          `json:"outcome,omitempty"`
+	Usage    json.RawMessage `json:"usage,omitempty"`
+	First    *float64        `json:"first_seconds,omitempty"`
+	Duration float64         `json:"duration_seconds,omitempty"`
+	Quality  string          `json:"quality,omitempty"`
+}
+type profileRequest struct {
+	e       profileEvent
+	start   time.Time
+	tags    string
+	usage   json.RawMessage
+	first   *float64
+	quality string
+	outcome string
+}
+type profileContextKey struct{}
+type profileSeen struct {
+	key string
+	at  time.Time
+	seq uint64
+}
+type profileJob struct {
+	ID      string       `json:"id"`
+	State   string       `json:"state"`
+	Created float64      `json:"created_at"`
+	Error   string       `json:"error,omitempty"`
+	Result  any          `json:"result,omitempty"`
+	Query   profileQuery `json:"query"`
+}
+type profileQuery struct {
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Backend string  `json:"backend,omitempty"`
+	Model   string  `json:"model,omitempty"`
+}
+type requestProfiler struct {
+	c              ProfileConfig
+	key            []byte
+	boot           string
+	counterStarted float64
+	started        time.Time
+	emitMu         sync.RWMutex
+	closed         bool
+	mu             sync.Mutex
+	active         map[uint64]struct{}
+	values         map[string]float64
+	types          map[string]string
+	groups         map[string]bool
+	domains        map[string]map[string]string
+	index          map[string]*list.Element
+	lru            *list.List
+	observations   uint64
+	indexReset     time.Time
+	seq            atomic.Uint64
+	dropped        atomic.Uint64
+	writes         atomic.Uint64
+	queue          chan []byte
+	done           chan struct{}
+	closeOnce      sync.Once
+	diskMu         sync.Mutex
+	files          []string
+	oldest         float64
+	storedBytes    int64
+	lastWrite      float64
+	jobsMu         sync.Mutex
+	jobs           map[string]*profileJob
+	work           chan string
+	cancel         context.CancelFunc
+	workers        sync.WaitGroup
+}
+
+func newRequestProfiler(c ProfileConfig) (*requestProfiler, error) {
+	if e := os.MkdirAll(c.Directory, 0700); e != nil {
+		return nil, e
+	}
+	keyPath := filepath.Join(c.Directory, "hmac.key")
+	key, e := os.ReadFile(keyPath)
+	if os.IsNotExist(e) {
+		key = make([]byte, 32)
+		if _, e = rand.Read(key); e != nil {
+			return nil, e
+		}
+		f, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return nil, err
+		}
+		_, e = f.Write(key)
+		f.Close()
+	}
+	if e != nil {
+		return nil, e
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("profile HMAC key must contain 32 bytes")
+	}
+	now := time.Now()
+	p := &requestProfiler{c: c, key: key, boot: randomID(), started: now, indexReset: now, values: map[string]float64{}, types: map[string]string{}, groups: map[string]bool{}, domains: map[string]map[string]string{}, index: map[string]*list.Element{}, lru: list.New(), queue: make(chan []byte, c.QueueEvents), done: make(chan struct{}), jobs: map[string]*profileJob{}, work: make(chan string, 4)}
+	p.counterStarted = profileNow()
+	p.restoreCounters()
+	p.add("requests_started_total", "", 0)
+	p.add("requests_inflight", "", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.cancel = cancel
+	p.refreshFiles()
+	p.workers.Add(2)
+	go func() { defer p.workers.Done(); p.writer() }()
+	go func() { defer p.workers.Done(); p.analyzer(ctx) }()
+	return p, nil
+}
+func (p *requestProfiler) close() {
+	p.closeOnce.Do(func() {
+		p.cancel()
+		p.emitMu.Lock()
+		p.closed = true
+		close(p.queue)
+		p.emitMu.Unlock()
+		p.workers.Wait()
+		p.saveCounters()
+	})
+}
+func profileNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
+func (p *requestProfiler) add(name, tags string, n float64) {
+	p.values["aigate_"+name+tags] += n
+	kind := "counter"
+	if name == "requests_inflight" {
+		kind = "gauge"
+	}
+	p.types["aigate_"+name] = kind
+}
+func (p *requestProfiler) hist(name, tags string, n float64, buckets []float64) {
+	if n < 0 || math.IsNaN(n) || math.IsInf(n, 0) {
+		return
+	}
+	p.types["aigate_"+name] = "histogram"
+	p.values["aigate_"+name+"_sum"+tags] += n
+	p.values["aigate_"+name+"_count"+tags]++
+	for _, b := range buckets {
+		key := "aigate_" + name + "_bucket" + profileExtra(tags, "le", strconv.FormatFloat(b, 'g', -1, 64))
+		if n <= b {
+			p.values[key]++
+		} else {
+			p.values[key] += 0
+		}
+	}
+	p.values["aigate_"+name+"_bucket"+profileExtra(tags, "le", "+Inf")]++
+}
+func profileExtra(tags, key, value string) string {
+	if tags == "" {
+		return "{" + key + "=" + strconv.Quote(value) + "}"
+	}
+	return strings.TrimSuffix(tags, "}") + "," + key + "=" + strconv.Quote(value) + "}"
+}
+func (p *requestProfiler) tags(backend, model string) string {
+	t := "{backend=" + strconv.Quote(backend) + ",model=" + strconv.Quote(model) + "}"
+	if !p.groups[t] && len(p.groups) >= 64 {
+		t = `{backend="overflow",model="overflow"}`
+	}
+	if !p.groups[t] {
+		p.values["aigate_profile_group_start_time_seconds"+t] = profileNow()
+		p.types["aigate_profile_group_start_time_seconds"] = "gauge"
+		for _, name := range []string{"prompt_tokens_total", "completion_tokens_total", "cached_tokens_total", "cache_prompt_tokens_total", "cache_usage_known_total"} {
+			p.add(name, t, 0)
+		}
+		for _, field := range []string{"prompt_tokens", "completion_tokens"} {
+			p.add("usage_known_total", profileExtra(t, "field", field), 0)
+			p.add("usage_missing_total", profileExtra(t, "field", field), 0)
+		}
+	}
+	p.groups[t] = true
+	return t
+}
+func (p *requestProfiler) emit(e profileEvent) {
+	p.emitMu.RLock()
+	defer p.emitMu.RUnlock()
+	if p.closed {
+		return
+	}
+	b := encodeJSON(e)
+	if len(b) > 16<<10 {
+		p.dropped.Add(1)
+		return
+	}
+	select {
+	case p.queue <- b:
+	default:
+		p.dropped.Add(1)
+	}
+}
+func (p *requestProfiler) begin(id string) *profileRequest {
+	r := &profileRequest{start: time.Now(), e: profileEvent{Kind: "start", ID: id, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
+	r.e.Arrived = r.e.At
+	p.mu.Lock()
+	if p.active == nil {
+		p.active = make(map[uint64]struct{})
+	}
+	p.active[r.e.Seq] = struct{}{}
+	p.add("requests_started_total", "", 1)
+	p.add("requests_inflight", "", 1)
+	p.mu.Unlock()
+	p.emit(r.e)
+	return r
+}
+func (p *requestProfiler) digest(b []byte) string {
+	h := hmac.New(sha256.New, p.key)
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
+}
+func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, backend, model string) {
+	r.e.Backend = backend
+	r.e.Model = model
+	p.mu.Lock()
+	r.tags = p.tags(backend, model)
+	p.add("requests_routed_total", r.tags, 1)
+	p.hist("request_bytes", r.tags, float64(len(payload)), profileLengthBuckets)
+	p.mu.Unlock()
+	r.e.Kind = "input"
+	r.e.At = profileNow()
+	r.e.Bytes = len(payload)
+	if len(payload) > p.c.MaxPayloadBytes {
+		r.quality = "payload_limit"
+		r.e.Quality = r.quality
+		p.emit(r.e)
+		return
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(payload, &fields) != nil {
+		r.quality = "input_parse"
+		return
+	}
+	var messages []json.RawMessage
+	var tools []json.RawMessage
+	if json.Unmarshal(fields["messages"], &messages) != nil {
+		r.quality = "unsupported_input"
+		return
+	}
+	_ = json.Unmarshal(fields["tools"], &tools)
+	_ = json.Unmarshal(fields["stream"], &r.e.Stream)
+	r.e.Messages = len(messages)
+	r.e.Tools = len(tools)
+	// Preserve all non-message prompt extensions in the comparison domain. Exclude only known non-rendering controls.
+	for _, k := range []string{"messages", "stream", "stream_options", "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "seed", "stop", "frequency_penalty", "presence_penalty", "n", "metadata", "user"} {
+		delete(fields, k)
+	}
+	// Canonicalize JSON objects without altering string whitespace, number spelling or array order.
+	var canonical any
+	_ = decodeJSON(encodeJSON(fields), &canonical)
+	r.e.Domain = p.digest(encodeJSON([]any{"message-prefix-v1", backend, model, b.URL, b.Adapter, b.Compatibility, b.RequestTemplate, canonical}))
+	h := hmac.New(sha256.New, p.key)
+	h.Write([]byte(r.e.Domain))
+	size := 0
+	levelIndex := 0
+	for i, m := range messages {
+		if i >= 512 {
+			break
+		}
+		var v any
+		if decodeJSON(m, &v) != nil {
+			r.quality = "input_parse"
+			break
+		}
+		cb := encodeJSON(v)
+		size += len(cb)
+		fmt.Fprintf(h, "%d:", len(cb))
+		h.Write(cb)
+		if levelIndex < len(profileLevels) && i+1 == profileLevels[levelIndex] {
+			r.e.Marks = append(r.e.Marks, profileMark{i + 1, size, hex.EncodeToString(h.Sum(nil))})
+			levelIndex++
+		}
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.domains) < 64 {
+		p.domains[r.e.Domain] = map[string]string{"backend": backend, "model": model}
+	}
+	p.hist("message_count", r.tags, float64(len(messages)), profileCountBuckets)
+	p.hist("tool_count", r.tags, float64(len(tools)), profileCountBuckets)
+	for p.lru.Len() > 0 {
+		old := p.lru.Back().Value.(profileSeen)
+		if now.Sub(old.at) <= time.Hour {
+			break
+		}
+		delete(p.index, old.key)
+		p.lru.Remove(p.lru.Back())
+	}
+	p.observations++
+	for _, m := range r.e.Marks {
+		tags := profileExtra(r.tags, "level", strconv.Itoa(m.Level))
+		p.add("prefix_eligible_total", tags, 1)
+		p.add("prefix_repeated_total", tags, 0)
+		key := r.e.Domain + ":" + m.Digest
+		if elem := p.index[key]; elem != nil {
+			last := elem.Value.(profileSeen)
+			p.add("prefix_repeated_total", tags, 1)
+			p.hist("prefix_gap_seconds", tags, now.Sub(last.at).Seconds(), profileTimeBuckets)
+			gap := float64(0)
+			if p.observations > last.seq {
+				gap = float64(p.observations - last.seq)
+			}
+			p.hist("prefix_gap_requests", tags, gap, profileCountBuckets)
+			p.lru.Remove(elem)
+		}
+		p.index[key] = p.lru.PushFront(profileSeen{key, now, p.observations})
+	}
+	for len(p.index) > p.c.MaxIndexEntries {
+		elem := p.lru.Back()
+		delete(p.index, elem.Value.(profileSeen).key)
+		p.lru.Remove(elem)
+		p.add("profile_index_evictions_total", "", 1)
+		p.indexReset = now
+	}
+	p.emit(r.e)
+}
+func profileUsage(raw json.RawMessage) map[string]uint64 {
+	out := map[string]uint64{}
+	var f map[string]json.RawMessage
+	_ = json.Unmarshal(usageCounters(raw), &f)
+	for _, k := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+		var n uint64
+		if v, ok := f[k]; ok && json.Unmarshal(v, &n) == nil {
+			out[k] = n
+		}
+	}
+	var d map[string]json.RawMessage
+	_ = json.Unmarshal(f["prompt_tokens_details"], &d)
+	var n uint64
+	if v, ok := d["cached_tokens"]; ok && json.Unmarshal(v, &n) == nil {
+		out["cached_tokens"] = n
+	}
+	return out
+}
+func profileBucket(n uint64) string {
+	for _, b := range profileLengthBuckets {
+		if float64(n) <= b {
+			return strconv.FormatFloat(b, 'g', -1, 64)
+		}
+	}
+	return "+Inf"
+}
+func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bool) {
+	e := r.e
+	e.Kind = "end"
+	e.At = profileNow()
+	e.Marks = nil
+	e.Outcome = entry.Outcome
+	if r.outcome != "" {
+		e.Outcome = r.outcome
+	}
+	if cancelled {
+		e.Outcome = "client_cancelled"
+	}
+	e.Usage = usageCounters(r.usage)
+	e.First = r.first
+	e.Duration = time.Since(r.start).Seconds()
+	e.Quality = r.quality
+	p.mu.Lock()
+	delete(p.active, r.e.Seq)
+	if r.tags == "" {
+		r.tags = p.tags("unrouted", "unknown")
+	}
+	p.add("requests_inflight", "", -1)
+	p.add("requests_ended_total", profileExtra(r.tags, "outcome", e.Outcome), 1)
+	p.hist("request_duration_seconds", r.tags, e.Duration, profileTimeBuckets)
+	if e.First != nil {
+		p.hist("first_increment_seconds", r.tags, *e.First, profileTimeBuckets)
+	}
+	u := profileUsage(e.Usage)
+	in, iok := u["prompt_tokens"]
+	out, ook := u["completion_tokens"]
+	for _, k := range []string{"prompt_tokens", "completion_tokens"} {
+		if n, ok := u[k]; ok {
+			p.add(k+"_total", r.tags, float64(n))
+			p.hist(k, r.tags, float64(n), profileLengthBuckets)
+			p.add("usage_known_total", profileExtra(r.tags, "field", k), 1)
+		} else {
+			p.add("usage_missing_total", profileExtra(r.tags, "field", k), 1)
+		}
+	}
+	if iok && ook {
+		tags := profileExtra(profileExtra(r.tags, "input_le", profileBucket(in)), "output_le", profileBucket(out))
+		p.add("token_pairs_total", tags, 1)
+	}
+	if n, ok := u["cached_tokens"]; ok && iok && n <= in {
+		p.add("cached_tokens_total", r.tags, float64(n))
+		p.add("cache_prompt_tokens_total", r.tags, float64(in))
+		p.add("cache_usage_known_total", r.tags, 1)
+	}
+	if r.quality != "" {
+		p.add("profile_parse_failures_total", profileExtra(r.tags, "reason", r.quality), 1)
+	}
+	p.mu.Unlock()
+	p.emit(e)
+}
+func (p *requestProfiler) refreshFiles() {
+	p.diskMu.Lock()
+	defer p.diskMu.Unlock()
+	p.refreshFilesLocked()
+}
+func (p *requestProfiler) refreshFilesLocked() {
+	files, _ := filepath.Glob(filepath.Join(p.c.Directory, "events-*.jsonl"))
+	sort.Strings(files)
+	var total int64
+	kept := []string{}
+	cutoff := time.Now().Add(-time.Duration(p.c.RetentionHours) * time.Hour)
+	for _, path := range files {
+		s, e := os.Stat(path)
+		if e != nil {
+			continue
+		}
+		if s.ModTime().Before(cutoff) {
+			if os.Remove(path) != nil {
+				p.writes.Add(1)
+			}
+			_ = os.Remove(path + ".meta.json")
+			_ = os.Remove(path + ".meta.tmp")
+			continue
+		}
+		kept = append(kept, path)
+		total += s.Size()
+		if ts := float64(s.ModTime().UnixNano()) / 1e9; s.Size() > 0 && ts > p.lastWrite {
+			p.lastWrite = ts
+		}
+	}
+	for total > p.c.MaxDiskBytes && len(kept) > 1 {
+		s, _ := os.Stat(kept[0])
+		if os.Remove(kept[0]) != nil {
+			p.writes.Add(1)
+			break
+		}
+		_ = os.Remove(kept[0] + ".meta.json")
+		_ = os.Remove(kept[0] + ".meta.tmp")
+		total -= s.Size()
+		kept = kept[1:]
+	}
+	p.files = kept
+	p.storedBytes = total
+	p.oldest = profileNow()
+	if len(kept) > 0 {
+		base := strings.TrimPrefix(filepath.Base(kept[0]), "events-")
+		if n, e := strconv.ParseInt(strings.Split(base, "-")[0], 10, 64); e == nil {
+			p.oldest = float64(n) / 1000
+		}
+		if f, err := os.Open(kept[0]); err == nil {
+			line, _, _ := bufio.NewReader(f).ReadLine()
+			var event profileEvent
+			if json.Unmarshal(line, &event) == nil && event.Arrived > 0 {
+				p.oldest = event.Arrived
+			}
+			f.Close()
+		}
+	}
+}
+func (p *requestProfiler) writer() {
+	defer close(p.done)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var f *os.File
+	var opened time.Time
+	var size int64
+	var path string
+	var meta profileSegmentMeta
+	flushMeta := func() {
+		if f == nil {
+			return
+		}
+		tmp := path + ".meta.tmp"
+		if err := os.WriteFile(tmp, encodeJSON(meta), 0600); err != nil {
+			p.writes.Add(1)
+			return
+		}
+		if os.Rename(tmp, path+".meta.json") != nil {
+			p.writes.Add(1)
+		}
+	}
+	closeFile := func() {
+		if f != nil {
+			if f.Sync() != nil {
+				p.writes.Add(1)
+			}
+			flushMeta()
+			f.Close()
+			f = nil
+		}
+	}
+	defer closeFile()
+	for {
+		select {
+		case b, ok := <-p.queue:
+			if !ok {
+				return
+			}
+			if f == nil || size >= min(p.c.MaxDiskBytes/2, 4<<20) || time.Since(opened) >= time.Minute {
+				closeFile()
+				opened = time.Now()
+				path = filepath.Join(p.c.Directory, fmt.Sprintf("events-%013d-%s.jsonl", opened.UnixMilli(), randomID()))
+				var err error
+				f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+				size = 0
+				meta = profileSegmentMeta{}
+				if err != nil {
+					p.writes.Add(1)
+					continue
+				}
+				p.refreshFiles()
+			}
+			n, err := f.Write(append(b, '\n'))
+			if err != nil {
+				p.writes.Add(1)
+				closeFile()
+				continue
+			}
+			size += int64(n)
+			meta.Bytes = size
+			var event profileEvent
+			if json.Unmarshal(b, &event) == nil {
+				if meta.Min == 0 || event.Arrived < meta.Min {
+					meta.Min = event.Arrived
+				}
+				if event.Arrived > meta.Max {
+					meta.Max = event.Arrived
+				}
+			}
+			p.diskMu.Lock()
+			p.storedBytes += int64(n)
+			p.lastWrite = profileNow()
+			p.diskMu.Unlock()
+		case <-ticker.C:
+			if f != nil && f.Sync() != nil {
+				p.writes.Add(1)
+			}
+			flushMeta()
+			p.refreshFiles()
+		}
+	}
+}
+func (p *requestProfiler) status() any {
+	p.mu.Lock()
+	domains := make([]map[string]string, 0, len(p.domains))
+	for _, d := range p.domains {
+		domains = append(domains, d)
+	}
+	warm := time.Since(p.indexReset).Seconds()
+	entries := len(p.index)
+	p.mu.Unlock()
+	p.diskMu.Lock()
+	defer p.diskMu.Unlock()
+	return map[string]any{"schema": "gateway-profile-v1", "started_at": float64(p.started.UnixNano()) / 1e9, "retained_start": p.oldest, "retained_end": p.lastWrite, "queue_events": len(p.queue), "dropped_events": p.dropped.Load(), "write_errors": p.writes.Load(), "stored_bytes": p.storedBytes, "index_entries": entries, "index_lookback_seconds": 3600, "index_ready": warm >= 3600, "domains": domains, "prefix_unit": "messages", "max_analysis_seconds": 86400}
+}
+func (p *requestProfiler) metrics(w io.Writer) {
+	p.mu.Lock()
+	values := make(map[string]float64, len(p.values))
+	for k, v := range p.values {
+		values[k] = v
+	}
+	metricTypes := make(map[string]string, len(p.types))
+	for k, v := range p.types {
+		metricTypes[k] = v
+	}
+	indexLen, indexReady := len(p.index), time.Since(p.indexReset) >= time.Hour
+	p.mu.Unlock()
+	names := make([]string, 0, len(values))
+	for k := range values {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	types := make([]string, 0, len(metricTypes))
+	for k := range metricTypes {
+		types = append(types, k)
+	}
+	sort.Strings(types)
+	for _, k := range types {
+		fmt.Fprintf(w, "# TYPE %s %s\n", k, metricTypes[k])
+	}
+	for _, k := range names {
+		fmt.Fprintf(w, "%s %g\n", k, values[k])
+	}
+	fmt.Fprintf(w, "aigate_profile_dropped_events_total %d\naigate_profile_write_errors_total %d\naigate_profile_queue_events %d\naigate_profile_index_entries %d\naigate_profile_index_ready %d\naigate_profile_start_time_seconds %g\n", p.dropped.Load(), p.writes.Load(), len(p.queue), indexLen, profileBoolInt(indexReady), float64(p.started.Unix()))
+	fmt.Fprintf(w, "aigate_profile_counter_start_time_seconds %g\n", p.counterStarted)
+	p.diskMu.Lock()
+	fmt.Fprintf(w, "aigate_profile_stored_bytes %d\naigate_profile_last_write_seconds %g\n", p.storedBytes, p.lastWrite)
+	p.diskMu.Unlock()
+}
+func profileBoolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+func (p *requestProfiler) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+os.Getenv(p.c.APIKeyEnv))) != 1 {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/metrics" {
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			p.metrics(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Method == "GET" && r.URL.Path == "/profile/v1/status" {
+			json.NewEncoder(w).Encode(p.status())
+			return
+		}
+		if r.Method == "POST" && r.URL.Path == "/profile/v1/analyses" {
+			var q profileQuery
+			d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+			d.DisallowUnknownFields()
+			err := d.Decode(&q)
+			var tail any
+			if err != nil || d.Decode(&tail) != io.EOF || math.IsNaN(q.Start) || math.IsNaN(q.End) || q.Start <= 0 || q.Start >= q.End || q.End-q.Start > 86400 || q.End > profileNow()+1 || len(q.Backend) > 128 || len(q.Model) > 256 {
+				http.Error(w, "invalid window or filters", 400)
+				return
+			}
+			p.diskMu.Lock()
+			oldest, last := p.oldest, p.lastWrite
+			p.diskMu.Unlock()
+			if q.Start < oldest || last == 0 {
+				http.Error(w, "outside retained event range", 410)
+				return
+			}
+			p.jobsMu.Lock()
+			defer p.jobsMu.Unlock()
+			for id, j := range p.jobs {
+				if profileNow()-j.Created > 600 && j.State != "running" && j.State != "queued" {
+					delete(p.jobs, id)
+				}
+			}
+			if len(p.jobs) >= 16 {
+				http.Error(w, "analysis cache full", 429)
+				return
+			}
+			id := randomID()
+			j := &profileJob{ID: id, State: "queued", Created: profileNow(), Query: q}
+			p.jobs[id] = j
+			select {
+			case p.work <- id:
+				w.WriteHeader(202)
+				json.NewEncoder(w).Encode(j)
+			default:
+				delete(p.jobs, id)
+				http.Error(w, "analysis queue full", 429)
+			}
+			return
+		}
+		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/profile/v1/analyses/") {
+			id := strings.TrimPrefix(r.URL.Path, "/profile/v1/analyses/")
+			p.jobsMu.Lock()
+			defer p.jobsMu.Unlock()
+			j := p.jobs[id]
+			if j == nil || profileNow()-j.Created > 600 {
+				http.Error(w, "analysis expired or missing", 404)
+				return
+			}
+			json.NewEncoder(w).Encode(j)
+			return
+		}
+		http.NotFound(w, r)
+	})
+}
+
+// This is a single bounded operational checkpoint, not a historical metric/report database.
+// Graceful restarts preserve counters even when no scrape can observe a reset to zero.
+type profileCounterState struct {
+	Version int                `json:"version"`
+	Started float64            `json:"started"`
+	Values  map[string]float64 `json:"values"`
+	Types   map[string]string  `json:"types"`
+	Groups  map[string]bool    `json:"groups"`
+}
+
+func (p *requestProfiler) restoreCounters() {
+	path := filepath.Join(p.c.Directory, "counters.json")
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil || info.Size() > 16<<20 {
+		p.writes.Add(1)
+		return
+	}
+	data, err := os.ReadFile(path)
+	var saved profileCounterState
+	if err != nil || json.Unmarshal(data, &saved) != nil || saved.Version != 1 || saved.Started <= 0 || saved.Values == nil || saved.Types == nil || saved.Groups == nil || len(saved.Values) > 100000 || len(saved.Groups) > 65 {
+		p.writes.Add(1)
+		return
+	}
+	for key, value := range saved.Values {
+		if !strings.HasPrefix(key, "aigate_") || len(key) > 2048 || math.IsNaN(value) || math.IsInf(value, 0) {
+			p.writes.Add(1)
+			return
+		}
+	}
+	p.values = saved.Values
+	p.types = saved.Types
+	p.groups = saved.Groups
+	p.counterStarted = saved.Started
+	p.values["aigate_requests_inflight"] = 0
+	// Consume the checkpoint: an unclean exit must not silently reuse an older graceful snapshot.
+	if os.Remove(path) != nil {
+		p.writes.Add(1)
+	}
+}
+func (p *requestProfiler) saveCounters() {
+	p.mu.Lock()
+	data := encodeJSON(profileCounterState{1, p.counterStarted, p.values, p.types, p.groups})
+	p.mu.Unlock()
+	if len(data) > 16<<20 {
+		p.writes.Add(1)
+		return
+	}
+	path := filepath.Join(p.c.Directory, "counters.json")
+	f, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		p.writes.Add(1)
+		return
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	f.Close()
+	if err == nil {
+		err = os.Rename(path+".tmp", path)
+	}
+	if err != nil {
+		p.writes.Add(1)
+	}
+}

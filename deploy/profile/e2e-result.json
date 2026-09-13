@@ -1,0 +1,10 @@
+{
+  "gateway_vm_query": true,
+  "input_tokens": 1000.0,
+  "output_tokens": 100.0,
+  "cache_ratio": 0.8,
+  "detail_requests": 12,
+  "private_payload_absent": true,
+  "graceful_restart_input_total": 1200,
+  "source": "isolated synthetic HTTP + VM + vmagent"
+}

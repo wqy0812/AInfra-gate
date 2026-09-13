@@ -1,0 +1,8 @@
+goos: darwin
+goarch: arm64
+pkg: aigate
+cpu: Apple M4
+BenchmarkGatewayProfile/false-10         	      30	   6277175 ns/op	  89.54 MB/s	 7755145 B/op	     951 allocs/op
+BenchmarkGatewayProfile/true-10          	      30	  12285708 ns/op	  45.75 MB/s	12104368 B/op	    9399 allocs/op
+PASS
+ok  	aigate	3.309s

@@ -215,3 +215,7 @@ go build -trimpath -o bin/aigate .
 ### 在线后端配置
 
 启用管理模式后，管理网页支持新增和编辑后端 API，无需重启。当前接流端须先切走并排空再编辑；保存配置不会自动切流，切换时重新进行协议验证。地址、鉴权、首选模型及兼容参数均可编辑，在线配置在重启后保留。详见 [管理说明](MANAGEMENT.md#在线新增与编辑后端)。
+
+## 请求画像
+
+使用 [画像配置示例](config.profile.example.json)，设置独立 `AIGATE_PROFILE_KEY` 后启用。Gateway `/metrics` 经 vmagent 写入 VM，平台读取 VM；消息前缀的窗口详细分析读取网关 API。事件默认保留 72 小时或 10 GiB，不保存正文。指标与时间口径、资源限制及接口见 [画像说明](deploy/profile/README.md)。

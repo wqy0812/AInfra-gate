@@ -24,6 +24,7 @@ type Config struct {
 	Routing                 Policy              `json:"routing"`
 	Backends                map[string]*Backend `json:"backends"`
 	HTTPPool                PoolConfig          `json:"http_pool"`
+	Profile                 ProfileConfig       `json:"profile"`
 	Management              ManagementConfig    `json:"management"`
 	names                   []string
 }
@@ -140,6 +141,7 @@ func parseConfig(data []byte, path string) (*Config, error) {
 		c.RoutingFile = filepath.Join(filepath.Dir(absolute), c.RoutingFile)
 	}
 	c.Management.defaults(c, path)
+	c.Profile.defaults(path)
 	return c, nil
 }
 
@@ -162,6 +164,9 @@ func (p Policy) validate(c *Config) error {
 }
 
 func (c *Config) validate() error {
+	if err := c.Profile.validate(); err != nil {
+		return err
+	}
 	if len(c.Backends) == 0 || len(c.names) != len(c.Backends) {
 		return fmt.Errorf("配置中必须包含 backends")
 	}

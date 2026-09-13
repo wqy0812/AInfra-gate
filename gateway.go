@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +28,7 @@ type Gateway struct {
 	apiKey     string
 	buffers    sync.Pool
 	management *Management
+	profile    *requestProfiler
 }
 
 func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
@@ -67,10 +69,20 @@ func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
 			return nil, err
 		}
 	}
+	if c.Profile.Enabled {
+		g.profile, err = newRequestProfiler(c.Profile)
+		if err != nil {
+			g.Close()
+			return nil, err
+		}
+	}
 	return g, nil
 }
 
 func (g *Gateway) Close() {
+	if g.profile != nil {
+		g.profile.close()
+	}
 	if g.management != nil {
 		g.management.close()
 	}
@@ -117,6 +129,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-ID", entry.RequestID)
 	started := time.Now()
 	if r.URL.Path == "/v1/chat/completions" {
+		if g.profile != nil {
+			pr := g.profile.begin(entry.RequestID)
+			r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
+			defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
+		}
 		defer func() {
 			entry.DurationMS = float64(time.Since(started).Microseconds()) / 1000
 			g.audit.Print(string(encodeJSON(entry)))
@@ -246,6 +263,10 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.Backend, entry.Model = &name, &model
+	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
+		pr.e.Backend = name
+		pr.e.Model = model
+	}
 	if body.stream && backend.Adapter != "openai" {
 		sendError(w, entry, fault(400, "stream_not_supported", "模板适配器尚不支持下游流式协议转换"))
 		return
@@ -274,6 +295,16 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		sendError(w, entry, upstreamError(readErr, ctx))
 		return
 	}
+	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
+		var v struct {
+			Usage json.RawMessage `json:"usage"`
+		}
+		if json.Unmarshal(data, &v) == nil {
+			pr.usage = v.Usage
+		} else {
+			pr.quality = "response_parse"
+		}
+	}
 	result, err := normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
 	if err != nil {
 		outcome = "backend_failure"
@@ -292,6 +323,9 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	payload, err := makePayload(body, backend, model)
 	if err != nil {
 		return nil, err
+	}
+	if pr, ok := ctx.Value(profileContextKey{}).(*profileRequest); ok && g.profile != nil {
+		g.profile.input(pr, payload, backend, pr.e.Backend, model)
 	}
 	req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, backend.URL, bytes.NewReader(payload))
 	if requestErr != nil {
@@ -343,6 +377,29 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	if g.management != nil {
 		observer = newSSEObserver(false)
 	}
+	var profileObserver *sseObserver
+	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
+		profileObserver = newSSEObserver(false)
+		profileObserver.started = pr.start
+		profileObserver.profileUsage = true
+		defer func() {
+			pr.usage = profileObserver.Usage
+			if profileObserver.FirstMS != nil {
+				n := *profileObserver.FirstMS / 1000
+				pr.first = &n
+			}
+			if profileObserver.Unknown || profileObserver.Invalid {
+				pr.quality = "sse_parse"
+			}
+			// Keep forwarding semantics unchanged; profile success requires a complete stream.
+			if entry.Outcome == "completed" && !profileObserver.valid() {
+				pr.outcome = "upstream_protocol_error"
+				if profileObserver.Unknown {
+					pr.outcome = "protocol_unknown"
+				}
+			}
+		}()
+	}
 	var rewrite *sseModelWriter
 	if g.config.PublicModelName != "" {
 		rewrite = &sseModelWriter{model: g.config.PublicModelName}
@@ -363,6 +420,9 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		n, readErr := response.Body.Read(*buffer)
 		if n > 0 {
 			data := (*buffer)[:n]
+			if profileObserver != nil {
+				profileObserver.Feed(data)
+			}
 			var err error
 			if rewrite != nil {
 				err = rewrite.feed(data, emit)

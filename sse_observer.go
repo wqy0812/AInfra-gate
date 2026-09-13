@@ -17,6 +17,7 @@ type sseObserver struct {
 	line, data                                         []byte
 	skipLF                                             bool
 	collect                                            bool
+	profileUsage                                       bool
 	Unknown, Invalid, HasError, Done, Finished, Useful bool
 	Content                                            string
 	Tools                                              map[int]*observedTool
@@ -89,8 +90,10 @@ func (o *sseObserver) event(data []byte) {
 		Choices []struct {
 			Finish *string `json:"finish_reason"`
 			Delta  struct {
-				Content string `json:"content"`
-				Tools   []struct {
+				Content       string `json:"content"`
+				Reasoning     string `json:"reasoning_content"`
+				ReasoningText string `json:"reasoning"`
+				Tools         []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id"`
 					Function struct {
@@ -111,14 +114,14 @@ func (o *sseObserver) event(data []byte) {
 	if len(event.Choices) == 0 && len(event.Usage) == 0 && !o.HasError {
 		o.Invalid = true
 	}
-	if o.collect && len(event.Usage) > 0 && !isNull(event.Usage) {
+	if (o.collect || o.profileUsage) && len(event.Usage) > 0 && !isNull(event.Usage) {
 		o.Usage = usageCounters(event.Usage)
 	}
 	for _, c := range event.Choices {
 		if c.Finish != nil && *c.Finish != "" {
 			o.Finished = true
 		}
-		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0
+		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0 || (o.profileUsage && (c.Delta.Reasoning != "" || c.Delta.ReasoningText != ""))
 		if useful {
 			o.Useful = true
 			if o.FirstMS == nil {

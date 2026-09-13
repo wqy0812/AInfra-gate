@@ -183,9 +183,23 @@ func run(args []string, out, stderr io.Writer) error {
 		defer adminListener.Close()
 		admin = &http.Server{Handler: gateway.adminHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	}
+	var profileServer *http.Server
+	var profileListener net.Listener
+	if gateway.profile != nil {
+		profileListener, err = net.Listen("tcp", c.Profile.Listen)
+		if err != nil {
+			return err
+		}
+		defer profileListener.Close()
+		profileServer = &http.Server{Handler: gateway.profile.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+		defer profileServer.Close()
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	done := make(chan error, 2)
+	done := make(chan error, 3)
+	if profileServer != nil {
+		go func() { done <- profileServer.Serve(profileListener) }()
+	}
 	go func() { done <- server.Serve(listener) }()
 	if admin != nil {
 		go func() { done <- admin.Serve(adminListener) }()
