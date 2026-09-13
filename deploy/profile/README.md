@@ -18,6 +18,8 @@ The 10 GiB limit is the current code/configuration default. Existing explicit `m
 
 Segment sidecars record min/max arrival time and covered bytes. Analysis skips a segment only when the sidecar covers its entire file; an active/crashed tail is scanned conservatively. The as_of boundary also filters lifecycle events. Query-time scan limits therefore apply to intersecting segments, not the entire 72h store.
 
+After restart, the analysis cutoff includes the retained events that predate startup, even when filesystem mtime precision rounds the last event's file timestamp down. Live writes still advance the cutoff with their completed-write time.
+
 VM cumulative counters include process/group birth gauges. Queries use increase_pure only when a zero origin inside the requested window is established; otherwise increase is used. This avoids dropping startup token totals while retaining correct historical/reset behavior. Recent queries use an explicit 1ms latency offset and mark the latest samples as potentially incomplete; ingestion is still asynchronous.
 
 A single <=16MiB counters.json checkpoint is written on graceful shutdown and consumed on startup. It preserves cumulative counters and their zero-origin time across normal restarts, including resets that would otherwise be invisible between two scrapes. It is operational metadata, not metric history. Unclean exits can still lose an unsampled tail and reset counters; such boundary uncertainty remains part of capture quality.

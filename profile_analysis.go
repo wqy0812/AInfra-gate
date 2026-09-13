@@ -56,7 +56,9 @@ func (p *requestProfiler) analyze(ctx context.Context, q profileQuery) (any, err
 	p.diskMu.Lock()
 	files := append([]string{}, p.files...)
 	oldest := p.oldest
-	asof := p.lastWrite
+	// Filesystem mtime may be rounded below the final event timestamp. All events
+	// retained at startup precede this boot even if their file has a coarse mtime.
+	asof := max(p.lastWrite, float64(p.started.UnixNano())/1e9)
 	p.diskMu.Unlock()
 	// Only live requests can be pending. Missing end events may have been dropped.
 	p.mu.Lock()

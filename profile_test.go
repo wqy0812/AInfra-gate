@@ -395,6 +395,8 @@ func TestProfileDroppedEndAndLiveRequests(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(p.c.Directory, "events-1000000000000-review.jsonl"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Simulate writer()'s completed-write timestamp, independently of filesystem mtime precision.
+	p.lastWrite = profileNow()
 	p.refreshFiles()
 	query := profileQuery{Start: p.oldest, End: profileNow()}
 	check := func(pending, unknown int) {
@@ -455,5 +457,37 @@ func TestProfileDiskLimitDefaultAndOverride(t *testing.T) {
 		if c.MaxDiskBytes != tc.want {
 			t.Fatalf("configured %d: got %d, want %d", tc.configured, c.MaxDiskBytes, tc.want)
 		}
+	}
+}
+
+func TestProfileAnalysisAfterRestartWithCoarseFileTime(t *testing.T) {
+	p, c := profileFixture(t)
+	r := p.begin("before-restart")
+	p.input(r, []byte(`{"messages":[{"role":"user","content":"same"}]}`), c.Backends["api1"], "api1", "model")
+	p.end(r, &auditEntry{Outcome: "completed"}, false)
+	p.close()
+	files, err := filepath.Glob(filepath.Join(c.Profile.Directory, "events-*.jsonl"))
+	if err != nil || len(files) == 0 {
+		t.Fatal("missing persisted events", err)
+	}
+	// Emulate a filesystem that rounds mtime down below the event's arrival/end.
+	coarse := r.start.Truncate(time.Second)
+	for _, path := range files {
+		if err := os.Chtimes(path, coarse, coarse); err != nil {
+			t.Fatal(err)
+		}
+	}
+	next, err := newRequestProfiler(c.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.close()
+	raw, err := next.analyze(context.Background(), profileQuery{Start: r.e.Arrived, End: profileNow()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := raw.(map[string]any)
+	if result["requests"] != 1 || result["pending"] != 0 || result["unknown"] != 0 || result["outcomes"].(map[string]int)["completed"] != 1 {
+		t.Fatalf("lost persisted lifecycle after restart: %v", result)
 	}
 }
