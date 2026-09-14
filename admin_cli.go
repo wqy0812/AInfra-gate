@@ -1,29 +1,23 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
-	"net/url"
-	"os"
 	"strings"
 	"time"
 )
 
 type adminCLIOptions struct {
-	path, base, id string
-	noWait, json   bool
-	positional     []string
+	path, socket, id string
+	noWait, json     bool
+	positional       []string
 }
 
 func parseAdminCLI(args []string) (adminCLIOptions, error) {
 	o := adminCLIOptions{path: configPath()}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "--config", "-config", "--admin-url", "--operation-id":
+		case "--config", "-config", "--socket", "--operation-id":
 			flag := args[i]
 			i++
 			if i == len(args) {
@@ -32,8 +26,8 @@ func parseAdminCLI(args []string) (adminCLIOptions, error) {
 			switch flag {
 			case "--config", "-config":
 				o.path = args[i]
-			case "--admin-url":
-				o.base = args[i]
+			case "--socket":
+				o.socket = args[i]
 			case "--operation-id":
 				o.id = args[i]
 			}
@@ -69,66 +63,20 @@ func managedCLI(kind string, args []string, out io.Writer) error {
 		}
 		o.positional = o.positional[1:]
 	}
-	if (kind == "status" && len(o.positional) != 0) || (kind != "status" && len(o.positional) != 1) {
+	if kind != "backends" && ((kind == "status" && len(o.positional) != 0) || (kind != "status" && len(o.positional) != 1)) {
 		return fmt.Errorf("用法: aigate %s [BACKEND] [--config PATH] [--json] [--no-wait]", kind)
 	}
-	if o.base == "" {
-		host, port, e := net.SplitHostPort(c.Management.Listen)
-		if e != nil {
-			return e
-		}
-		if host == "" || host == "0.0.0.0" || host == "::" {
-			host = "127.0.0.1"
-		}
-		o.base = "http://" + net.JoinHostPort(host, port)
+	if o.socket == "" {
+		o.socket = c.Management.Socket
 	}
-	u, err := url.Parse(o.base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("admin-url 必须为无凭据的 HTTP(S) 地址")
+	call := func(command string, body, result any) error {
+		return callControl(o.socket, command, body, result)
 	}
-	key := os.Getenv(c.Management.APIKeyEnv)
-	if key == "" {
-		return fmt.Errorf("缺少管理密钥环境变量 %s", c.Management.APIKeyEnv)
-	}
-	transport := &http.Transport{Proxy: nil}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	call := func(method, path string, body any, result any) error {
-		var data []byte
-		if body != nil {
-			data = encodeJSON(body)
-		}
-		req, e := http.NewRequest(method, strings.TrimRight(o.base, "/")+"/admin/v1/"+path, bytes.NewReader(data))
-		if e != nil {
-			return e
-		}
-		req.Header.Set("Authorization", "Bearer "+key)
-		req.Header.Set("Content-Type", "application/json")
-		resp, e := client.Do(req)
-		if e != nil {
-			return fmt.Errorf("无法访问管理服务")
-		}
-		defer resp.Body.Close()
-		data, e = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		if e != nil {
-			return fmt.Errorf("管理响应读取失败")
-		}
-		if resp.StatusCode >= 300 {
-			var envelope struct {
-				Error ManagementError `json:"error"`
-			}
-			if json.Unmarshal(data, &envelope) == nil && envelope.Error.Message != "" {
-				return fmt.Errorf("%s (%s; operation_id=%s)", envelope.Error.Message, envelope.Error.Code, envelope.Error.OperationID)
-			}
-			return fmt.Errorf("管理服务返回 HTTP %d", resp.StatusCode)
-		}
-		if decodeJSON(data, result) != nil {
-			return fmt.Errorf("管理响应无效")
-		}
-		return nil
+	if kind == "backends" {
+		return backendsCLI(o, call, out)
 	}
 	var state ManagementStatus
-	if err = call("GET", "status", nil, &state); err != nil {
+	if err = call("status", nil, &state); err != nil {
 		return err
 	}
 	if kind == "status" {
@@ -158,14 +106,7 @@ func managedCLI(kind string, args []string, out io.Writer) error {
 		}
 		op = *old
 	} else {
-		path := "backends/" + url.PathEscape(target) + "/" + kind
-		if kind == "switch" {
-			path = "switches"
-		}
-		if kind == "warmup" {
-			path = "warmups"
-		}
-		err = call("POST", path, OperationRequest{o.id, target, state.Revision}, &op)
+		err = call(kind, OperationRequest{o.id, target, state.Revision}, &op)
 		if err != nil {
 			return fmt.Errorf("%w；可使用 --operation-id %s 查询或重试同一操作", err, o.id)
 		}
@@ -181,7 +122,7 @@ func managedCLI(kind string, args []string, out io.Writer) error {
 				last = op.Phase
 			}
 			time.Sleep(time.Second)
-			if err = call("GET", "operations/"+url.PathEscape(op.ID), nil, &op); err != nil {
+			if err = call("operation", op.ID, &op); err != nil {
 				return fmt.Errorf("%w；操作 %s 可能仍在后台执行", err, op.ID)
 			}
 		}

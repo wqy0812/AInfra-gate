@@ -25,7 +25,6 @@ type result struct {
 
 func main() {
 	base := flag.String("base", "http://127.0.0.1:10015", "business URL")
-	admin := flag.String("admin", "http://127.0.0.1:8081", "management URL")
 	unavailable := flag.Bool("expect-unavailable", false, "check unavailable-backend behavior, not model acceptance")
 	flag.Parse()
 	client := &http.Client{Timeout: 150 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -75,18 +74,13 @@ func main() {
 			return json.Unmarshal(b, &v) == nil && v.Error.Code == code && v.Error.ID != "" && v.Error.ID == h.Get("X-Request-ID")
 		}
 	}
-	bkey, akey := os.Getenv("GATEWAY_API_KEY"), os.Getenv("AIGATE_ADMIN_KEY")
+	bkey := os.Getenv("GATEWAY_API_KEY")
 	check("health", "GET", *base+"/health", "", "", "", 200, func(b []byte, _ http.Header) bool { return bytes.Contains(b, []byte(`"status":"ok"`)) })
 	check("business-openapi", "GET", *base+"/openapi.json", "", "", "", 200, validJSON)
-	for _, path := range []string{"/", "/app.js", "/backends.js", "/style.css", "/openapi.json"} {
-		check("admin-asset"+path, "GET", *admin+path, "", "", "", 200, func(b []byte, h http.Header) bool { return len(b) > 0 && h.Get("Content-Security-Policy") != "" })
+	check("business-docs-removed", "GET", *base+"/docs", "", "", "", 404, errorCode("not_found"))
+	for _, path := range []string{"/", "/index.html", "/app.js", "/backends.js", "/style.css", "/admin/v1/status", "/admin/v1/backends"} {
+		check("removed-management"+path, "GET", *base+path, "", "", "", 404, errorCode("not_found"))
 	}
-	for _, path := range []string{"status", "backends"} {
-		check("admin-anonymous-"+path, "GET", *admin+"/admin/v1/"+path, "", "", "", 401, errorCode("unauthorized"))
-		check("admin-authorized-"+path, "GET", *admin+"/admin/v1/"+path, "", akey, "", 200, validJSON)
-	}
-	check("admin-wrong-key", "GET", *admin+"/admin/v1/status", "", "invalid-deployment-probe-key", "", 401, errorCode("unauthorized"))
-	check("admin-cross-origin", "GET", *admin+"/admin/v1/status", "", akey, "http://example.invalid", 403, errorCode("cross_origin_denied"))
 	for i, body := range []string{`null`, `{}`, `{"messages":[]}`, `{"messages":[{"role":"user","content":"probe"}],"stream":"true"}`} {
 		check(fmt.Sprintf("invalid-request-%d", i), "POST", *base+"/v1/chat/completions", body, bkey, "", 400, errorCode("invalid_request"))
 	}

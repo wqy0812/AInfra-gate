@@ -122,6 +122,7 @@ func (m *Management) probe(parent context.Context, name, model string, restore b
 	observer := newSSEObserver(true)
 	ctx, cancel := context.WithTimeout(parent, seconds(m.g.config.Management.WarmupStepSeconds))
 	defer cancel()
+	ctx = context.WithValue(ctx, sseObserverContextKey{}, observer)
 	lease, err := m.acquire(name, true, false, restore)
 	if err != nil {
 		return step, observer, err
@@ -157,7 +158,7 @@ func (m *Management) probe(parent context.Context, name, model string, restore b
 				return finish(fmt.Errorf("预热流中断或超时"))
 			}
 		}
-		if !observer.valid() {
+		if !observer.validProbe() {
 			return finish(fmt.Errorf("%s", observer.errorMessage()))
 		}
 	} else {

@@ -3,16 +3,13 @@ package main
 import (
 	"fmt"
 	"math"
-	"net"
-	"os"
 	"path/filepath"
 	"time"
 )
 
 type ManagementConfig struct {
 	Enabled              bool    `json:"enabled"`
-	Listen               string  `json:"listen"`
-	APIKeyEnv            string  `json:"api_key_env"`
+	Socket               string  `json:"socket"`
 	StateFile            string  `json:"state_file"`
 	WarmupRounds         int     `json:"warmup_rounds"`
 	WarmupStepSeconds    float64 `json:"warmup_step_seconds"`
@@ -29,18 +26,19 @@ func (m *ManagementConfig) defaults(c *Config, path string) {
 	if !m.Enabled {
 		return
 	}
-	if m.Listen == "" {
-		m.Listen = "127.0.0.1:8081"
-	}
-	if m.APIKeyEnv == "" {
-		m.APIKeyEnv = "AIGATE_ADMIN_KEY"
-	}
 	if m.StateFile == "" {
 		m.StateFile = "management-state.json"
 	}
 	if !filepath.IsAbs(m.StateFile) {
 		absolute, _ := filepath.Abs(path)
 		m.StateFile = filepath.Join(filepath.Dir(absolute), m.StateFile)
+	}
+	if m.Socket == "" {
+		m.Socket = filepath.Join(filepath.Dir(m.StateFile), ".aigate", "control.sock")
+	}
+	if !filepath.IsAbs(m.Socket) {
+		absolute, _ := filepath.Abs(path)
+		m.Socket = filepath.Join(filepath.Dir(absolute), m.Socket)
 	}
 	if m.WarmupRounds == 0 {
 		m.WarmupRounds = 2
@@ -77,11 +75,8 @@ func (m ManagementConfig) validate(c *Config) error {
 	if c.RoutingFile != "" || c.Routing.Mode != "single" {
 		return fmt.Errorf("management 模式要求 single 路由且不能设置 routing_file")
 	}
-	if _, _, err := net.SplitHostPort(m.Listen); err != nil {
-		return fmt.Errorf("management.listen 必须为 host:port")
-	}
-	if m.StateFile == "" || m.APIKeyEnv == "" || os.Getenv(m.APIKeyEnv) == "" {
-		return fmt.Errorf("management 需要 state_file 和有效的管理密钥环境变量 %s", m.APIKeyEnv)
+	if m.StateFile == "" || m.Socket == "" {
+		return fmt.Errorf("management 需要 state_file 和 socket")
 	}
 	if m.WarmupRounds < 1 || m.WarmupRounds > 20 || m.WarmupMaxTokens < 1 || m.FailureThreshold < 1 || m.FailureThreshold > 100 {
 		return fmt.Errorf("management 轮数、token 预算或故障阈值无效")

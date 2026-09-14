@@ -1,5 +1,14 @@
 # dcu1 上线记录
 
+## CLI 管理版本迁移（尚未部署）
+
+新版本移除 Web、管理 HTTP API 和 8081 监听，管理仅由本机 CLI 通过 Unix socket 完成。部署前在主配置的 management 中移除 listen、api_key_env，增加 `"socket": "/data4/aigate/.aigate/control.sock"`；状态文件保持原位，勿覆盖已有 v2 后端注册表。socket 目录由程序创建为 0700，文件为 0600，以服务用户或 root 运行 `aigate-admin`。
+
+`admin.env` 可能同时包含业务、下游或 Profile 凭据，不能因为管理密钥移除而删除整个文件。包装脚本仍加载该环境文件，但 CLI 授权由本机 socket 权限控制。
+
+升级仍需先备份版本、配置和状态，候选验证后排空并优雅重启。启动后执行 `aigate-admin status --json`、`aigate-admin backends list` 和真实协议预热，确认 TCP 8081 无监听；HTTP 验证工具改为只检查业务端口。失败时配套恢复旧版本和旧配置。以下内容为历史部署证据，不能代表本次已部署。
+
+
 状态：**2026-09-12 21:14（Asia/Shanghai）正式网关已升级，新版真实协议与 HTTP 验收全部通过。**
 
 ## DCU → A3 往返切换尝试（2026-09-12 21:20）

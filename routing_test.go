@@ -140,7 +140,9 @@ func TestDiscoveryFailureAndNoGenerationRetry(t *testing.T) {
 					t.Fatal("single fell back")
 				}
 			case "generation_failure":
-				requireError(t, r, data, 502, "upstream_http_error")
+				if r.StatusCode != 500 || len(data) != 0 {
+					t.Fatal("generation error status/body not preserved")
+				}
 				if posts[0].Load() != 1 || posts[1].Load() != 0 {
 					t.Fatal("generation retried")
 				}

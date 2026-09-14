@@ -1,9 +1,9 @@
 import json,os,pathlib,shutil,subprocess,time,urllib.request
 root=pathlib.Path('/data4/aigate');release=root/'releases/gateway-profile-v1';envPath=root/'admin.env';configPath=root/'config.json';envText=envPath.read_text();env=dict(line.split('=',1) for line in envText.splitlines() if '=' in line and not line.startswith('#'))
-def api(path):
- r=urllib.request.Request('http://127.0.0.1:8081'+path,headers={'Authorization':'Bearer '+env['AIGATE_ADMIN_KEY']});return json.load(urllib.request.urlopen(r,timeout=5))
+def status_cli():
+ return json.loads(subprocess.check_output([str(root/'current/aigate'),'status','--config',str(configPath),'--json'],env=dict(os.environ,**env),timeout=15))
 def cmd(*args):return subprocess.check_output(args,stderr=subprocess.STDOUT).decode()
-status=api('/admin/v1/status');assert not status.get('busy'),'Management operation active'
+status=status_cli();assert not status.get('busy'),'Management operation active'
 for name,c in status['counts'].items():
  for key,value in c.items():
   if key in ('business','streams','probes','in_flight','active') and isinstance(value,(int,float)):assert value==0,(name,key,value)
@@ -24,7 +24,7 @@ try:
  temp=root/'current-profile-next';temp.symlink_to(release);temp.replace(root/'current');cmd('systemctl','start','aigate')
  for i in range(50):
   try:
-   after=api('/admin/v1/status');assert after['active_backend']==status['active_backend'];assert after['route_version']==status['route_version']
+   after=status_cli();assert after['active_backend']==status['active_backend'];assert after['route_version']==status['route_version']
    req=urllib.request.Request('http://122.235.251.106:18082/profile/v1/status',headers={'Authorization':'Bearer '+key});profile=json.load(urllib.request.urlopen(req,timeout=3));break
   except Exception:time.sleep(.2)
  else:raise RuntimeError('profile endpoint startup failed')

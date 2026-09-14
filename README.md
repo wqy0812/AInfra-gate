@@ -10,9 +10,9 @@
 
 ## DCU / A3 维护切换
 
-可选的 `management` 模式已经提供离线网页控制台：一键预热目标端、验证真实生成/SSE/工具协议、切换新请求、等待原端排空，并在原端进入维护前支持自动回切。管理监听器默认 `127.0.0.1:8081`，使用独立 Bearer 密钥；所有网页资源内嵌 Go 二进制。
+可选的 `management` 模式通过本机 CLI 预热目标端、验证真实生成/SSE/工具协议、切换新请求、等待原端排空，并在原端进入维护前支持自动回切。CLI 使用私有 Unix socket 与运行中的网关通信；无 Web 页面、管理 HTTP API 或管理 TCP 端口，不需要管理密钥和端口转发。
 
-配置示例为 `config.management.example.json`，完整启动、维护步骤、CLI/API 和故障边界见 [维护模式使用说明](MANAGEMENT.md)。如果要重启 DCU/A3 整机，网关须放在独立节点。此模式不同时使用 `routing_file`，只支持单进程 single 路由；未启用时下述普通路由行为保持不变。实际 DCU/A3 上线联调与性能验收仍需单独完成。
+配置示例为 `config.management.example.json`，完整启动、维护步骤、CLI 和故障边界见 [维护模式使用说明](MANAGEMENT.md)。如果要重启 DCU/A3 整机，网关须放在独立节点。此模式不同时使用 `routing_file`，只支持单进程 single 路由；未启用时下述普通路由行为保持不变。实际 DCU/A3 上线联调与性能验收仍需单独完成。
 
 ## 替代 SGLang workspace 兼容层
 
@@ -42,7 +42,7 @@ go build -trimpath -o bin/aigate .
 
 此示例未启用入口鉴权，也未配置下游凭据；需要时按下文配置 `gateway_api_key_env` 和 `headers_env`。生成请求总超时为 1860 秒（含 SSE 全程）。
 
-这项规则提供 workspace 转换功能，gateway 保留自动替换模型名、入口校验、统一错误响应和日志行为。它提供聊天、模型发现及自身健康/文档接口，不透传 Router 的其他路径、客户端请求头或下游原始错误；上线前需确认调用方所需接口。`check` 只做本地配置校验，本次本地测试不代表已部署或已通过真实 Router 验收。
+这项规则提供 workspace 转换功能，gateway 保留自动替换模型名、入口校验、网关自身错误响应和日志行为。聊天生成阶段透传后端非 2xx 状态码、错误正文及必要响应头。它提供聊天、模型发现及自身健康/文档接口，不透传 Router 的其他路径或客户端请求头；上线前需确认调用方所需接口。`check` 只做本地配置校验，本次本地测试不代表已部署或已通过真实 Router 验收。
 
 ## 通用 metadata 兼容规则
 
@@ -93,7 +93,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   --no-buffer --data-binary @body-agent-ds4.json
 ```
 
-`GET /health` 仅表示网关已启动，不检测下游模型是否就绪。离线可访问的 API 说明位于 `/docs`，OpenAPI 规范位于 `/openapi.json`；Go 版文档页不依赖 CDN，也不提供原 FastAPI 的交互式 Swagger 调试界面。
+`GET /health` 仅表示网关已启动，不检测下游模型是否就绪。业务 OpenAPI 规范位于 `/openapi.json`；HTML 文档页 `/docs` 已移除。
 
 ## 模型发现与 A/B 切换
 
@@ -173,7 +173,46 @@ OpenAI 适配器保留历史消息、工具字段、显式 null、流式选项�
 
 只截取最后一条 `role=user` 消息的前 10 个 Unicode 码点（中文不按字节截取，空格和标点计数，组合 emoji 可能包含多个码点）。不足 10 个则记录全部；未通过校验/鉴权时前缀为空。日志不记录问题剩余内容、其他历史消息、模型回答或密钥；转发时使用完整消息。JSON 编码会转义换行符，避免形成伪造日志行。
 
-响应携带 `X-Request-ID`。入口格式错误或模板适配器收到流式请求返回 400，入口鉴权错误返回 401；下游限流返回 429，连接/HTTP/协议错误返回 502，路由配置错误或没有可发现模型返回 503，生成超时返回 504。错误正文统一为 `error.code/message/request_id`，不回传下游原始错误正文。生成请求总超时由 `timeout_seconds` 配置（包括 SSE 全程）；模型发现另有 `discovery_timeout_seconds` 限制，每个 API 各计一次。不自动重试生成或跟随重定向。
+响应携带网关生成的 `X-Request-ID`。聊天生成阶段收到后端非 2xx 响应时，原样返回状态码和正文（包括后端 401/403、重定向、纯文本、HTML 和空正文），不再统一转换为 502，也不包装后端错误正文。透传 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`；过滤逐跳头和 `Connection` 指定的头，不传递后端 Cookie 或覆盖网关请求 ID。Go HTTP Transport 自动解压时，正文与响应头一起按解压后的表示转发。
+
+错误正文使用固定缓冲区转发，不整体缓存或保存；响应头已发出后读取失败会中止响应，不向原始正文追加 JSON。后端 SSE error 事件保留内容，已发出的 HTTP 200 无法改写，失败由指标反映。
+
+网关自身错误仍使用 `error.code/message/request_id`：入口格式错误或模板适配器收到流式请求返回 400，入口鉴权错误返回 401，连接失败或后端成功响应的协议错误返回 502，路由配置错误或模型发现失败返回 503，生成超时返回 504。模型发现及后台预热的错误约定不变。生成请求总超时由 `timeout_seconds` 配置（包括 SSE 和错误正文转发全程）；模型发现另有 `discovery_timeout_seconds` 限制，每个 API 各计一次。不自动重试生成或跟随重定向。
+
+### 生成错误指标
+
+开启现有 `profile.enabled` 后，通过原有鉴权 `GET /metrics` 暴露以下指标，vmagent → VictoriaMetrics 的抓取接口和鉴权方式不变：
+
+| 指标 | 标签 | 含义 |
+| --- | --- | --- |
+| `aigate_generation_requests_ended_total` | `backend, model, stream, result` | 进入生成 HTTP 调用的业务请求结束数；`result` 为 `completed/error/client_cancelled/client_disconnected/unknown` |
+| `aigate_upstream_errors_total` | `backend, model, stream, error_class, upstream_status` | 每个生成请求最多一个主要后端错误；收到响应时保留原始状态码（含 SSE 的 200），未收到响应记为 `none` |
+| `aigate_error_metrics_start_time_seconds` | 无 | 本组新增指标的统计起点，正常关闭重启后保持不变 |
+
+`error_class` 使用固定枚举：400/413/422 为 `request_rejected`，401/403 为 `auth`，404 为 `not_found`，429 为 `rate_limited`，5xx 为 `server_error`，3xx 为 `unexpected_redirect`，其他非 2xx 为 `http_other`。不解析错误正文猜测 OOM 或上下文超长等根因。
+
+无有效 HTTP 错误响应时，按 `connection_error`、`timeout`、`response_read_error`、`stream_error`（明确 SSE error）、`stream_incomplete`（缺失结束证据）和 `protocol_error` 分类。HTTP 错误或明确 SSE error 一经观察到，后续断流/取消不会覆盖或重复计数；仅客户端取消/写入断开不算后端错误。观察器超过资源限制而不能判断时记为 `unknown`，不推断成功或失败。
+
+业务 SSE 完成要求收到 `[DONE]`、所有预期候选均有结束原因，且没有残留数据事件或协议错误。候选数采用实际发送请求（含后端 overrides）的 `n`，缺省或 null 按 1；仅单候选兼容省略 `index`。完整空文本、拒答或内容过滤响应不计为后端故障；空响应不生成首 token 时间。预热仍要求有效输出并继续执行工具协议验证。候选跟踪最多 1024 项，超过上限只标记 `unknown`，不修改或拒绝业务请求。
+
+入口拒绝、模型发现和后台探测不进入新增指标。已有请求指标保持原有口径，不能用其总数替代生成阶段分母。标签沿用后端/模型分组上限；不放入任意错误文本、后端错误代码或请求 ID。profile 结束事件仅增加 `upstream_status`、`error_class`、`generation_result` 结构化字段，不保存错误正文。
+
+查询示例（按实际抓取标签补充环境/实例筛选）：
+
+```promql
+# 当前统计生命周期内的累计分类错误数
+sum by (backend, model, error_class, upstream_status) (aigate_upstream_errors_total)
+
+# 5 分钟分类错误速率（次/秒）
+sum by (backend, model, error_class) (rate(aigate_upstream_errors_total[5m]))
+
+# 5 分钟后端错误率：同窗口错误数 / 同窗口生成结束请求数
+sum by (backend, model) (increase(aigate_upstream_errors_total[5m]))
+/
+sum by (backend, model) (increase(aigate_generation_requests_ended_total[5m]))
+```
+
+计数在请求结束时增加，错误率分母包含取消、断开及未知结果；未知数量应另查 `result="unknown"`。指标按实际出现的标签组合生成，无样本不直接补零；新序列不足两个采样点时速率不可判定。新增指标不回填升级前历史，跨统计起点或缺失抓取的窗口不能称为完整统计；使用 `aigate_error_metrics_start_time_seconds` 与采样覆盖范围判定。正常关闭沿用现有计数检查点，异常退出仍遵循原有重置语义。
 
 流式响应已经发出 HTTP 200 后发生的异常无法再改 HTTP 状态码，会发送包含 `error` 的 SSE 数据事件并关闭流，不补发 `[DONE]`。日志在整条流结束后记录耗时，并通过 `outcome=upstream_stream_error/upstream_timeout` 区分异常；未发完响应时为 `incomplete`。`completed` 仅表示 HTTP 传输完成，不代表模型结果质量或任务成功。
 
@@ -214,7 +253,7 @@ go build -trimpath -o bin/aigate .
 
 ### 在线后端配置
 
-启用管理模式后，管理网页支持新增和编辑后端 API，无需重启。当前接流端须先切走并排空再编辑；保存配置不会自动切流，切换时重新进行协议验证。地址、鉴权、首选模型及兼容参数均可编辑，在线配置在重启后保留。详见 [管理说明](MANAGEMENT.md#在线新增与编辑后端)。
+启用管理模式后，使用 `aigate backends list`、`aigate backends create REQUEST.json` 和 `aigate backends edit BACKEND REQUEST.json` 在线查看、新增和编辑后端，无需重启。当前接流端须先切走并排空再编辑；保存配置不会自动切流，切换时重新进行协议验证。地址、鉴权、首选模型及兼容参数均可编辑，在线配置在重启后保留。详见 [管理说明](MANAGEMENT.md#在线新增与编辑后端)。
 
 ## 请求画像
 

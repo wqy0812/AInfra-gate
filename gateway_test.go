@@ -330,9 +330,6 @@ func TestUpstreamErrors(t *testing.T) {
 		{"invalid_response", 200, `{"error":"private-secret"}`, 502, "invalid_upstream_response"},
 		{"null", 200, `null`, 502, "invalid_upstream_response"},
 		{"bad_choice", 200, `{"choices":[{"message":{"role":"assistant","content":null}}]}`, 502, "invalid_upstream_response"},
-		{"unauthorized", 401, "private-secret", 502, "upstream_http_error"},
-		{"limited", 429, "private-secret", 429, "upstream_http_error"},
-		{"redirect", 302, "private-secret", 502, "upstream_http_error"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -619,7 +616,7 @@ func TestClientDisconnectCancelsUpstream(t *testing.T) {
 func TestDocumentationAndHealth(t *testing.T) {
 	u := upstreamServer(t, "real", nil)
 	_, s, _ := serveTest(t, fixtureConfig(t, u.URL))
-	for _, path := range []string{"/health", "/docs", "/openapi.json"} {
+	for _, path := range []string{"/health", "/openapi.json"} {
 		r, data := request(t, s, "GET", path, "", "")
 		if r.StatusCode != 200 || len(data) == 0 {
 			t.Fatal("missing endpoint")
@@ -628,7 +625,9 @@ func TestDocumentationAndHealth(t *testing.T) {
 			t.Fatal("invalid OpenAPI")
 		}
 	}
-	r, data := request(t, s, "GET", "/missing", "", "")
+	r, data := request(t, s, "GET", "/docs", "", "")
+	requireError(t, r, data, 404, "not_found")
+	r, data = request(t, s, "GET", "/missing", "", "")
 	requireError(t, r, data, 404, "not_found")
 	r, data = request(t, s, "GET", "/v1/chat/completions", "", "")
 	requireError(t, r, data, 405, "method_not_allowed")

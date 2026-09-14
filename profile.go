@@ -101,25 +101,28 @@ type profileMark struct {
 	Digest string `json:"digest"`
 }
 type profileEvent struct {
-	Kind     string          `json:"kind"`
-	ID       string          `json:"request_id"`
-	Boot     string          `json:"boot"`
-	Seq      uint64          `json:"sequence"`
-	At       float64         `json:"at"`
-	Arrived  float64         `json:"arrived"`
-	Backend  string          `json:"backend,omitempty"`
-	Model    string          `json:"model,omitempty"`
-	Domain   string          `json:"domain,omitempty"`
-	Stream   bool            `json:"stream,omitempty"`
-	Bytes    int             `json:"bytes,omitempty"`
-	Messages int             `json:"messages,omitempty"`
-	Tools    int             `json:"tools,omitempty"`
-	Marks    []profileMark   `json:"marks,omitempty"`
-	Outcome  string          `json:"outcome,omitempty"`
-	Usage    json.RawMessage `json:"usage,omitempty"`
-	First    *float64        `json:"first_seconds,omitempty"`
-	Duration float64         `json:"duration_seconds,omitempty"`
-	Quality  string          `json:"quality,omitempty"`
+	Kind             string          `json:"kind"`
+	ID               string          `json:"request_id"`
+	Boot             string          `json:"boot"`
+	Seq              uint64          `json:"sequence"`
+	At               float64         `json:"at"`
+	Arrived          float64         `json:"arrived"`
+	Backend          string          `json:"backend,omitempty"`
+	Model            string          `json:"model,omitempty"`
+	Domain           string          `json:"domain,omitempty"`
+	Stream           bool            `json:"stream,omitempty"`
+	Bytes            int             `json:"bytes,omitempty"`
+	Messages         int             `json:"messages,omitempty"`
+	Tools            int             `json:"tools,omitempty"`
+	Marks            []profileMark   `json:"marks,omitempty"`
+	Outcome          string          `json:"outcome,omitempty"`
+	Usage            json.RawMessage `json:"usage,omitempty"`
+	First            *float64        `json:"first_seconds,omitempty"`
+	Duration         float64         `json:"duration_seconds,omitempty"`
+	Quality          string          `json:"quality,omitempty"`
+	UpstreamStatus   int             `json:"upstream_status,omitempty"`
+	ErrorClass       string          `json:"error_class,omitempty"`
+	GenerationResult string          `json:"generation_result,omitempty"`
 }
 type profileRequest struct {
 	e       profileEvent
@@ -214,6 +217,10 @@ func newRequestProfiler(c ProfileConfig) (*requestProfiler, error) {
 	p := &requestProfiler{c: c, key: key, boot: randomID(), started: now, indexReset: now, values: map[string]float64{}, types: map[string]string{}, groups: map[string]bool{}, domains: map[string]map[string]string{}, index: map[string]*list.Element{}, lru: list.New(), queue: make(chan []byte, c.QueueEvents), done: make(chan struct{}), jobs: map[string]*profileJob{}, work: make(chan string, 4)}
 	p.counterStarted = profileNow()
 	p.restoreCounters()
+	if p.values["aigate_error_metrics_start_time_seconds"] == 0 {
+		p.values["aigate_error_metrics_start_time_seconds"] = profileNow()
+	}
+	p.types["aigate_error_metrics_start_time_seconds"] = "gauge"
 	p.add("requests_started_total", "", 0)
 	p.add("requests_inflight", "", 0)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -466,6 +473,9 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	if cancelled {
 		e.Outcome = "client_cancelled"
 	}
+	if s := entry.generation; s != nil && s.started {
+		e.UpstreamStatus, e.ErrorClass, e.GenerationResult = s.status, s.errorClass, s.result
+	}
 	e.Usage = usageCounters(r.usage)
 	e.First = r.first
 	e.Duration = time.Since(r.start).Seconds()
@@ -477,6 +487,7 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	}
 	p.add("requests_inflight", "", -1)
 	p.add("requests_ended_total", profileExtra(r.tags, "outcome", e.Outcome), 1)
+	p.generationEnd(entry.generation, r.tags)
 	p.hist("request_duration_seconds", r.tags, e.Duration, profileTimeBuckets)
 	if e.First != nil {
 		p.hist("first_increment_seconds", r.tags, *e.First, profileTimeBuckets)

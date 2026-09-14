@@ -8,27 +8,55 @@ import (
 )
 
 const maxSSEEvent = 1 << 20
+const maxSSEChoices = 1024
+
+type sseObserverContextKey struct{}
 
 type observedTool struct{ ID, Name, Arguments string }
 
 // Observes a copy of streamed bytes. It never changes or delays the forward path.
 // Business streams retain no output text; probes collect bounded synthetic output.
 type sseObserver struct {
-	line, data                                         []byte
-	skipLF                                             bool
-	collect                                            bool
-	profileUsage                                       bool
-	Unknown, Invalid, HasError, Done, Finished, Useful bool
-	Content                                            string
-	Tools                                              map[int]*observedTool
-	Usage                                              json.RawMessage
-	FirstMS                                            *float64
-	started                                            time.Time
-	collected                                          int
+	line, data                               []byte
+	skipLF                                   bool
+	collect                                  bool
+	profileUsage                             bool
+	Unknown, Invalid, HasError, Done, Useful bool
+	expectedChoices                          int
+	finishedChoices                          map[int]bool
+	Content                                  string
+	Tools                                    map[int]*observedTool
+	Usage                                    json.RawMessage
+	FirstMS                                  *float64
+	started                                  time.Time
+	collected                                int
 }
 
 func newSSEObserver(collect bool) *sseObserver {
-	return &sseObserver{collect: collect, started: time.Now(), Tools: map[int]*observedTool{}}
+	return &sseObserver{collect: collect, started: time.Now(), Tools: map[int]*observedTool{}, expectedChoices: 1, finishedChoices: map[int]bool{}}
+}
+
+// Read the effective payload after overrides and compatibility adaptation.
+// Observation limits never reject or modify the business request.
+func (o *sseObserver) expectPayload(payload []byte) {
+	var fields struct {
+		N json.RawMessage `json:"n"`
+	}
+	if json.Unmarshal(payload, &fields) != nil {
+		o.Unknown = true
+		return
+	}
+	n := 1
+	if raw := fields.N; len(raw) > 0 && !isNull(raw) {
+		if json.Unmarshal(raw, &n) != nil || n < 1 {
+			o.Unknown = true
+			return
+		}
+	}
+	o.expectedChoices = n
+	if n > maxSSEChoices {
+		o.Unknown = true
+	}
 }
 
 func (o *sseObserver) Feed(p []byte) {
@@ -48,12 +76,13 @@ func (o *sseObserver) Feed(p []byte) {
 		} else {
 			o.line = append(o.line, b)
 		}
-		if len(o.line)+len(o.data) > maxSSEEvent || o.collected > maxSSEEvent {
+		if o.Unknown || len(o.line)+len(o.data) > maxSSEEvent || o.collected > maxSSEEvent {
 			o.Unknown = true
 			o.line = nil
 			o.data = nil
 			o.Content = ""
 			o.Tools = nil
+			o.finishedChoices = nil
 			return
 		}
 	}
@@ -88,9 +117,11 @@ func (o *sseObserver) event(data []byte) {
 		Error   json.RawMessage `json:"error"`
 		Usage   json.RawMessage `json:"usage"`
 		Choices []struct {
-			Finish *string `json:"finish_reason"`
+			Index  json.RawMessage `json:"index"`
+			Finish *string         `json:"finish_reason"`
 			Delta  struct {
 				Content       string `json:"content"`
+				Refusal       string `json:"refusal"`
 				Reasoning     string `json:"reasoning_content"`
 				ReasoningText string `json:"reasoning"`
 				Tools         []struct {
@@ -118,10 +149,26 @@ func (o *sseObserver) event(data []byte) {
 		o.Usage = usageCounters(event.Usage)
 	}
 	for _, c := range event.Choices {
-		if c.Finish != nil && *c.Finish != "" {
-			o.Finished = true
+		index := 0
+		if len(c.Index) == 0 {
+			if o.expectedChoices != 1 {
+				o.Invalid = true
+				continue
+			}
+		} else if isNull(c.Index) || json.Unmarshal(c.Index, &index) != nil {
+			o.Invalid = true
+			continue
 		}
-		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0 || (o.profileUsage && (c.Delta.Reasoning != "" || c.Delta.ReasoningText != ""))
+		if index < 0 || index >= o.expectedChoices {
+			o.Invalid = true
+			continue
+		}
+		if _, exists := o.finishedChoices[index]; !exists && len(o.finishedChoices) >= maxSSEChoices {
+			o.Unknown = true
+			return
+		}
+		o.finishedChoices[index] = o.finishedChoices[index] || (c.Finish != nil && *c.Finish != "")
+		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0 || c.Delta.Refusal != "" || c.Delta.Reasoning != "" || c.Delta.ReasoningText != ""
 		if useful {
 			o.Useful = true
 			if o.FirstMS == nil {
@@ -151,8 +198,33 @@ func (o *sseObserver) event(data []byte) {
 	}
 }
 
-func (o *sseObserver) valid() bool {
-	return !o.Unknown && !o.Invalid && !o.HasError && o.Done && o.Finished && o.Useful
+// completionClass is shared by business outcomes and generation metrics.
+// Empty content is a valid business completion, not a failed model probe.
+func (o *sseObserver) completionClass() string {
+	if o.HasError {
+		return "stream_error"
+	}
+	if o.Unknown {
+		return "unknown"
+	}
+	if o.Invalid {
+		return "protocol_error"
+	}
+	if !o.Done || len(o.data) > 0 || isDataLine(o.line) || len(o.finishedChoices) != o.expectedChoices {
+		return "stream_incomplete"
+	}
+	for _, finished := range o.finishedChoices {
+		if !finished {
+			return "stream_incomplete"
+		}
+	}
+	return ""
+}
+
+func (o *sseObserver) valid() bool { return o.completionClass() == "" }
+
+func (o *sseObserver) validProbe() bool {
+	return o.valid() && o.Useful && (strings.TrimSpace(o.Content) != "" || len(o.Tools) > 0)
 }
 
 func (o *sseObserver) errorMessage() string {
@@ -165,7 +237,7 @@ func (o *sseObserver) errorMessage() string {
 	if o.Invalid {
 		return "SSE 事件格式无效"
 	}
-	if !o.Done || !o.Finished {
+	if o.completionClass() == "stream_incomplete" {
 		return "SSE 未完整结束"
 	}
 	if !o.Useful || (o.collect && strings.TrimSpace(o.Content) == "" && len(o.Tools) == 0) {

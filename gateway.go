@@ -90,6 +90,7 @@ func (g *Gateway) Close() {
 }
 
 type auditEntry struct {
+	generation     *generationResult
 	RequestID      string  `json:"request_id"`
 	QuestionPrefix string  `json:"question_prefix"`
 	Status         int     `json:"status"`
@@ -141,10 +142,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/health" && r.Method == http.MethodGet {
 		sendJSON(w, entry, 200, []byte(`{"status":"ok"}`))
-		return
-	}
-	if r.URL.Path == "/docs" && r.Method == http.MethodGet {
-		serveDocs(w)
 		return
 	}
 	if r.URL.Path == "/openapi.json" && r.Method == http.MethodGet {
@@ -273,8 +270,23 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), seconds(g.config.TimeoutSeconds))
 	defer cancel()
+	entry.generation = &generationResult{stream: body.stream}
+	state := entry.generation
+	if body.stream {
+		state.observer = newSSEObserver(false)
+		ctx = context.WithValue(ctx, sseObserverContextKey{}, state.observer)
+	}
+	ctx = context.WithValue(ctx, generationContextKey{}, state)
+	defer func() { state.finish(entry, r.Context().Err() != nil) }()
 	response, err := g.generate(ctx, body, backend, model)
 	if err != nil {
+		if state.started && state.errorClass == "" && r.Context().Err() == nil {
+			if err.Code == "upstream_timeout" {
+				state.fail("timeout")
+			} else {
+				state.fail("connection_error")
+			}
+		}
 		if err.Status >= 500 || err.Status == 429 {
 			outcome = "backend_failure"
 		}
@@ -285,12 +297,21 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		outcome = "backend_failure"
+		if response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != 429 {
+			outcome = "upstream_rejected"
+		}
+		g.forwardGenerationError(w, r, response, ctx, entry)
+		return
+	}
 	if body.stream {
 		outcome = g.stream(w, r, response, ctx, entry)
 		return
 	}
 	data, readErr = io.ReadAll(response.Body)
 	if readErr != nil {
+		state.transportError(readErr, ctx, r.Context(), "response_read_error")
 		outcome = "backend_failure"
 		sendError(w, entry, upstreamError(readErr, ctx))
 		return
@@ -307,6 +328,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	result, err := normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
 	if err != nil {
+		state.fail("protocol_error")
 		outcome = "backend_failure"
 		sendError(w, entry, err)
 		return
@@ -315,6 +337,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	if entry.Outcome == "completed" {
 		outcome = "success"
 	} else {
+		state.writeFailure(ctx, r.Context())
 		outcome = "client_failure"
 	}
 }
@@ -323,6 +346,9 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	payload, err := makePayload(body, backend, model)
 	if err != nil {
 		return nil, err
+	}
+	if observer, ok := ctx.Value(sseObserverContextKey{}).(*sseObserver); ok {
+		observer.expectPayload(payload)
 	}
 	if pr, ok := ctx.Value(profileContextKey{}).(*profileRequest); ok && g.profile != nil {
 		g.profile.input(pr, payload, backend, pr.e.Backend, model)
@@ -337,9 +363,20 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	state := generationFrom(ctx)
+	if state != nil {
+		state.started = true
+	}
 	response, requestErr := g.client.Do(req)
 	if requestErr != nil {
 		return nil, upstreamError(requestErr, ctx)
+	}
+	if state != nil {
+		state.status = response.StatusCode
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			state.fail(upstreamHTTPClass(response.StatusCode))
+			return response, nil
+		}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		response.Body.Close()
@@ -353,6 +390,7 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	}
 	if body.stream && !strings.EqualFold(strings.TrimSpace(strings.SplitN(response.Header.Get("Content-Type"), ";", 2)[0]), "text/event-stream") {
 		response.Body.Close()
+		state.fail("protocol_error")
 		return nil, fault(502, "invalid_upstream_stream", "下游未返回 SSE 流")
 	}
 	return response, nil
@@ -369,17 +407,15 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	w.WriteHeader(200)
 	entry.Status = 200
 	if controller.Flush() != nil {
+		entry.generation.writeFailure(ctx, r.Context())
 		return "client_failure"
 	}
 	buffer := g.buffers.Get().(*[]byte)
 	defer g.buffers.Put(buffer)
-	var observer *sseObserver
-	if g.management != nil {
-		observer = newSSEObserver(false)
-	}
+	observer := entry.generation.observer
 	var profileObserver *sseObserver
 	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
-		profileObserver = newSSEObserver(false)
+		profileObserver = observer
 		profileObserver.started = pr.start
 		profileObserver.profileUsage = true
 		defer func() {
@@ -394,7 +430,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			// Keep forwarding semantics unchanged; profile success requires a complete stream.
 			if entry.Outcome == "completed" && !profileObserver.valid() {
 				pr.outcome = "upstream_protocol_error"
-				if profileObserver.Unknown {
+				if profileObserver.completionClass() == "unknown" {
 					pr.outcome = "protocol_unknown"
 				}
 			}
@@ -420,9 +456,8 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		n, readErr := response.Body.Read(*buffer)
 		if n > 0 {
 			data := (*buffer)[:n]
-			if profileObserver != nil {
-				profileObserver.Feed(data)
-			}
+			observer.Feed(data)
+			entry.generation.observeStream(observer, false)
 			var err error
 			if rewrite != nil {
 				err = rewrite.feed(data, emit)
@@ -430,14 +465,15 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 				err = emit(data)
 			}
 			if writeFailed {
+				entry.generation.writeFailure(ctx, r.Context())
 				return "client_failure"
-			}
-			if observer != nil {
-				observer.Feed(data)
 			}
 			if err != nil {
 				readErr = err
 			}
+		}
+		if readErr == io.EOF && r.Context().Err() == nil {
+			entry.generation.observeStream(observer, true)
 		}
 		if readErr == io.EOF && rewrite != nil {
 			if err := rewrite.finish(); err != nil {
@@ -453,7 +489,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		if readErr == io.EOF {
 			if observer != nil && !observer.valid() {
 				entry.Outcome = "upstream_protocol_error"
-				if observer.Unknown {
+				if observer.completionClass() == "unknown" {
 					entry.Outcome = "protocol_unknown"
 					return "protocol_unknown"
 				}
@@ -461,6 +497,15 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			}
 			entry.Outcome = "completed"
 			return "success"
+		}
+		if errors.Is(readErr, errSSEModel) {
+			if observer.Unknown {
+				entry.generation.result = "unknown"
+			} else {
+				entry.generation.fail("protocol_error")
+			}
+		} else {
+			entry.generation.transportError(readErr, ctx, r.Context(), "response_read_error")
 		}
 		code := "upstream_stream_error"
 		if errors.Is(readErr, errSSEModel) {

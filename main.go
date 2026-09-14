@@ -92,10 +92,10 @@ func switchCommand(args []string, out io.Writer) error {
 func run(args []string, out, stderr io.Writer) error {
 	if len(args) > 0 {
 		switch args[0] {
-		case "switch", "status", "warmup", "maintenance", "restore", "confirm-drain":
+		case "switch", "status", "warmup", "maintenance", "restore", "confirm-drain", "backends":
 			for _, arg := range args[1:] {
 				if arg == "--help" || arg == "-h" {
-					_, err := fmt.Fprintln(out, "管理命令: status | warmup BACKEND | switch single BACKEND | maintenance BACKEND | restore BACKEND | confirm-drain BACKEND\n选项: --config PATH --admin-url URL --operation-id ID --no-wait --json\n未启用 management 时，switch 保留 single 路由文件切换。")
+					_, err := fmt.Fprintln(out, "管理命令: status | warmup BACKEND | switch single BACKEND | maintenance BACKEND | restore BACKEND | confirm-drain BACKEND | backends list | backends create REQUEST.json | backends edit BACKEND REQUEST.json\n选项: --config PATH --socket PATH --operation-id ID --no-wait --json\n未启用 management 时，switch 保留 single 路由文件切换。")
 					return err
 				}
 			}
@@ -103,7 +103,7 @@ func run(args []string, out, stderr io.Writer) error {
 	}
 	if len(args) > 0 {
 		switch args[0] {
-		case "status", "warmup", "maintenance", "restore", "confirm-drain":
+		case "status", "warmup", "maintenance", "restore", "confirm-drain", "backends":
 			return managedCLI(args[0], args[1:], out)
 		}
 	}
@@ -118,7 +118,7 @@ func run(args []string, out, stderr io.Writer) error {
 	flags := flag.NewFlagSet("aigate "+command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "用法: aigate [serve|check] [选项]\n管理命令: status, warmup, switch, maintenance, restore, confirm-drain；各命令支持 --help")
+		fmt.Fprintln(stderr, "用法: aigate [serve|check] [选项]\n管理命令: status, warmup, switch, maintenance, restore, confirm-drain, backends；各命令支持 --help")
 		flags.PrintDefaults()
 	}
 	path := flags.String("config", configPath(), "主配置路径，也可设置 AIGATE_CONFIG")
@@ -173,15 +173,13 @@ func run(args []string, out, stderr io.Writer) error {
 		return err
 	}
 	defer listener.Close()
-	var admin *http.Server
-	var adminListener net.Listener
+	var admin *controlServer
 	if c.Management.Enabled {
-		adminListener, err = net.Listen("tcp", c.Management.Listen)
+		admin, err = listenControl(gateway.management, c.Management.Socket)
 		if err != nil {
 			return err
 		}
-		defer adminListener.Close()
-		admin = &http.Server{Handler: gateway.adminHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+		defer admin.Close()
 	}
 	var profileServer *http.Server
 	var profileListener net.Listener
@@ -202,7 +200,7 @@ func run(args []string, out, stderr io.Writer) error {
 	}
 	go func() { done <- server.Serve(listener) }()
 	if admin != nil {
-		go func() { done <- admin.Serve(adminListener) }()
+		go func() { done <- admin.Serve() }()
 	}
 	select {
 	case err := <-done:
@@ -222,9 +220,7 @@ func run(args []string, out, stderr io.Writer) error {
 		closing, cancel := context.WithTimeout(context.Background(), *shutdown)
 		defer cancel()
 		if admin != nil {
-			if err := admin.Shutdown(closing); err != nil {
-				_ = admin.Close()
-			}
+			_ = admin.Close()
 		}
 		if err := server.Shutdown(closing); err != nil {
 			_ = server.Close()

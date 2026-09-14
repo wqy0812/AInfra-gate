@@ -34,76 +34,87 @@ func writeBackendOK(t *testing.T, m *Management, create bool, req BackendWriteRe
 	return op
 }
 
-func TestOnlineBackendsAPIAndNewRoute(t *testing.T) {
+func TestOnlineBackendsCLIAndNewRoute(t *testing.T) {
 	one, two, three := newProtocolBackend(t), newProtocolBackend(t), newProtocolBackend(t)
-	g, business, logs := serveTest(t, managedConfig(t, one, two))
-	admin := httptest.NewServer(g.adminHandler())
-	defer admin.Close()
+	c := managedConfig(t, one, two)
+	g, business, logs := serveTest(t, c)
+	startTestControl(t, g)
+	cfg := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(cfg, encodeJSON(c), 0600); err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(t.TempDir(), "request.json")
+	var out bytes.Buffer
+	cli := func(args ...string) error {
+		out.Reset()
+		return run(append(args, "--config", cfg, "--json"), &out, io.Discard)
+	}
+	write := func(req BackendWriteRequest, args ...string) error {
+		t.Helper()
+		if err := os.WriteFile(requestPath, encodeJSON(req), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return cli(append(args, requestPath)...)
+	}
 	m := g.management
 	req := backendRequest(m, "api3", map[string]any{"url": three.server.URL + "/infer", "models_url": three.server.URL + "/v1/models"})
 	secret := "Bearer online-private-secret"
 	req.Credentials = map[string]HeaderChange{"Authorization": {Action: "replace", Value: &secret}}
-	call := func(method, path string, body any) (int, []byte) {
-		t.Helper()
-		text := ""
-		if body != nil {
-			text = string(encodeJSON(body))
+	if err := write(req, "backends", "create"); err != nil {
+		t.Fatal(err)
+	}
+	if one.posts.Load()+two.posts.Load()+three.posts.Load() != 0 || m.status().ActiveBackend != "api1" {
+		t.Fatal("save generated traffic or changed route")
+	}
+	for _, args := range [][]string{{"backends", "list"}, {"status"}} {
+		if err := cli(args...); err != nil {
+			t.Fatal(err)
 		}
-		r, data := request(t, admin, method, path, text, "Bearer admin-secret")
-		return r.StatusCode, data
-	}
-	if status, data := call("POST", "/admin/v1/backends", req); status != 201 {
-		t.Fatalf("create: %d %s", status, data)
-	}
-	if one.posts.Load()+two.posts.Load()+three.posts.Load() != 0 {
-		t.Fatal("saving sent generation traffic")
-	}
-	if m.status().ActiveBackend != "api1" {
-		t.Fatal("save changed route")
-	}
-	for _, path := range []string{"/admin/v1/backends", "/admin/v1/status", "/admin/v1/operations/" + req.OperationID} {
-		status, data := call("GET", path, nil)
-		if status != 200 || bytes.Contains(data, []byte(secret)) || bytes.Contains(data, []byte("fingerprint")) || bytes.Contains(data, []byte("registry")) {
-			t.Fatalf("unsafe response: %s %d", path, status)
+		if bytes.Contains(out.Bytes(), []byte(secret)) || bytes.Contains(out.Bytes(), []byte("fingerprint")) {
+			t.Fatal("unsafe CLI response")
 		}
 	}
-	if status, _ := call("POST", "/admin/v1/backends", req); status != 201 {
-		t.Fatal("retry failed")
+	if err := write(req, "backends", "create"); err != nil {
+		t.Fatalf("retry failed: %v", err)
 	}
 	req.Backend["preferred_model"] = encodeJSON("different")
-	if status, _ := call("POST", "/admin/v1/backends", req); status != 409 {
-		t.Fatal("idempotency conflict not rejected")
+	if err := write(req, "backends", "create"); err == nil {
+		t.Fatal("idempotency conflict accepted")
 	}
-	op := waitOp(t, m, submitOp(t, m, "switch", "api3").ID)
-	if op.Outcome != "completed" {
-		t.Fatalf("new backend switch: %s", encodeJSON(op))
+	if err := cli("switch", "single", "api3"); err != nil {
+		t.Fatal(err)
 	}
 	before := three.posts.Load()
 	r, _ := request(t, business, "POST", "/v1/chat/completions", basicBody, "")
 	if r.StatusCode != 200 || three.posts.Load() != before+1 {
 		t.Fatal("new backend did not serve business")
 	}
-	if strings.Contains(logs.String(), secret) {
-		t.Fatal("secret logged")
-	}
-	// The same authentication, CSRF and strict body guards apply to PATCH.
 	patch := backendRequest(m, "api2", map[string]any{"preferred_model": "local-protocol-model"})
-	if status, _ := call("PATCH", "/admin/v1/backends/api2", patch); status != 200 {
-		t.Fatal("patch failed")
+	if err := write(patch, "backends", "edit", "api2"); err != nil {
+		t.Fatal(err)
 	}
-	r, _ = request(t, admin, "GET", "/admin/v1/backends", "", "")
-	if r.StatusCode != 401 {
-		t.Fatal("anonymous registry access")
+	if err := write(patch, "backends", "edit", "api1"); err == nil {
+		t.Fatal("target mismatch accepted")
 	}
-	if status, _ := call("PATCH", "/admin/v1/backends/api1", patch); status != 400 {
-		t.Fatal("path mismatch accepted")
+	patch = backendRequest(m, "api3", map[string]any{"preferred_model": "another"})
+	if err := write(patch, "backends", "edit", "api3"); err == nil {
+		t.Fatal("active backend edited")
 	}
-	if status, _ := call("POST", "/admin/v1/backends", map[string]any{"unknown": 1}); status != 400 {
-		t.Fatal("unknown envelope accepted")
+	patch = backendRequest(m, "api2", map[string]any{"preferred_model": "another"})
+	patch.ExpectedRevision--
+	if err := write(patch, "backends", "edit", "api2"); err == nil {
+		t.Fatal("stale revision accepted")
 	}
-	r, _ = request(t, admin, "GET", "/backends.js", "", "")
-	if r.StatusCode != 200 {
-		t.Fatal("editor asset missing")
+	for _, data := range []string{`{"unknown":1}`, `null`, strings.Repeat("x", (64<<10)+1)} {
+		if err := os.WriteFile(requestPath, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := cli("backends", "create", requestPath); err == nil {
+			t.Fatal("invalid request accepted")
+		}
+	}
+	if strings.Contains(logs.String(), secret) || strings.Contains(out.String(), secret) {
+		t.Fatal("secret exposed")
 	}
 }
 

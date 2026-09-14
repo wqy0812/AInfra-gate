@@ -145,8 +145,7 @@ func managedConfig(t *testing.T, backends ...*protocolBackend) *Config {
 	}
 	c := fixtureConfig(t, urls...)
 	c.Routing = Policy{Mode: "single", Backend: "api1"}
-	t.Setenv("AIGATE_TEST_ADMIN_KEY", "admin-secret")
-	c.Management = ManagementConfig{Enabled: true, APIKeyEnv: "AIGATE_TEST_ADMIN_KEY", StateFile: filepath.Join(t.TempDir(), "state.json"), WarmupRounds: 1, WarmupStepSeconds: 1, WarmupTimeoutSeconds: 5, DrainTimeoutSeconds: .12, FailureWindowSeconds: 5, RollbackRetrySeconds: .03}
+	c.Management = ManagementConfig{Enabled: true, Socket: filepath.Join(controlTempDir(t), "control.sock"), StateFile: filepath.Join(t.TempDir(), "state.json"), WarmupRounds: 1, WarmupStepSeconds: 1, WarmupTimeoutSeconds: 5, DrainTimeoutSeconds: .12, FailureWindowSeconds: 5, RollbackRetrySeconds: .03}
 	c.Management.defaults(c, filepath.Join(t.TempDir(), "config.json"))
 	return c
 }
@@ -308,7 +307,7 @@ func TestManagedAutomaticRollbackAndLock(t *testing.T) {
 			two.businessStatus.Store(503)
 			for i := 0; i < 3; i++ {
 				r, _ := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-				if r.StatusCode != 502 {
+				if r.StatusCode != 503 {
 					t.Fatal(r.StatusCode)
 				}
 			}
@@ -457,53 +456,49 @@ func TestManagedStateLockRestartAndReadOnlyCheck(t *testing.T) {
 	submitOp(t, g.management, "maintenance", "api2")
 }
 
-func TestManagedAdminAPIAndCLI(t *testing.T) {
+func TestManagedLocalCLI(t *testing.T) {
 	one, two := newProtocolBackend(t), newProtocolBackend(t)
 	c := managedConfig(t, one, two)
 	g, business, logs := serveTest(t, c)
-	admin := httptest.NewServer(g.adminHandler())
-	defer admin.Close()
-	r, _ := request(t, admin, "GET", "/admin/v1/status", "", "")
-	if r.StatusCode != 401 {
-		t.Fatal("admin allowed missing key")
-	}
-	r, _ = request(t, business, "GET", "/admin/v1/status", "", "Bearer admin-secret")
-	if r.StatusCode != 404 {
-		t.Fatal("admin exposed on business port")
-	}
-	for _, path := range []string{"/", "/app.js", "/style.css"} {
-		r, data := request(t, admin, "GET", path, "", "")
-		if r.StatusCode != 200 || len(data) == 0 {
-			t.Fatal("missing embedded asset")
+	startTestControl(t, g)
+	for _, path := range []string{"/", "/index.html", "/app.js", "/backends.js", "/style.css", "/docs", "/admin/v1/status", "/admin/v1/backends"} {
+		r, _ := request(t, business, "GET", path, "", "")
+		if r.StatusCode != 404 {
+			t.Fatalf("removed endpoint still served: %s", path)
 		}
 	}
-	req, _ := http.NewRequest("GET", admin.URL+"/admin/v1/status", nil)
-	req.Header.Set("Authorization", "Bearer admin-secret")
-	req.Header.Set("Origin", "https://other.example")
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	response.Body.Close()
-	if response.StatusCode != 403 {
-		t.Fatal("cross-origin API permitted")
-	}
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	os.WriteFile(cfgPath, encodeJSON(c), 0600)
-	var out bytes.Buffer
-	if err := run([]string{"switch", "single", "api2", "--config", cfgPath, "--admin-url", admin.URL, "--json"}, &out, io.Discard); err != nil {
+	if err := os.WriteFile(cfgPath, encodeJSON(c), 0600); err != nil {
 		t.Fatal(err)
 	}
+	var out bytes.Buffer
+	cli := func(args ...string) {
+		t.Helper()
+		out.Reset()
+		if err := run(append(args, "--config", cfgPath, "--json"), &out, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cli("warmup", "api2")
+	cli("switch", "single", "api2")
 	var op Operation
 	if decodeJSON(out.Bytes(), &op) != nil || op.Outcome != "completed" || g.management.status().ActiveBackend != "api2" {
-		t.Fatal("CLI did not use management API")
+		t.Fatal("CLI did not switch through local socket")
 	}
-	out.Reset()
-	if err := run([]string{"status", "--config", cfgPath, "--admin-url", admin.URL, "--json"}, &out, io.Discard); err != nil {
-		t.Fatal(err)
+	cli("maintenance", "api1")
+	if !g.management.status().Backends["api1"].Maintenance {
+		t.Fatal("CLI did not lock maintenance")
 	}
-	if strings.Contains(out.String(), "admin-secret") || strings.Contains(logs.String(), "aigate-echo-") || strings.Contains(logs.String(), "private") {
-		t.Fatal("management exposed credentials or generated output")
+	cli("restore", "api1")
+	if g.management.status().Backends["api1"].Maintenance {
+		t.Fatal("CLI did not restore")
+	}
+	cli("status")
+	if strings.Contains(logs.String(), "aigate-echo-") || strings.Contains(logs.String(), "private") {
+		t.Fatal("management exposed generated output")
+	}
+	if err := run([]string{"status", "--config", cfgPath, "--admin-url", "http://127.0.0.1:8081"}, io.Discard, io.Discard); err == nil {
+		t.Fatal("removed HTTP option accepted")
 	}
 }
 
