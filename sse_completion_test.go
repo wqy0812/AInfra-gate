@@ -156,7 +156,7 @@ func TestSSECompletionGatewayModes(t *testing.T) {
 						if strings.Contains(generationMetrics(g.profile), "aigate_first_increment_seconds_count{") {
 							t.Fatal("invented first token")
 						}
-						if !strings.Contains(generationMetrics(g.profile), `outcome="completed"} 3`) {
+						if !strings.Contains(generationMetrics(g.profile), `outcome="completed",request_scope="all"} 3`) {
 							t.Fatal("profile outcome disagrees")
 						}
 					}

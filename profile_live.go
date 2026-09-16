@@ -1,0 +1,144 @@
+package main
+
+import (
+	"context"
+	"strconv"
+	"time"
+)
+
+// Live values are never stored in the cumulative counter checkpoint.
+var profileLiveStages = []string{
+	"routing_discovery", "preparing_upstream",
+	"waiting_upstream_headers", "waiting_first_output", "streaming",
+	"reading_response", "writing_client", "finishing_stream",
+}
+
+var profileIdleThresholds = []int{5, 15, 30, 60}
+
+type profileLiveRequest struct {
+	start, lastUseful time.Time
+	backend, stage    string
+	terminal          bool
+	unknown           bool
+	nonstream         bool
+}
+
+func profileFrom(ctx context.Context) *profileRequest {
+	r, _ := ctx.Value(profileContextKey{}).(*profileRequest)
+	return r
+}
+
+func (r *profileRequest) updateLive(update func(*profileLiveRequest)) {
+	if r == nil || r.profiler == nil {
+		return
+	}
+	p := r.profiler
+	p.mu.Lock()
+	if live, ok := p.active[r.e.Seq]; ok {
+		update(&live)
+		p.active[r.e.Seq] = live
+	}
+	p.mu.Unlock()
+}
+
+func (r *profileRequest) liveStage(stage string) {
+	r.updateLive(func(live *profileLiveRequest) { live.stage = stage })
+}
+
+func (r *profileRequest) liveBackend(backend string) {
+	if r == nil || r.profiler == nil {
+		return
+	}
+	r.updateLive(func(live *profileLiveRequest) {
+		groups := r.profiler.liveBackends
+		if !groups[backend] && backend != "unrouted" && backend != "overflow" && len(groups)-profileBoolInt(groups["unrouted"])-profileBoolInt(groups["overflow"]) >= 64 {
+			backend = "overflow"
+		}
+		groups[backend] = true
+		live.backend = backend
+	})
+}
+
+func (r *profileRequest) liveTerminal() {
+	r.updateLive(func(live *profileLiveRequest) { live.terminal = true })
+}
+
+func (r *profileRequest) liveObserve(o *sseObserver) {
+	r.updateLive(func(live *profileLiveRequest) {
+		live.lastUseful = o.LastUsefulAt
+		live.unknown = o.Unknown || o.Invalid
+		live.terminal = live.terminal || o.HasError || o.valid()
+	})
+}
+
+func (r *profileRequest) liveStreamRead(o *sseObserver) {
+	stage := "waiting_first_output"
+	if o.HasError || o.valid() {
+		stage = "finishing_stream"
+	} else if o.Useful {
+		stage = "streaming"
+	}
+	r.liveStage(stage)
+}
+
+// Input maps are private scrape snapshots. Durations use Go's monotonic clock.
+func profileLiveMetrics(now time.Time, active map[uint64]profileLiveRequest, backends map[string]bool, values map[string]float64, types map[string]string) {
+	// A source-level inventory lets consumers reject partial backend aggregates,
+	// even after a vanished series has aged out of the current query window.
+	types["aigate_live_backend_groups"] = "gauge"
+	values["aigate_live_backend_groups"] = float64(len(backends))
+	base := []string{"streams_waiting_first_output", "stream_first_output_wait_max_seconds", "stream_idle_requests", "stream_idle_max_seconds", "inflight_requests_by_stage", "inflight_oldest_age_seconds", "inflight_oldest_stage", "stream_observation_unknown"}
+	for _, name := range base {
+		types["aigate_"+name] = "gauge"
+	}
+	tagsFor := func(backend string) string { return profileExtra("", "backend", backend) }
+	for backend := range backends {
+		tags := tagsFor(backend)
+		for _, name := range []string{base[0], base[1], base[3], base[5], base[7]} {
+			values["aigate_"+name+tags] = 0
+		}
+		for _, threshold := range profileIdleThresholds {
+			values["aigate_stream_idle_requests"+profileExtra(tags, "threshold_seconds", strconv.Itoa(threshold))] = 0
+		}
+		for _, stage := range profileLiveStages {
+			values["aigate_inflight_requests_by_stage"+profileExtra(tags, "stage", stage)] = 0
+			values["aigate_inflight_oldest_stage"+profileExtra(tags, "stage", stage)] = 0
+		}
+	}
+	oldest := make(map[string]uint64)
+	for seq, live := range active {
+		tags := tagsFor(live.backend)
+		age := max(0, now.Sub(live.start).Seconds())
+		values["aigate_inflight_requests_by_stage"+profileExtra(tags, "stage", live.stage)]++
+		previous, found := oldest[live.backend]
+		if !found || live.start.Before(active[previous].start) || (live.start.Equal(active[previous].start) && seq < previous) {
+			oldest[live.backend] = seq
+		}
+		if live.nonstream || live.terminal {
+			continue
+		}
+		if live.unknown {
+			values["aigate_stream_observation_unknown"+tags]++
+			continue
+		}
+		if live.lastUseful.IsZero() {
+			values["aigate_streams_waiting_first_output"+tags]++
+			key := "aigate_stream_first_output_wait_max_seconds" + tags
+			values[key] = max(values[key], age)
+		} else {
+			idle := max(0, now.Sub(live.lastUseful).Seconds())
+			key := "aigate_stream_idle_max_seconds" + tags
+			values[key] = max(values[key], idle)
+			for _, threshold := range profileIdleThresholds {
+				if idle >= float64(threshold) {
+					values["aigate_stream_idle_requests"+profileExtra(tags, "threshold_seconds", strconv.Itoa(threshold))]++
+				}
+			}
+		}
+	}
+	for backend, seq := range oldest {
+		live, tags := active[seq], tagsFor(backend)
+		values["aigate_inflight_oldest_age_seconds"+tags] = max(0, now.Sub(live.start).Seconds())
+		values["aigate_inflight_oldest_stage"+profileExtra(tags, "stage", live.stage)] = 1
+	}
+}

@@ -206,6 +206,7 @@ func (p *BackendPool) choose(ctx context.Context) (string, *Backend, string, *Ga
 		return "", nil, "", err
 	}
 	runtime := p.snapshot(policy.Backend)
+	profileFrom(ctx).liveBackend(policy.Backend)
 	model, discoveryErr := p.discoverRuntime(ctx, runtime)
 	if discoveryErr != nil {
 		return "", nil, "", discoveryErr

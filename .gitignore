@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+*.env
 config.json
 config.management.json
 routing.json
@@ -8,6 +11,11 @@ body-agent-ds4.json
 /bin/
 /dist/
 /request-profile/
+/slow-requests/
+.aigate/
+__pycache__/
+*.py[cod]
+.DS_Store
 coverage.out
 *.test
 management-state.json
@@ -15,5 +23,12 @@ management-state.json.lock
 .management-*.json
 .backups/
 deploy/**/evidence/
+deploy/**/source-manifest.json
+
+# Historical execution output stays local; source/scripts/reports remain tracked.
+/deploy/profile/benchmark.txt
+/deploy/profile/e2e-result.json
+/deploy/profile/gateway-final-state.json
+/deploy/profile/gateway-live.json
 
 management-state.json.v1-backup-*

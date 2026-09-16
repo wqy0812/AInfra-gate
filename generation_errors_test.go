@@ -61,9 +61,9 @@ func requireGenerationCount(t *testing.T, p *requestProfiler, stream bool, resul
 	t.Helper()
 	m := generationMetrics(p)
 	tags := fmt.Sprintf(`{backend="api1",model="real",stream="%t"`, stream)
-	wants := []string{fmt.Sprintf(`aigate_generation_requests_ended_total%s,result="%s"} %d`, tags, result, count)}
+	wants := []string{fmt.Sprintf(`aigate_generation_requests_ended_total%s,result="%s",request_scope="all"} %d`, tags, result, count)}
 	if class != "" {
-		wants = append(wants, fmt.Sprintf(`aigate_upstream_errors_total%s,error_class="%s",upstream_status="%s"} %d`, tags, class, status, count))
+		wants = append(wants, fmt.Sprintf(`aigate_upstream_errors_total%s,error_class="%s",upstream_status="%s",request_scope="all"} %d`, tags, class, status, count))
 	}
 	for _, want := range wants {
 		if !strings.Contains(m, want+"\n") {
@@ -120,7 +120,7 @@ func TestGenerationHTTPPassthrough(t *testing.T) {
 					t.Fatalf("unexpected retry/redirect: %d", calls)
 				}
 				g.profile.close()
-				files, _ := filepath.Glob(filepath.Join(g.config.Profile.Directory, "events-*.jsonl"))
+				files, _ := filepath.Glob(filepath.Join(g.config.Profile.Directory, "events-v2-*.jsonl"))
 				for _, file := range files {
 					b, err := os.ReadFile(file)
 					if err != nil {
@@ -274,10 +274,10 @@ func TestGenerationConcurrentCountersAndRestart(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 40; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); generationRequest(g, false) }()
+		go func() { defer wg.Done(); generationRequest(g, true) }()
 	}
 	wg.Wait()
-	requireGenerationCount(t, g.profile, false, "error", "rate_limited", "429", 40)
+	requireGenerationCount(t, g.profile, true, "error", "rate_limited", "429", 40)
 	start := g.profile.values["aigate_error_metrics_start_time_seconds"]
 	g.profile.close()
 	p, err := newRequestProfiler(g.config.Profile)
@@ -285,7 +285,7 @@ func TestGenerationConcurrentCountersAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.close()
-	requireGenerationCount(t, p, false, "error", "rate_limited", "429", 40)
+	requireGenerationCount(t, p, true, "error", "rate_limited", "429", 40)
 	if p.values["aigate_error_metrics_start_time_seconds"] != start {
 		t.Fatal("error counter origin changed")
 	}
@@ -351,11 +351,11 @@ func TestGenerationMetricsUpgradeAndGroupLimit(t *testing.T) {
 	for i := 0; i < 70; i++ {
 		next.mu.Lock()
 		tags := next.tags(fmt.Sprintf("backend-%d", i), "real")
-		next.generationEnd(&generationResult{started: true, status: 503, errorClass: "server_error", result: "error"}, tags)
+		next.generationEnd(&generationResult{stream: true, started: true, status: 503, errorClass: "server_error", result: "error"}, tags)
 		next.mu.Unlock()
 	}
 	m := generationMetrics(next)
-	if len(next.groups) != 65 || !strings.Contains(m, `aigate_upstream_errors_total{backend="overflow",model="overflow",stream="false",error_class="server_error",upstream_status="503"} 6`) {
+	if len(next.groups) != 65 || !strings.Contains(m, `aigate_upstream_errors_total{backend="overflow",model="overflow",stream="true",error_class="server_error",upstream_status="503",request_scope="all"} 6`) {
 		t.Fatal("unbounded error groups")
 	}
 	for _, auth := range []string{"", "Bearer fixture-key"} {

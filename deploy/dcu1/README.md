@@ -1,12 +1,28 @@
 # dcu1 上线记录
 
-## CLI 管理版本迁移（尚未部署）
+以下按日期保存历史发布结果；2026-09-15 22:17 的 metric-v2 后续发布记录位于相邻 monitoring 仓库的 `docs/metric-scope-v2-20260915.md`，源码口径见 [项目说明](../../README.md)。操作前重新读取当前二进制、配置和路由，不能将下方旧版本当作实时状态。脚本依赖与入库规则见 [部署源码说明](../README.md)。
+
+## 慢请求输入留存版本（2026-09-15）
+
+DCU 网关已于 17:54:09 更新为与 A3 相同的 `slow-requests-20260915`，二进制 SHA-256 为 `a1cd6006464b14a1199c582f69350a0971c015a4facccb338728251e27be9fd2`。启用仅流式请求结束后耗时严格超过 300 秒的完整原始输入留存，目录 `/data4/aigate/slow-requests`，默认保留 72 小时／10 GiB。
+
+路由保持 `active_backend=dcu`、`route_version=3`，A3 后端维护锁保持。DCU 同步采用流式画像和独立非流式计数，新流式计数起点独立，旧混合检查点和历史数据保留。本次未更新 A3 网关或推理服务。详情、验收证据和回退方法见 [本次发布记录](slow-requests-20260915/README.md)。以下为历史上线记录。
+
+## 历史版本 e435f42（2026-09-14）
+
+已通过 SSH MCP 升级至 `/data4/aigate/releases/e435f42-30a42c2020ea`，二进制 SHA256 `30a42c2020ea2445110289f5e606c6c1ddb4daa07aa3e687a845693367ca00e9`。用户选择保持 A3 接流：`active_backend=a3`、`route_version=2`，DCU 后端维护锁保持。
+
+任意字符串 `model` 或省略模型名均可调用。候选及正式 HTTP 各 49/49、两轮完整协议验证，以及任意模型名 JSON/SSE 各 6/6 全部通过。管理改用私有 Unix socket，8081 已关闭；画像历史、累计计数起点、HMAC、凭据及后端注册表保留，新指标已进入 VictoriaMetrics。DCU 两台主机上的推理及其他容器未重启。
+
+详细证据、回退位置及验收范围见 [本次部署验收](evidence/e435f42-20260914/README.md)。下方为迁移说明及历史记录。
+
+## CLI 管理版本迁移（已于 2026-09-14 部署）
 
 新版本移除 Web、管理 HTTP API 和 8081 监听，管理仅由本机 CLI 通过 Unix socket 完成。部署前在主配置的 management 中移除 listen、api_key_env，增加 `"socket": "/data4/aigate/.aigate/control.sock"`；状态文件保持原位，勿覆盖已有 v2 后端注册表。socket 目录由程序创建为 0700，文件为 0600，以服务用户或 root 运行 `aigate-admin`。
 
 `admin.env` 可能同时包含业务、下游或 Profile 凭据，不能因为管理密钥移除而删除整个文件。包装脚本仍加载该环境文件，但 CLI 授权由本机 socket 权限控制。
 
-升级仍需先备份版本、配置和状态，候选验证后排空并优雅重启。启动后执行 `aigate-admin status --json`、`aigate-admin backends list` 和真实协议预热，确认 TCP 8081 无监听；HTTP 验证工具改为只检查业务端口。失败时配套恢复旧版本和旧配置。以下内容为历史部署证据，不能代表本次已部署。
+升级仍需先备份版本、配置和状态，候选验证后排空并优雅重启。启动后执行 `aigate-admin status --json`、`aigate-admin backends list` 和真实协议预热，确认 TCP 8081 无监听；HTTP 验证工具改为只检查业务端口。失败时配套恢复旧版本和旧配置。下方旧版记录为历史证据，本次部署结果以上方 e435f42 验收为准。
 
 
 状态：**2026-09-12 21:14（Asia/Shanghai）正式网关已升级，新版真实协议与 HTTP 验收全部通过。**

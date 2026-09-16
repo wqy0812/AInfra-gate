@@ -28,6 +28,7 @@ type sseObserver struct {
 	Tools                                    map[int]*observedTool
 	Usage                                    json.RawMessage
 	FirstMS                                  *float64
+	LastUsefulAt                             time.Time
 	started                                  time.Time
 	collected                                int
 }
@@ -171,6 +172,7 @@ func (o *sseObserver) event(data []byte) {
 		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0 || c.Delta.Refusal != "" || c.Delta.Reasoning != "" || c.Delta.ReasoningText != ""
 		if useful {
 			o.Useful = true
+			o.LastUsefulAt = time.Now()
 			if o.FirstMS == nil {
 				n := float64(time.Since(o.started).Microseconds()) / 1000
 				o.FirstMS = &n

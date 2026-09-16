@@ -29,6 +29,8 @@ type Gateway struct {
 	buffers    sync.Pool
 	management *Management
 	profile    *requestProfiler
+	slow       *slowRequestStore
+	now        func() time.Time
 }
 
 func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
@@ -51,7 +53,7 @@ func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
 	if audit == nil {
 		audit = io.Discard
 	}
-	g := &Gateway{config: c, client: client, transport: transport, audit: log.New(audit, "", 0)}
+	g := &Gateway{config: c, client: client, transport: transport, audit: log.New(audit, "", 0), now: time.Now}
 	if c.GatewayAPIKeyEnv != "" {
 		g.apiKey = "Bearer " + os.Getenv(c.GatewayAPIKeyEnv)
 	}
@@ -76,10 +78,20 @@ func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
 			return nil, err
 		}
 	}
+	if c.SlowRequests.Enabled {
+		g.slow, err = newSlowRequestStore(c.SlowRequests, g.audit)
+		if err != nil {
+			g.Close()
+			return nil, err
+		}
+	}
 	return g, nil
 }
 
 func (g *Gateway) Close() {
+	if g.slow != nil {
+		g.slow.close()
+	}
 	if g.profile != nil {
 		g.profile.close()
 	}
@@ -90,6 +102,8 @@ func (g *Gateway) Close() {
 }
 
 type auditEntry struct {
+	slowInput      []byte
+	profile        *profileRequest
 	generation     *generationResult
 	RequestID      string  `json:"request_id"`
 	QuestionPrefix string  `json:"question_prefix"`
@@ -101,6 +115,10 @@ type auditEntry struct {
 }
 
 func sendJSON(w http.ResponseWriter, entry *auditEntry, status int, data []byte) {
+	if status >= 400 {
+		entry.profile.liveTerminal()
+	}
+	entry.profile.liveStage("writing_client")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	entry.Status = status
@@ -128,16 +146,15 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	entry := &auditEntry{RequestID: hex.EncodeToString(id[:]), Status: 500, Outcome: "incomplete"}
 	w.Header().Set("X-Request-ID", entry.RequestID)
-	started := time.Now()
+	started := g.now()
 	if r.URL.Path == "/v1/chat/completions" {
-		if g.profile != nil {
-			pr := g.profile.begin(entry.RequestID)
-			r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
-			defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
-		}
 		defer func() {
-			entry.DurationMS = float64(time.Since(started).Microseconds()) / 1000
+			ended := g.now()
+			entry.DurationMS = float64(ended.Sub(started).Microseconds()) / 1000
 			g.audit.Print(string(encodeJSON(entry)))
+			if g.slow != nil {
+				g.slow.capture(entry, started, ended, r.Context().Err() != nil)
+			}
 		}()
 	}
 	if r.URL.Path == "/health" && r.Method == http.MethodGet {
@@ -220,6 +237,7 @@ func questionPrefix(question string) string {
 }
 
 func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry) {
+	arrived := time.Now()
 	data, readErr := io.ReadAll(r.Body)
 	if readErr != nil {
 		sendError(w, entry, fault(400, "invalid_request", "请求不符合固定 JSON 格式"))
@@ -231,6 +249,16 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.QuestionPrefix = questionPrefix(body.question)
+	if body.stream && g.slow != nil {
+		// Keep the original bytes alive; makePayload may change the parsed fields.
+		entry.slowInput = data
+	}
+	if g.profile != nil {
+		pr := g.profile.beginRequest(entry.RequestID, body.stream, arrived)
+		entry.profile = pr
+		r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
+		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
+	}
 	var name, model string
 	var backend *Backend
 	outcome := "ignored"
@@ -245,6 +273,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 				lease.release(outcome)
 			}()
 			name = lease.name
+			entry.profile.liveBackend(name)
 			backend = lease.runtime.backend
 			model, err = g.pool.discoverRuntime(r.Context(), lease.runtime)
 			g.management.noteModel(name, model)
@@ -260,6 +289,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.Backend, entry.Model = &name, &model
+	entry.profile.liveStage("preparing_upstream")
 	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
 		pr.e.Backend = name
 		pr.e.Model = model
@@ -309,6 +339,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		outcome = g.stream(w, r, response, ctx, entry)
 		return
 	}
+	entry.profile.liveStage("reading_response")
 	data, readErr = io.ReadAll(response.Body)
 	if readErr != nil {
 		state.transportError(readErr, ctx, r.Context(), "response_read_error")
@@ -316,22 +347,23 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		sendError(w, entry, upstreamError(readErr, ctx))
 		return
 	}
-	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
-		var v struct {
-			Usage json.RawMessage `json:"usage"`
-		}
-		if json.Unmarshal(data, &v) == nil {
-			pr.usage = v.Usage
-		} else {
-			pr.quality = "response_parse"
-		}
-	}
+
 	result, err := normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
 	if err != nil {
 		state.fail("protocol_error")
 		outcome = "backend_failure"
 		sendError(w, entry, err)
 		return
+	}
+	if entry.profile != nil {
+		var decoded struct {
+			Usage json.RawMessage `json:"usage"`
+		}
+		// Template normalization creates a new response envelope without usage.
+		// Observe the upstream counters after validating the response.
+		if json.Unmarshal(data, &decoded) == nil {
+			entry.profile.usage = usageCounters(decoded.Usage)
+		}
 	}
 	sendJSON(w, entry, 200, result)
 	if entry.Outcome == "completed" {
@@ -343,6 +375,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 }
 
 func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend, model string) (*http.Response, *GatewayError) {
+	profileFrom(ctx).liveStage("preparing_upstream")
 	payload, err := makePayload(body, backend, model)
 	if err != nil {
 		return nil, err
@@ -367,6 +400,7 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	if state != nil {
 		state.started = true
 	}
+	profileFrom(ctx).liveStage("waiting_upstream_headers")
 	response, requestErr := g.client.Do(req)
 	if requestErr != nil {
 		return nil, upstreamError(requestErr, ctx)
@@ -397,6 +431,7 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 }
 
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) string {
+	entry.profile.liveStage("writing_client")
 	controller := http.NewResponseController(w)
 	deadline, _ := ctx.Deadline()
 	_ = controller.SetWriteDeadline(deadline)
@@ -442,6 +477,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	}
 	writeFailed := false
 	emit := func(data []byte) error {
+		entry.profile.liveStage("writing_client")
 		if _, err := w.Write(data); err != nil {
 			writeFailed = true
 			return err
@@ -453,10 +489,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		return nil
 	}
 	for {
+		entry.profile.liveStreamRead(observer)
 		n, readErr := response.Body.Read(*buffer)
 		if n > 0 {
 			data := (*buffer)[:n]
 			observer.Feed(data)
+			entry.profile.liveObserve(observer)
 			entry.generation.observeStream(observer, false)
 			var err error
 			if rewrite != nil {
@@ -515,6 +553,8 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			code = "upstream_timeout"
 		}
 		entry.Outcome = code
+		entry.profile.liveTerminal()
+		entry.profile.liveStage("writing_client")
 		// Permit a bounded final error write after the generation deadline expires.
 		_ = controller.SetWriteDeadline(time.Now().Add(time.Second))
 		_, _ = fmt.Fprintf(w, "\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID))

@@ -130,6 +130,8 @@ func copyErrorHeaders(dst, src http.Header) {
 }
 
 func (g *Gateway) forwardGenerationError(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) {
+	entry.profile.liveTerminal()
+	entry.profile.liveStage("writing_client")
 	s := entry.generation
 	s.fail(upstreamHTTPClass(response.StatusCode))
 	entry.Status, entry.Outcome = response.StatusCode, "rejected"
@@ -146,8 +148,10 @@ func (g *Gateway) forwardGenerationError(w http.ResponseWriter, r *http.Request,
 	buffer := g.buffers.Get().(*[]byte)
 	defer g.buffers.Put(buffer)
 	for {
+		entry.profile.liveStage("reading_response")
 		n, err := response.Body.Read(*buffer)
 		if n > 0 {
+			entry.profile.liveStage("writing_client")
 			if _, writeErr := w.Write((*buffer)[:n]); writeErr != nil {
 				s.writeFailure(ctx, r.Context())
 				return

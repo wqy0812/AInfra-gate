@@ -125,13 +125,14 @@ type profileEvent struct {
 	GenerationResult string          `json:"generation_result,omitempty"`
 }
 type profileRequest struct {
-	e       profileEvent
-	start   time.Time
-	tags    string
-	usage   json.RawMessage
-	first   *float64
-	quality string
-	outcome string
+	profiler *requestProfiler
+	e        profileEvent
+	start    time.Time
+	tags     string
+	usage    json.RawMessage
+	first    *float64
+	quality  string
+	outcome  string
 }
 type profileContextKey struct{}
 type profileSeen struct {
@@ -162,7 +163,8 @@ type requestProfiler struct {
 	emitMu         sync.RWMutex
 	closed         bool
 	mu             sync.Mutex
-	active         map[uint64]struct{}
+	active         map[uint64]profileLiveRequest
+	liveBackends   map[string]bool
 	values         map[string]float64
 	types          map[string]string
 	groups         map[string]bool
@@ -217,10 +219,12 @@ func newRequestProfiler(c ProfileConfig) (*requestProfiler, error) {
 	p := &requestProfiler{c: c, key: key, boot: randomID(), started: now, indexReset: now, values: map[string]float64{}, types: map[string]string{}, groups: map[string]bool{}, domains: map[string]map[string]string{}, index: map[string]*list.Element{}, lru: list.New(), queue: make(chan []byte, c.QueueEvents), done: make(chan struct{}), jobs: map[string]*profileJob{}, work: make(chan string, 4)}
 	p.counterStarted = profileNow()
 	p.restoreCounters()
+	p.add("nonstream_requests_total", "", 0)
 	if p.values["aigate_error_metrics_start_time_seconds"] == 0 {
 		p.values["aigate_error_metrics_start_time_seconds"] = profileNow()
 	}
 	p.types["aigate_error_metrics_start_time_seconds"] = "gauge"
+	p.liveBackends = map[string]bool{"unrouted": true}
 	p.add("requests_started_total", "", 0)
 	p.add("requests_inflight", "", 0)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -310,14 +314,27 @@ func (p *requestProfiler) emit(e profileEvent) {
 		p.dropped.Add(1)
 	}
 }
-func (p *requestProfiler) begin(id string) *profileRequest {
-	r := &profileRequest{start: time.Now(), e: profileEvent{Kind: "start", ID: id, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
+func (p *requestProfiler) begin(id string, arrived ...time.Time) *profileRequest {
+	return p.beginRequest(id, true, arrived...)
+}
+func (p *requestProfiler) beginRequest(id string, stream bool, arrived ...time.Time) *profileRequest {
+	r := &profileRequest{profiler: p, start: time.Now(), e: profileEvent{Kind: "start", Stream: stream, ID: id, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
+	if len(arrived) > 0 {
+		r.start = arrived[0]
+		r.e.At = float64(r.start.UnixNano()) / 1e9
+	}
 	r.e.Arrived = r.e.At
 	p.mu.Lock()
 	if p.active == nil {
-		p.active = make(map[uint64]struct{})
+		p.active = make(map[uint64]profileLiveRequest)
 	}
-	p.active[r.e.Seq] = struct{}{}
+	if p.liveBackends == nil {
+		p.liveBackends = map[string]bool{"unrouted": true}
+	}
+	p.active[r.e.Seq] = profileLiveRequest{start: r.start, backend: "unrouted", stage: "routing_discovery", nonstream: !stream}
+	if !stream {
+		p.add("nonstream_requests_total", "", 1)
+	}
 	p.add("requests_started_total", "", 1)
 	p.add("requests_inflight", "", 1)
 	p.mu.Unlock()
@@ -358,7 +375,6 @@ func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, b
 		return
 	}
 	_ = json.Unmarshal(fields["tools"], &tools)
-	_ = json.Unmarshal(fields["stream"], &r.e.Stream)
 	r.e.Messages = len(messages)
 	r.e.Tools = len(tools)
 	// Preserve all non-message prompt extensions in the comparison domain. Exclude only known non-rendering controls.
@@ -478,6 +494,9 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	}
 	e.Usage = usageCounters(r.usage)
 	e.First = r.first
+	if !e.Stream {
+		e.First = nil
+	}
 	e.Duration = time.Since(r.start).Seconds()
 	e.Quality = r.quality
 	p.mu.Lock()
@@ -489,7 +508,7 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	p.add("requests_ended_total", profileExtra(r.tags, "outcome", e.Outcome), 1)
 	p.generationEnd(entry.generation, r.tags)
 	p.hist("request_duration_seconds", r.tags, e.Duration, profileTimeBuckets)
-	if e.First != nil {
+	if e.Stream && e.First != nil {
 		p.hist("first_increment_seconds", r.tags, *e.First, profileTimeBuckets)
 	}
 	u := profileUsage(e.Usage)
@@ -525,7 +544,7 @@ func (p *requestProfiler) refreshFiles() {
 	p.refreshFilesLocked()
 }
 func (p *requestProfiler) refreshFilesLocked() {
-	files, _ := filepath.Glob(filepath.Join(p.c.Directory, "events-*.jsonl"))
+	files, _ := filepath.Glob(filepath.Join(p.c.Directory, "events-v2-*.jsonl"))
 	sort.Strings(files)
 	var total int64
 	kept := []string{}
@@ -564,7 +583,7 @@ func (p *requestProfiler) refreshFilesLocked() {
 	p.storedBytes = total
 	p.oldest = profileNow()
 	if len(kept) > 0 {
-		base := strings.TrimPrefix(filepath.Base(kept[0]), "events-")
+		base := strings.TrimPrefix(filepath.Base(kept[0]), "events-v2-")
 		if n, e := strconv.ParseInt(strings.Split(base, "-")[0], 10, 64); e == nil {
 			p.oldest = float64(n) / 1000
 		}
@@ -620,7 +639,7 @@ func (p *requestProfiler) writer() {
 			if f == nil || size >= min(p.c.MaxDiskBytes/2, 4<<20) || time.Since(opened) >= time.Minute {
 				closeFile()
 				opened = time.Now()
-				path = filepath.Join(p.c.Directory, fmt.Sprintf("events-%013d-%s.jsonl", opened.UnixMilli(), randomID()))
+				path = filepath.Join(p.c.Directory, fmt.Sprintf("events-v2-%013d-%s.jsonl", opened.UnixMilli(), randomID()))
 				var err error
 				f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 				size = 0
@@ -672,10 +691,19 @@ func (p *requestProfiler) status() any {
 	p.mu.Unlock()
 	p.diskMu.Lock()
 	defer p.diskMu.Unlock()
-	return map[string]any{"schema": "gateway-profile-v1", "started_at": float64(p.started.UnixNano()) / 1e9, "retained_start": p.oldest, "retained_end": p.lastWrite, "queue_events": len(p.queue), "dropped_events": p.dropped.Load(), "write_errors": p.writes.Load(), "stored_bytes": p.storedBytes, "index_entries": entries, "index_lookback_seconds": 3600, "index_ready": warm >= 3600, "domains": domains, "prefix_unit": "messages", "max_analysis_seconds": 86400}
+	return map[string]any{"schema": "gateway-profile-v1", "request_scope": "all", "scope_policy": "metric-v2", "started_at": float64(p.started.UnixNano()) / 1e9, "retained_start": p.oldest, "retained_end": p.lastWrite, "queue_events": len(p.queue), "dropped_events": p.dropped.Load(), "write_errors": p.writes.Load(), "stored_bytes": p.storedBytes, "index_entries": entries, "index_lookback_seconds": 3600, "index_ready": warm >= 3600, "domains": domains, "prefix_unit": "messages", "max_analysis_seconds": 86400}
 }
 func (p *requestProfiler) metrics(w io.Writer) {
 	p.mu.Lock()
+	now := time.Now()
+	active := make(map[uint64]profileLiveRequest, len(p.active))
+	for seq, live := range p.active {
+		active[seq] = live
+	}
+	backends := make(map[string]bool, len(p.liveBackends))
+	for backend := range p.liveBackends {
+		backends[backend] = true
+	}
 	values := make(map[string]float64, len(p.values))
 	for k, v := range p.values {
 		values[k] = v
@@ -686,6 +714,7 @@ func (p *requestProfiler) metrics(w io.Writer) {
 	}
 	indexLen, indexReady := len(p.index), time.Since(p.indexReset) >= time.Hour
 	p.mu.Unlock()
+	profileLiveMetrics(now, active, backends, values, metricTypes)
 	names := make([]string, 0, len(values))
 	for k := range values {
 		names = append(names, k)
@@ -700,14 +729,31 @@ func (p *requestProfiler) metrics(w io.Writer) {
 		fmt.Fprintf(w, "# TYPE %s %s\n", k, metricTypes[k])
 	}
 	for _, k := range names {
-		fmt.Fprintf(w, "%s %g\n", k, values[k])
+		name, tags := k, ""
+		if i := strings.IndexByte(k, '{'); i >= 0 {
+			name, tags = k[:i], k[i:]
+		}
+		scope := profileMetricScope(name)
+		fmt.Fprintf(w, "%s%s %g\n", name, profileExtra(tags, "request_scope", scope), values[k])
 	}
-	fmt.Fprintf(w, "aigate_profile_dropped_events_total %d\naigate_profile_write_errors_total %d\naigate_profile_queue_events %d\naigate_profile_index_entries %d\naigate_profile_index_ready %d\naigate_profile_start_time_seconds %g\n", p.dropped.Load(), p.writes.Load(), len(p.queue), indexLen, profileBoolInt(indexReady), float64(p.started.Unix()))
-	fmt.Fprintf(w, "aigate_profile_counter_start_time_seconds %g\n", p.counterStarted)
+	fmt.Fprintf(w, "aigate_profile_dropped_events_total{request_scope=\"all\"} %d\naigate_profile_write_errors_total{request_scope=\"all\"} %d\naigate_profile_queue_events{request_scope=\"all\"} %d\naigate_profile_index_entries{request_scope=\"all\"} %d\naigate_profile_index_ready{request_scope=\"all\"} %d\naigate_profile_start_time_seconds{request_scope=\"all\"} %g\n", p.dropped.Load(), p.writes.Load(), len(p.queue), indexLen, profileBoolInt(indexReady), float64(p.started.Unix()))
+	fmt.Fprintf(w, "aigate_profile_counter_start_time_seconds{request_scope=\"all\"} %g\n", p.counterStarted)
 	p.diskMu.Lock()
-	fmt.Fprintf(w, "aigate_profile_stored_bytes %d\naigate_profile_last_write_seconds %g\n", p.storedBytes, p.lastWrite)
+	fmt.Fprintf(w, "aigate_profile_stored_bytes{request_scope=\"all\"} %d\naigate_profile_last_write_seconds{request_scope=\"all\"} %g\n", p.storedBytes, p.lastWrite)
 	p.diskMu.Unlock()
 }
+
+// Scope follows the observation semantics, independently of the request population.
+func profileMetricScope(name string) string {
+	if name == "aigate_nonstream_requests_total" {
+		return "nonstreaming"
+	}
+	if strings.HasPrefix(name, "aigate_first_increment_seconds_") || strings.HasPrefix(name, "aigate_stream_") || name == "aigate_streams_waiting_first_output" {
+		return "streaming"
+	}
+	return "all"
+}
+
 func profileBoolInt(b bool) int {
 	if b {
 		return 1
@@ -799,7 +845,7 @@ type profileCounterState struct {
 }
 
 func (p *requestProfiler) restoreCounters() {
-	path := filepath.Join(p.c.Directory, "counters.json")
+	path := filepath.Join(p.c.Directory, "counters-metric-v2.json")
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		return
@@ -838,7 +884,7 @@ func (p *requestProfiler) saveCounters() {
 		p.writes.Add(1)
 		return
 	}
-	path := filepath.Join(p.c.Directory, "counters.json")
+	path := filepath.Join(p.c.Directory, "counters-metric-v2.json")
 	f, err := os.OpenFile(path+".tmp", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		p.writes.Add(1)

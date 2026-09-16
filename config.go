@@ -25,6 +25,7 @@ type Config struct {
 	Backends                map[string]*Backend `json:"backends"`
 	HTTPPool                PoolConfig          `json:"http_pool"`
 	Profile                 ProfileConfig       `json:"profile"`
+	SlowRequests            SlowRequestConfig   `json:"slow_requests"`
 	Management              ManagementConfig    `json:"management"`
 	names                   []string
 }
@@ -142,6 +143,7 @@ func parseConfig(data []byte, path string) (*Config, error) {
 	}
 	c.Management.defaults(c, path)
 	c.Profile.defaults(path)
+	c.SlowRequests.defaults(path)
 	return c, nil
 }
 
@@ -164,6 +166,9 @@ func (p Policy) validate(c *Config) error {
 }
 
 func (c *Config) validate() error {
+	if err := c.SlowRequests.validate(); err != nil {
+		return err
+	}
 	if err := c.Profile.validate(); err != nil {
 		return err
 	}

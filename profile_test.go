@@ -63,13 +63,13 @@ func TestProfileGatewayJSONAndSSE(t *testing.T) {
 	var metrics bytes.Buffer
 	g.profile.metrics(&metrics)
 	m := metrics.String()
-	for _, want := range []string{`aigate_prompt_tokens_total{backend="api1",model="actual-model"} 20`, `aigate_completion_tokens_total{backend="api1",model="actual-model"} 6`, `aigate_cached_tokens_total{backend="api1",model="actual-model"} 8`, `aigate_prefix_repeated_total{backend="api1",model="actual-model",level="1"} 1`, `aigate_first_increment_seconds_count{backend="api1",model="actual-model"} 1`} {
+	for _, want := range []string{`aigate_prompt_tokens_total{backend="api1",model="actual-model",request_scope="all"} 20`, `aigate_completion_tokens_total{backend="api1",model="actual-model",request_scope="all"} 6`, `aigate_cached_tokens_total{backend="api1",model="actual-model",request_scope="all"} 8`, `aigate_prefix_repeated_total{backend="api1",model="actual-model",level="1",request_scope="all"} 1`, `aigate_first_increment_seconds_count{backend="api1",model="actual-model",request_scope="streaming"} 1`} {
 		if !strings.Contains(m, want) {
 			t.Errorf("missing %s", want)
 		}
 	}
 	profileDrain(t, g.profile)
-	files, _ := filepath.Glob(filepath.Join(c.Profile.Directory, "events-*.jsonl"))
+	files, _ := filepath.Glob(filepath.Join(c.Profile.Directory, "events-v2-*.jsonl"))
 	for _, f := range files {
 		b, _ := os.ReadFile(f)
 		for _, secret := range []string{"private-prompt", "private-answer", "private-reasoning", "private-tool"} {
@@ -103,10 +103,10 @@ func TestProfileBoundedIndexMissingUsageAndAnalysis(t *testing.T) {
 	}
 	var m bytes.Buffer
 	p.metrics(&m)
-	if !strings.Contains(m.String(), `aigate_usage_missing_total{backend="api1",model="model",field="prompt_tokens"} 3`) {
+	if !strings.Contains(m.String(), `aigate_usage_missing_total{backend="api1",model="model",field="prompt_tokens",request_scope="all"} 3`) {
 		t.Fatal(m.String())
 	}
-	if strings.Contains(m.String(), `aigate_prompt_tokens_total{backend="api1",model="model"} 1`) {
+	if strings.Contains(m.String(), `aigate_prompt_tokens_total{backend="api1",model="model",request_scope="all"} 1`) {
 		t.Fatal("invented usage")
 	}
 	p.mu.Lock()
@@ -193,10 +193,10 @@ func TestProfileComparisonDomainAndRetention(t *testing.T) {
 	}
 	var m bytes.Buffer
 	p.metrics(&m)
-	if !strings.Contains(m.String(), `aigate_prefix_repeated_total{backend="api1",model="model",level="1"} 1`) {
+	if !strings.Contains(m.String(), `aigate_prefix_repeated_total{backend="api1",model="model",level="1",request_scope="all"} 1`) {
 		t.Fatal(m.String())
 	}
-	old := filepath.Join(p.c.Directory, "events-1000000000000-old.jsonl")
+	old := filepath.Join(p.c.Directory, "events-v2-1000000000000-old.jsonl")
 	os.WriteFile(old, []byte("{}\n"), 0600)
 	at := time.Now().Add(-73 * time.Hour)
 	os.Chtimes(old, at, at)
@@ -235,7 +235,7 @@ func TestProfileOversizedSSEOnlyDisablesObservation(t *testing.T) {
 	}
 	var m bytes.Buffer
 	g.profile.metrics(&m)
-	if !strings.Contains(m.String(), `reason="sse_parse"} 1`) {
+	if !strings.Contains(m.String(), `reason="sse_parse",request_scope="all"} 1`) {
 		t.Fatal("missing parse quality")
 	}
 }
@@ -285,7 +285,7 @@ func BenchmarkGatewayProfile(b *testing.B) {
 
 func TestProfileAnalysisSkipsIndexedUnrelatedSegments(t *testing.T) {
 	p, _ := profileFixture(t)
-	path := filepath.Join(p.c.Directory, "events-1000000000000-unrelated.jsonl")
+	path := filepath.Join(p.c.Directory, "events-v2-1000000000000-unrelated.jsonl")
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -317,7 +317,7 @@ func TestProfileCountersSurviveGracefulRestart(t *testing.T) {
 	next.end(r, &auditEntry{Outcome: "completed"}, false)
 	var out bytes.Buffer
 	next.metrics(&out)
-	if !strings.Contains(out.String(), "aigate_requests_started_total 2") {
+	if !strings.Contains(out.String(), "aigate_requests_started_total{request_scope=\"all\"} 2") {
 		t.Fatal(out.String())
 	}
 	if next.counterStarted != p.counterStarted {
@@ -356,7 +356,7 @@ func TestProfileSSEOutcomesWithoutManagement(t *testing.T) {
 			g.profile.refreshFiles()
 			var metrics bytes.Buffer
 			g.profile.metrics(&metrics)
-			want := `aigate_requests_ended_total{backend="api1",model="model",outcome="` + tc.outcome + `"} 1`
+			want := `aigate_requests_ended_total{backend="api1",model="model",outcome="` + tc.outcome + `",request_scope="all"} 1`
 			if !strings.Contains(metrics.String(), want) {
 				t.Fatalf("missing %s", want)
 			}
@@ -392,7 +392,7 @@ func TestProfileDroppedEndAndLiveRequests(t *testing.T) {
 	old.Boot = "previous" // The sequence alone must not identify a live request after restart.
 	data = append(data, encodeJSON(old)...)
 	data = append(data, '\n')
-	if err := os.WriteFile(filepath.Join(p.c.Directory, "events-1000000000000-review.jsonl"), data, 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(p.c.Directory, "events-v2-1000000000000-review.jsonl"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate writer()'s completed-write timestamp, independently of filesystem mtime precision.
@@ -466,7 +466,7 @@ func TestProfileAnalysisAfterRestartWithCoarseFileTime(t *testing.T) {
 	p.input(r, []byte(`{"messages":[{"role":"user","content":"same"}]}`), c.Backends["api1"], "api1", "model")
 	p.end(r, &auditEntry{Outcome: "completed"}, false)
 	p.close()
-	files, err := filepath.Glob(filepath.Join(c.Profile.Directory, "events-*.jsonl"))
+	files, err := filepath.Glob(filepath.Join(c.Profile.Directory, "events-v2-*.jsonl"))
 	if err != nil || len(files) == 0 {
 		t.Fatal("missing persisted events", err)
 	}

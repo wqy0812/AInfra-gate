@@ -8,6 +8,8 @@
 
 已根据本地 `body-agent-ds4.json` 样例验证：277 条历史消息、21 个工具定义、`stream=true`、`stream_options.include_usage=true`。文件内容仅作为请求数据，不执行其中的指令。
 
+A3 线上发布与回退统一使用 [A3-gate 直连部署流程](deploy/a3/README.md)。
+
 ## DCU / A3 维护切换
 
 可选的 `management` 模式通过本机 CLI 预热目标端、验证真实生成/SSE/工具协议、切换新请求、等待原端排空，并在原端进入维护前支持自动回切。CLI 使用私有 Unix socket 与运行中的网关通信；无 Web 页面、管理 HTTP API 或管理 TCP 端口，不需要管理密钥和端口转发。
@@ -165,6 +167,53 @@ OpenAI 适配器保留历史消息、工具字段、显式 null、流式选项�
 
 ## 日志与错误
 
+### 超过 5 分钟的流式请求输入留存
+
+在主配置增加以下配置即可开启（旧配置默认关闭）：
+
+```json
+"slow_requests": {
+  "enabled": true,
+  "threshold_seconds": 300,
+  "directory": "slow-requests",
+  "retention_hours": 72,
+  "max_disk_bytes": 10737418240,
+  "max_queue_bytes": 67108864
+}
+```
+
+仅记录通过 JSON 校验的 `POST /v1/chat/completions` 且 `stream=true` 的请求，在请求结束后判断总耗时**严格大于** 300 秒才保存。耗时与业务审计相同，包括读取输入、路由与模型发现、下游执行和响应转发，不包括留存写入。正常完成、客户端取消、下游超时或 SSE 中断都参与判断；不依赖 `profile.enabled`。这项设置不会修改 `timeout_seconds`，需要按实际业务另行配置生成超时。
+
+`directory` 相对于主配置文件所在目录解析，建议生产使用持久化目录。每条记录为 `slow-requests/request-<request_id>/`，包含：
+
+- `request.json`：客户端请求体的原始字节，保留空白、大整数、完整历史消息、工具及扩展字段，不保存适配后的下游输入。
+- `meta.json`：`aigate-slow-request-v1` 元数据，包括开始/结束时间、耗时、请求 ID、后端与实际模型、HTTP 状态、结束分类、`client_cancelled`、生成结果、上游状态、错误分类、原始输入字节数和 SHA-256。未知信息为 `null`。SSE 的 HTTP 200 不等于生成成功，应结合 `generation_result`、`error_class` 和取消标志分析。
+
+完整请求体只进入上述文件，不进入普通审计或画像事件；不额外记录请求头、鉴权凭据或模型输出，**请求体自身的内容完整保留**。目录权限为 `0700`，文件为 `0600`；已有目录必须为独立的真实 `0700` 目录。组件对目录加独占锁，避免多个进程同时清理或写入。默认目录已从 Git 排除；自定义目录也应放在源码目录之外。
+
+写入在单独后台队列完成，先写临时目录并同步，再原子发布完整记录。队列最多 1024 条；等待及正在写入的原始正文合计最多 64 MiB。单条正文过大、队列满或关闭时跳过并明确记录原因；运行期间写入失败不改变业务响应。`max_queue_bytes` 不包含尚未结束请求所引用的原始输入，因此长请求较多时需考虑这部分内存占用。
+
+启动时、每分钟及写入前清理：按请求结束时间保留 72 小时；写入后将超过 10 GiB 时，先删除结束时间最早的记录。总量按完整记录的两个文件字节数计算。只处理本组件的 `request-<32位ID>` 和 `.pending-<32位ID>` 目录，保留无关文件，不跟随符号链接。发现记录损坏或目录包含意外文件时报告错误并停止本轮存储操作，避免误删。记录过大而无法放入磁盘上限时不保存、不截断。
+
+诊断以单独 JSON 日志输出，`event="slow_request_capture"`，`result` 为 `saved/skipped/failed/cleanup_failed`，带请求 ID 和原因（定期清理失败没有单个请求 ID）。普通每请求审计格式不变；消费 stderr 时可以用 `event` 区分留存诊断。`saved` 表示已完成文件同步和原子发布，入队不等于已落盘。
+
+回放保存的请求到指定 aigate（网关地址不包含 `/v1` 后缀）：
+
+```bash
+gateway_url='http://127.0.0.1:9090'
+request_file='/var/lib/aigate/slow-requests/request-替换为请求ID/request.json'
+curl --fail --no-buffer \
+  -H 'Content-Type: application/json' \
+  --data-binary "@$request_file" \
+  "$gateway_url/v1/chat/completions"
+```
+
+若目标网关需要鉴权，在上述命令增加 `-H "Authorization: Bearer $AIGATE_REPLAY_KEY"`，凭据由当前环境提供，不从记录恢复。`--no-buffer` 等同于 `-N`。回放会生成新的 `X-Request-ID`，按目标网关当前路由、模型发现及适配配置执行；不能恢复当时的后端负载、缓存或保证相同输出。
+
+正常退出会排空已经入队的记录。由于采用“结束后保存”，仍在执行的请求不会生成文件；异常退出可能丢失在途输入或尚未写完的记录，重启会清理未完成的临时文件。
+
+### 普通审计与错误语义
+
 每个聊天请求输出一条 JSON 日志到 stderr，可由运行环境收集或重定向到文件：
 
 ```json
@@ -195,7 +244,7 @@ OpenAI 适配器保留历史消息、工具字段、显式 null、流式选项�
 
 业务 SSE 完成要求收到 `[DONE]`、所有预期候选均有结束原因，且没有残留数据事件或协议错误。候选数采用实际发送请求（含后端 overrides）的 `n`，缺省或 null 按 1；仅单候选兼容省略 `index`。完整空文本、拒答或内容过滤响应不计为后端故障；空响应不生成首 token 时间。预热仍要求有效输出并继续执行工具协议验证。候选跟踪最多 1024 项，超过上限只标记 `unknown`，不修改或拒绝业务请求。
 
-入口拒绝、模型发现和后台探测不进入新增指标。已有请求指标保持原有口径，不能用其总数替代生成阶段分母。标签沿用后端/模型分组上限；不放入任意错误文本、后端错误代码或请求 ID。profile 结束事件仅增加 `upstream_status`、`error_class`、`generation_result` 结构化字段，不保存错误正文。
+入口拒绝、模型发现和后台探测不进入新增指标。请求画像及生成/错误指标包含流式和非流式；首增量及流观察指标只适用于流式。画像请求总数包含解析后的路由/发现失败，不能替代生成阶段分母。标签沿用后端/模型分组上限；不放入任意错误文本、后端错误代码或请求 ID。profile 结束事件仅增加 `upstream_status`、`error_class`、`generation_result` 结构化字段，不保存错误正文。
 
 查询示例（按实际抓取标签补充环境/实例筛选）：
 
@@ -258,3 +307,21 @@ go build -trimpath -o bin/aigate .
 ## 请求画像
 
 使用 [画像配置示例](config.profile.example.json)，设置独立 `AIGATE_PROFILE_KEY` 后启用。Gateway `/metrics` 经 vmagent 写入 VM，平台读取 VM；消息前缀的窗口详细分析读取网关 API。事件默认保留 72 小时或 10 GiB，不保存正文。指标与时间口径、资源限制及接口见 [画像说明](deploy/profile/README.md)。
+
+### 实时等待、流停顿与处理阶段
+
+启用画像后还会暴露请求结束前更新的 Gauge：流式首输出等待数量/最大等待、5/15/30/60 秒流停顿数量/最大间隔、全部聊天请求的阶段分布、最老请求年龄及阶段，以及有效输出观察未知数量。完整接口、统计口径、上线结果和回退方式见 [实时监控说明](deploy/live-20260915/README.md)。
+
+### 当前源码的请求监控口径
+
+- 所有解析成功的聊天请求建立画像，包含流式及非流式；省略 `stream` 按非流式处理。鉴权或 JSON 解析失败的入口请求继续留在业务审计中。
+- 请求量、前缀画像、usage、总耗时、生成结果、错误率、在途阶段和最老请求覆盖完整请求集合，指标使用 `request_scope="all"`。生成错误仍保留原有 `stream` 维度，可按需要细分。
+- 网关首增量、首输出等待、流停顿和流观察未知只适用于实际流式输出，使用 `request_scope="streaming"`。非流式不补首增量，也不以完整响应耗时代替首增量。
+- `aigate_nonstream_requests_total{request_scope="nonstreaming"}` 保留为非流式到达数；它不再是非流式请求唯一参与的指标。
+- `reading_response` 同时覆盖非流式正常响应与错误响应读取。慢请求原始输入留存的既有规则不随本次指标改造扩大。
+- 新检查点为 `counters-metric-v2.json`，新事件文件为 `events-v2-*.jsonl`。旧检查点和事件不迁移、不混读；新计数生命周期在后续正常重启时继续保留。
+- 请求画像 API 路径和 `gateway-profile-v1` 数据结构保持兼容，增加 `scope_policy="metric-v2"`，`request_scope="all"` 表示完整请求画像。
+
+发布与验证记录见 [原生指标改造](../monitoring/docs/metric-scope-v2-20260915.md)。
+
+源码、部署脚本与本地运行产物的入库规则，以及发布脚本的本地回归命令，见 [部署源码说明](deploy/README.md)。上面的发布记录属于历史验收，当前源码审核和提交不代表再次部署。
