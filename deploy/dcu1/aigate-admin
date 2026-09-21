@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-set -a
-. /data4/aigate/admin.env
-set +a
-if [ "$#" -eq 0 ]; then set -- status; fi
-exec /data4/aigate/current/aigate "$@" --config /data4/aigate/config.json

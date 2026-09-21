@@ -209,7 +209,7 @@ func applyCompatibility(payload rawObject, rules Compatibility) (rawObject, *Gat
 			}
 		}
 	}
-	if metadata, exists := result["metadata"]; exists && rules.MetadataValues == "json_string" {
+	if metadata, exists := result["metadata"]; exists && !isNull(metadata) && rules.MetadataValues == "json_string" {
 		var values rawObject
 		if json.Unmarshal(metadata, &values) != nil || values == nil {
 			return nil, fault(400, "invalid_metadata", "此下游要求 metadata 为对象")
@@ -308,7 +308,10 @@ func normalizeResponse(data []byte, b *Backend, model, id string) ([]byte, *Gate
 		for _, choice := range choices {
 			role, _ := rawString(choice.Message["role"])
 			_, contentOK := rawString(choice.Message["content"])
-			if role != "assistant" || (!contentOK && !truthy(choice.Message["tool_calls"])) {
+			reasoning, reasoningOK := rawString(choice.Message["reasoning_content"])
+			content := choice.Message["content"]
+			reasoningOnly := (len(content) == 0 || isNull(content)) && reasoningOK && reasoning != ""
+			if role != "assistant" || (!contentOK && !truthy(choice.Message["tool_calls"]) && !reasoningOnly) {
 				return nil, bad
 			}
 		}

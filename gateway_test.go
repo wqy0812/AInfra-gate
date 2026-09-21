@@ -243,7 +243,7 @@ func TestCompatibilityAndOverrides(t *testing.T) {
 	if _, ok := dropped["patches"]; ok {
 		t.Fatal("explicit drop ignored")
 	}
-	for _, raw := range []string{`null`, `[]`, `"bad"`} {
+	for _, raw := range []string{`[]`, `"bad"`} {
 		_, err := applyCompatibility(rawObject{"metadata": json.RawMessage(raw)}, rules)
 		if err == nil || err.Code != "invalid_metadata" {
 			t.Fatal("invalid metadata accepted")
