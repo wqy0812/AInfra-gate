@@ -279,6 +279,9 @@ func (m *Management) writeBackend(create bool, req BackendWriteRequest) (*Operat
 		}
 		return publicOperation(old), nil
 	}
+	if m.state.TestOccupancy != nil {
+		return bad(409, "test_occupied", "测试占用期间禁止修改网关后端配置")
+	}
 	if m.closed {
 		return bad(503, "gateway_stopping", "网关正在退出")
 	}
@@ -304,6 +307,9 @@ func (m *Management) writeBackend(create bool, req BackendWriteRequest) (*Operat
 	b, err := editedBackend(old, req)
 	if err != nil {
 		return bad(400, "invalid_backend", err.Error())
+	}
+	if err := m.checkRouterLocked(b); err != nil {
+		return bad(400, "gateway_target_forbidden", err.Error())
 	}
 	// Validate an isolated candidate. Do not normalize or mutate a live config.
 	candidate := *m.g.config

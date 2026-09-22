@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strconv"
 	"time"
 )
 
@@ -178,75 +177,12 @@ func (p *requestProfiler) analyze(ctx context.Context, q profileQuery) (any, err
 		}
 		return a.Seq < b.Seq
 	})
-	input, output, durations, shared := []float64{}, []float64{}, []float64{}, []float64{}
+	input, output, durations := []float64{}, []float64{}, []float64{}
 	outcomes := map[string]int{}
 	pending, unknown, missingStart := 0, 0, 0
-	levels := map[string]any{}
-	longest := make([]float64, len(selected))
-	for _, level := range profileLevels {
-		counts := map[string]int{}
-		last := map[string]int{}
-		tree := make([]int, len(selected)+2)
-		times := map[string]float64{}
-		gaps, seconds, distinct := []float64{}, []float64{}, []float64{}
-		eligible := 0
-		add := func(i, delta int) {
-			for i++; i < len(tree); i += i & -i {
-				tree[i] += delta
-			}
-		}
-		total := func(i int) int {
-			n := 0
-			for i++; i > 0; i -= i & -i {
-				n += tree[i]
-			}
-			return n
-		}
-		for i, r := range selected {
-			if r.input == nil {
-				continue
-			}
-			for _, mark := range r.input.Marks {
-				if mark.Level != level {
-					continue
-				}
-				eligible++
-				key := r.input.Domain + ":" + mark.Digest
-				counts[key]++
-				if j, ok := last[key]; ok {
-					gaps = append(gaps, float64(i-j))
-					seconds = append(seconds, r.input.Arrived-times[key])
-					distinct = append(distinct, float64(total(i-1)-total(j)))
-					if float64(mark.Bytes) > longest[i] {
-						longest[i] = float64(mark.Bytes)
-					}
-					add(j, -1)
-				}
-				add(i, 1)
-				last[key] = i
-				times[key] = r.input.Arrived
-			}
-		}
-		ranked := []int{}
-		for _, n := range counts {
-			ranked = append(ranked, n)
-		}
-		sort.Sort(sort.Reverse(sort.IntSlice(ranked)))
-		top := []map[string]any{}
-		for i, n := range ranked {
-			if i == 10 {
-				break
-			}
-			top = append(top, map[string]any{"group": i + 1, "count": n, "share": float64(n) / float64(eligible)})
-		}
-		levels[strconv.Itoa(level)] = map[string]any{"eligible": eligible, "families": len(counts), "repeated": len(gaps), "top10": top, "gap_requests": profileStats(gaps), "gap_seconds": profileStats(seconds), "intervening_distinct": profileStats(distinct)}
-	}
-	for i, r := range selected {
+	for _, r := range selected {
 		if r.start == nil {
 			missingStart++
-		}
-		if r.input != nil && len(r.input.Marks) > 0 {
-			shared = append(shared, longest[i])
 		}
 		if r.end == nil {
 			e := arrival(r)
@@ -268,7 +204,7 @@ func (p *requestProfiler) analyze(ctx context.Context, q profileQuery) (any, err
 		}
 		durations = append(durations, r.end.Duration)
 	}
-	return map[string]any{"schema": "gateway-profile-v1", "source": "gateway", "request_scope": "all", "scope_policy": "metric-v2", "time_basis": "arrival", "prefix_basis": "within_window_messages", "start": q.Start, "end": q.End, "as_of": asof, "pending_as_of": pendingAsOf, "computed_at": profileNow(), "requests": len(selected), "pending": pending, "unknown": unknown, "outcomes": outcomes, "input_tokens": profileStats(input), "output_tokens": profileStats(output), "duration_seconds": profileStats(durations), "observed_shared_prefix_bytes": profileStats(shared), "prefix_levels": levels, "quality": map[string]any{"missing_start": missingStart, "shared_prefix_observed": len(shared), "shared_prefix_missing": len(selected) - len(shared), "invalid_records": invalid, "process_dropped_events": p.dropped.Load(), "process_write_errors": p.writes.Load(), "queue_events": len(p.queue), "approximate_prefix": true, "crash_tail_may_be_missing": true}}, nil
+	return map[string]any{"schema": "gateway-profile-v1", "source": "gateway", "request_scope": "all", "scope_policy": "metric-v2", "time_basis": "arrival", "start": q.Start, "end": q.End, "as_of": asof, "pending_as_of": pendingAsOf, "computed_at": profileNow(), "requests": len(selected), "pending": pending, "unknown": unknown, "outcomes": outcomes, "input_tokens": profileStats(input), "output_tokens": profileStats(output), "duration_seconds": profileStats(durations), "quality": map[string]any{"missing_start": missingStart, "invalid_records": invalid, "process_dropped_events": p.dropped.Load(), "process_write_errors": p.writes.Load(), "queue_events": len(p.queue), "crash_tail_may_be_missing": true}}, nil
 }
 
 type profileLimitedReader struct {

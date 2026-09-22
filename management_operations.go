@@ -59,6 +59,9 @@ func (m *Management) submit(kind string, req OperationRequest) (*Operation, *Man
 		copyState := m.cloneLocked()
 		return operationByID(&copyState, old.ID), nil
 	}
+	if kind == "switch" && m.state.TestOccupancy != nil {
+		return bad(409, "test_occupied", "测试占用期间禁止切换；请暂停测试并等待请求结束")
+	}
 	if m.closed {
 		return bad(503, "gateway_stopping", "网关正在退出")
 	}
@@ -71,6 +74,11 @@ func (m *Management) submit(kind string, req OperationRequest) (*Operation, *Man
 	b := m.state.Backends[req.Target]
 	if b == nil {
 		return bad(400, "unknown_backend", "后端不存在")
+	}
+	if kind == "switch" || kind == "warmup" || kind == "restore" {
+		if err := m.checkRouterLocked(m.state.Registry.Configs[req.Target]); err != nil {
+			return bad(409, "gateway_target_forbidden", err.Error())
+		}
 	}
 	c := m.counts[req.Target]
 	switch kind {
@@ -90,8 +98,13 @@ func (m *Management) submit(kind string, req OperationRequest) (*Operation, *Man
 			return bad(409, "not_in_maintenance", "该后端未进入维护")
 		}
 	case "confirm-drain":
-		if req.Target == m.state.ActiveBackend || c.Business+c.Probes != 0 || !b.DrainUnknown {
-			return bad(409, "drain_confirmation_unavailable", "只有非活动、无占用且排空待确认的后端可确认")
+		// An unclean restart loses the request callbacks that decrement durable
+		// test inflight. Explicit downstream drain confirmation may recover that
+		// active backend, but must never unlock a live test or current requests.
+		o := m.state.TestOccupancy
+		recoverTest := o != nil && o.Backend == req.Target
+		if (req.Target == m.state.ActiveBackend && !recoverTest) || c.Business+c.Probes+c.Tests != 0 || !b.DrainUnknown {
+			return bad(409, "drain_confirmation_unavailable", "须无当前请求且排空待确认；活动端仅允许恢复重启遗留的测试占用")
 		}
 	default:
 		return bad(400, "invalid_operation", "操作不支持")
@@ -110,6 +123,13 @@ func (m *Management) submit(kind string, req OperationRequest) (*Operation, *Man
 			}
 		} else {
 			s.Backends[req.Target].DrainUnknown = false
+			if o := s.TestOccupancy; o != nil && o.Backend == req.Target {
+				if s.ReleasedTestTokens == nil {
+					s.ReleasedTestTokens = map[string]bool{}
+				}
+				s.ReleasedTestTokens[o.TokenHash] = true
+				s.TestOccupancy = nil
+			}
 		}
 		op.Phase, op.Outcome = "completed", "completed"
 	}
@@ -307,7 +327,7 @@ func (m *Management) pruneFailuresLocked() {
 func (m *Management) rollbackNeededLocked() bool {
 	m.pruneFailuresLocked()
 	b := m.state.Backends[m.state.RollbackCandidate]
-	return !m.closed && m.g.config.Management.rollbackEnabled() && m.state.RollbackArmed && b != nil && !b.Maintenance && !b.DrainUnknown && len(m.failures) >= m.g.config.Management.FailureThreshold
+	return m.state.TestOccupancy == nil && !m.closed && m.g.config.Management.rollbackEnabled() && m.state.RollbackArmed && b != nil && !b.Maintenance && !b.DrainUnknown && len(m.failures) >= m.g.config.Management.FailureThreshold
 }
 
 func (m *Management) observeLocked(name string, version uint64, outcome string) {

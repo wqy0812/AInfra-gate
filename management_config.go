@@ -8,18 +8,19 @@ import (
 )
 
 type ManagementConfig struct {
-	Enabled              bool    `json:"enabled"`
-	Socket               string  `json:"socket"`
-	StateFile            string  `json:"state_file"`
-	WarmupRounds         int     `json:"warmup_rounds"`
-	WarmupStepSeconds    float64 `json:"warmup_step_seconds"`
-	WarmupTimeoutSeconds float64 `json:"warmup_timeout_seconds"`
-	WarmupMaxTokens      int     `json:"warmup_max_tokens"`
-	DrainTimeoutSeconds  float64 `json:"drain_timeout_seconds"`
-	AutoRollback         *bool   `json:"auto_rollback,omitempty"`
-	FailureThreshold     int     `json:"failure_threshold"`
-	FailureWindowSeconds float64 `json:"failure_window_seconds"`
-	RollbackRetrySeconds float64 `json:"rollback_retry_seconds"`
+	HTTP                 ManagementHTTPConfig `json:"http,omitempty"`
+	Enabled              bool                 `json:"enabled"`
+	Socket               string               `json:"socket"`
+	StateFile            string               `json:"state_file"`
+	WarmupRounds         int                  `json:"warmup_rounds"`
+	WarmupStepSeconds    float64              `json:"warmup_step_seconds"`
+	WarmupTimeoutSeconds float64              `json:"warmup_timeout_seconds"`
+	WarmupMaxTokens      int                  `json:"warmup_max_tokens"`
+	DrainTimeoutSeconds  float64              `json:"drain_timeout_seconds"`
+	AutoRollback         *bool                `json:"auto_rollback,omitempty"`
+	FailureThreshold     int                  `json:"failure_threshold"`
+	FailureWindowSeconds float64              `json:"failure_window_seconds"`
+	RollbackRetrySeconds float64              `json:"rollback_retry_seconds"`
 }
 
 func (m *ManagementConfig) defaults(c *Config, path string) {
@@ -69,6 +70,9 @@ func (m *ManagementConfig) defaults(c *Config, path string) {
 func (m ManagementConfig) rollbackEnabled() bool { return m.AutoRollback == nil || *m.AutoRollback }
 
 func (m ManagementConfig) validate(c *Config) error {
+	if err := m.HTTP.validate(m.Enabled); err != nil {
+		return err
+	}
 	if !m.Enabled {
 		return nil
 	}

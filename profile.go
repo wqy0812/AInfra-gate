@@ -3,13 +3,8 @@ package main
 // Request profiling is observational. No profile failure changes a business response.
 import (
 	"bufio"
-	"container/list"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,21 +21,21 @@ import (
 	"time"
 )
 
-var profileLevels = []int{1, 2, 4, 8, 16, 32, 64, 128, 256, 512}
 var profileLengthBuckets = []float64{256, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576}
 var profileTimeBuckets = []float64{.01, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
-var profileCountBuckets = []float64{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024}
 
 type ProfileConfig struct {
-	Enabled         bool   `json:"enabled"`
-	Listen          string `json:"listen"`
-	APIKeyEnv       string `json:"api_key_env"`
-	Directory       string `json:"directory"`
-	RetentionHours  int    `json:"retention_hours"`
-	MaxDiskBytes    int64  `json:"max_disk_bytes"`
-	MaxIndexEntries int    `json:"max_index_entries"`
-	QueueEvents     int    `json:"queue_events"`
-	MaxPayloadBytes int    `json:"max_payload_bytes"`
+	Enabled        bool   `json:"enabled"`
+	Listen         string `json:"listen"`
+	APIKeyEnv      string `json:"api_key_env"`
+	APIKey         string `json:"api_key,omitempty"`
+	Directory      string `json:"directory"`
+	RetentionHours int    `json:"retention_hours"`
+	MaxDiskBytes   int64  `json:"max_disk_bytes"`
+	QueueEvents    int    `json:"queue_events"`
+	// Deprecated: accepted for configuration compatibility; no prefix index or payload analysis remains.
+	MaxIndexEntries int `json:"max_index_entries"`
+	MaxPayloadBytes int `json:"max_payload_bytes"`
 }
 
 func (c *ProfileConfig) defaults(path string) {
@@ -63,14 +58,8 @@ func (c *ProfileConfig) defaults(path string) {
 	if c.MaxDiskBytes == 0 {
 		c.MaxDiskBytes = 10 << 30
 	}
-	if c.MaxIndexEntries == 0 {
-		c.MaxIndexEntries = 100000
-	}
 	if c.QueueEvents == 0 {
 		c.QueueEvents = 2048
-	}
-	if c.MaxPayloadBytes == 0 {
-		c.MaxPayloadBytes = 4 << 20
 	}
 }
 func (c ProfileConfig) validate() error {
@@ -80,10 +69,10 @@ func (c ProfileConfig) validate() error {
 	if _, _, e := net.SplitHostPort(c.Listen); e != nil {
 		return fmt.Errorf("profile.listen: %w", e)
 	}
-	if os.Getenv(c.APIKeyEnv) == "" {
+	if c.APIKey == "" && os.Getenv(c.APIKeyEnv) == "" {
 		return fmt.Errorf("profile requires %s", c.APIKeyEnv)
 	}
-	if c.Directory == "" || c.RetentionHours < 1 || c.RetentionHours > 720 || c.MaxDiskBytes < 1<<20 || c.MaxIndexEntries < 1 || c.MaxIndexEntries > 1000000 || c.QueueEvents < 1 || c.QueueEvents > 8192 || c.MaxPayloadBytes < 1024 || c.MaxPayloadBytes > 16<<20 {
+	if c.Directory == "" || c.RetentionHours < 1 || c.RetentionHours > 720 || c.MaxDiskBytes < 1<<20 || c.QueueEvents < 1 || c.QueueEvents > 8192 {
 		return fmt.Errorf("invalid profile resource limits")
 	}
 	return nil
@@ -95,11 +84,6 @@ type profileSegmentMeta struct {
 	Bytes int64   `json:"bytes"`
 }
 
-type profileMark struct {
-	Level  int    `json:"level"`
-	Bytes  int    `json:"bytes"`
-	Digest string `json:"digest"`
-}
 type profileEvent struct {
 	Kind             string          `json:"kind"`
 	ID               string          `json:"request_id"`
@@ -107,14 +91,12 @@ type profileEvent struct {
 	Seq              uint64          `json:"sequence"`
 	At               float64         `json:"at"`
 	Arrived          float64         `json:"arrived"`
+	TestTask         string          `json:"test_task,omitempty"`
+	RouteVersion     uint64          `json:"route_version,omitempty"`
 	Backend          string          `json:"backend,omitempty"`
 	Model            string          `json:"model,omitempty"`
-	Domain           string          `json:"domain,omitempty"`
 	Stream           bool            `json:"stream,omitempty"`
 	Bytes            int             `json:"bytes,omitempty"`
-	Messages         int             `json:"messages,omitempty"`
-	Tools            int             `json:"tools,omitempty"`
-	Marks            []profileMark   `json:"marks,omitempty"`
 	Outcome          string          `json:"outcome,omitempty"`
 	Usage            json.RawMessage `json:"usage,omitempty"`
 	First            *float64        `json:"first_seconds,omitempty"`
@@ -135,11 +117,6 @@ type profileRequest struct {
 	outcome  string
 }
 type profileContextKey struct{}
-type profileSeen struct {
-	key string
-	at  time.Time
-	seq uint64
-}
 type profileJob struct {
 	ID      string       `json:"id"`
 	State   string       `json:"state"`
@@ -155,8 +132,8 @@ type profileQuery struct {
 	Model   string  `json:"model,omitempty"`
 }
 type requestProfiler struct {
+	directory      *os.File // exclude other writers and cross-generation cleanup
 	c              ProfileConfig
-	key            []byte
 	boot           string
 	counterStarted float64
 	started        time.Time
@@ -168,11 +145,6 @@ type requestProfiler struct {
 	values         map[string]float64
 	types          map[string]string
 	groups         map[string]bool
-	domains        map[string]map[string]string
-	index          map[string]*list.Element
-	lru            *list.List
-	observations   uint64
-	indexReset     time.Time
 	seq            atomic.Uint64
 	dropped        atomic.Uint64
 	writes         atomic.Uint64
@@ -195,29 +167,22 @@ func newRequestProfiler(c ProfileConfig) (*requestProfiler, error) {
 	if e := os.MkdirAll(c.Directory, 0700); e != nil {
 		return nil, e
 	}
-	keyPath := filepath.Join(c.Directory, "hmac.key")
-	key, e := os.ReadFile(keyPath)
-	if os.IsNotExist(e) {
-		key = make([]byte, 32)
-		if _, e = rand.Read(key); e != nil {
-			return nil, e
-		}
-		f, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err != nil {
-			return nil, err
-		}
-		_, e = f.Write(key)
-		f.Close()
+	info, err := os.Lstat(c.Directory)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf("profile directory must be a real directory")
 	}
-	if e != nil {
-		return nil, e
+	directory, err := os.Open(c.Directory)
+	if err != nil {
+		return nil, err
 	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("profile HMAC key must contain 32 bytes")
+	if err = lockState(directory); err != nil {
+		directory.Close()
+		return nil, fmt.Errorf("profile directory lock: %w", err)
 	}
 	now := time.Now()
-	p := &requestProfiler{c: c, key: key, boot: randomID(), started: now, indexReset: now, values: map[string]float64{}, types: map[string]string{}, groups: map[string]bool{}, domains: map[string]map[string]string{}, index: map[string]*list.Element{}, lru: list.New(), queue: make(chan []byte, c.QueueEvents), done: make(chan struct{}), jobs: map[string]*profileJob{}, work: make(chan string, 4)}
+	p := &requestProfiler{c: c, boot: randomID(), started: now, values: map[string]float64{}, types: map[string]string{}, groups: map[string]bool{}, queue: make(chan []byte, c.QueueEvents), done: make(chan struct{}), jobs: map[string]*profileJob{}, work: make(chan string, 4)}
 	p.counterStarted = profileNow()
+	p.directory = directory
 	p.restoreCounters()
 	p.add("nonstream_requests_total", "", 0)
 	if p.values["aigate_error_metrics_start_time_seconds"] == 0 {
@@ -244,6 +209,8 @@ func (p *requestProfiler) close() {
 		p.emitMu.Unlock()
 		p.workers.Wait()
 		p.saveCounters()
+		unlockState(p.directory)
+		p.directory.Close()
 	})
 }
 func profileNow() float64 { return float64(time.Now().UnixNano()) / 1e9 }
@@ -341,11 +308,6 @@ func (p *requestProfiler) beginRequest(id string, stream bool, arrived ...time.T
 	p.emit(r.e)
 	return r
 }
-func (p *requestProfiler) digest(b []byte) string {
-	h := hmac.New(sha256.New, p.key)
-	h.Write(b)
-	return hex.EncodeToString(h.Sum(nil))
-}
 func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, backend, model string) {
 	r.e.Backend = backend
 	r.e.Model = model
@@ -357,100 +319,9 @@ func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, b
 	r.e.Kind = "input"
 	r.e.At = profileNow()
 	r.e.Bytes = len(payload)
-	if len(payload) > p.c.MaxPayloadBytes {
-		r.quality = "payload_limit"
-		r.e.Quality = r.quality
-		p.emit(r.e)
-		return
-	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(payload, &fields) != nil {
-		r.quality = "input_parse"
-		return
-	}
-	var messages []json.RawMessage
-	var tools []json.RawMessage
-	if json.Unmarshal(fields["messages"], &messages) != nil {
-		r.quality = "unsupported_input"
-		return
-	}
-	_ = json.Unmarshal(fields["tools"], &tools)
-	r.e.Messages = len(messages)
-	r.e.Tools = len(tools)
-	// Preserve all non-message prompt extensions in the comparison domain. Exclude only known non-rendering controls.
-	for _, k := range []string{"messages", "stream", "stream_options", "temperature", "top_p", "top_k", "max_tokens", "max_completion_tokens", "seed", "stop", "frequency_penalty", "presence_penalty", "n", "metadata", "user"} {
-		delete(fields, k)
-	}
-	// Canonicalize JSON objects without altering string whitespace, number spelling or array order.
-	var canonical any
-	_ = decodeJSON(encodeJSON(fields), &canonical)
-	r.e.Domain = p.digest(encodeJSON([]any{"message-prefix-v1", backend, model, b.URL, b.Adapter, b.Compatibility, b.RequestTemplate, canonical}))
-	h := hmac.New(sha256.New, p.key)
-	h.Write([]byte(r.e.Domain))
-	size := 0
-	levelIndex := 0
-	for i, m := range messages {
-		if i >= 512 {
-			break
-		}
-		var v any
-		if decodeJSON(m, &v) != nil {
-			r.quality = "input_parse"
-			break
-		}
-		cb := encodeJSON(v)
-		size += len(cb)
-		fmt.Fprintf(h, "%d:", len(cb))
-		h.Write(cb)
-		if levelIndex < len(profileLevels) && i+1 == profileLevels[levelIndex] {
-			r.e.Marks = append(r.e.Marks, profileMark{i + 1, size, hex.EncodeToString(h.Sum(nil))})
-			levelIndex++
-		}
-	}
-	now := time.Now()
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.domains) < 64 {
-		p.domains[r.e.Domain] = map[string]string{"backend": backend, "model": model}
-	}
-	p.hist("message_count", r.tags, float64(len(messages)), profileCountBuckets)
-	p.hist("tool_count", r.tags, float64(len(tools)), profileCountBuckets)
-	for p.lru.Len() > 0 {
-		old := p.lru.Back().Value.(profileSeen)
-		if now.Sub(old.at) <= time.Hour {
-			break
-		}
-		delete(p.index, old.key)
-		p.lru.Remove(p.lru.Back())
-	}
-	p.observations++
-	for _, m := range r.e.Marks {
-		tags := profileExtra(r.tags, "level", strconv.Itoa(m.Level))
-		p.add("prefix_eligible_total", tags, 1)
-		p.add("prefix_repeated_total", tags, 0)
-		key := r.e.Domain + ":" + m.Digest
-		if elem := p.index[key]; elem != nil {
-			last := elem.Value.(profileSeen)
-			p.add("prefix_repeated_total", tags, 1)
-			p.hist("prefix_gap_seconds", tags, now.Sub(last.at).Seconds(), profileTimeBuckets)
-			gap := float64(0)
-			if p.observations > last.seq {
-				gap = float64(p.observations - last.seq)
-			}
-			p.hist("prefix_gap_requests", tags, gap, profileCountBuckets)
-			p.lru.Remove(elem)
-		}
-		p.index[key] = p.lru.PushFront(profileSeen{key, now, p.observations})
-	}
-	for len(p.index) > p.c.MaxIndexEntries {
-		elem := p.lru.Back()
-		delete(p.index, elem.Value.(profileSeen).key)
-		p.lru.Remove(elem)
-		p.add("profile_index_evictions_total", "", 1)
-		p.indexReset = now
-	}
 	p.emit(r.e)
 }
+
 func profileUsage(raw json.RawMessage) map[string]uint64 {
 	out := map[string]uint64{}
 	var f map[string]json.RawMessage
@@ -481,7 +352,6 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	e := r.e
 	e.Kind = "end"
 	e.At = profileNow()
-	e.Marks = nil
 	e.Outcome = entry.Outcome
 	if r.outcome != "" {
 		e.Outcome = r.outcome
@@ -681,17 +551,9 @@ func (p *requestProfiler) writer() {
 	}
 }
 func (p *requestProfiler) status() any {
-	p.mu.Lock()
-	domains := make([]map[string]string, 0, len(p.domains))
-	for _, d := range p.domains {
-		domains = append(domains, d)
-	}
-	warm := time.Since(p.indexReset).Seconds()
-	entries := len(p.index)
-	p.mu.Unlock()
 	p.diskMu.Lock()
 	defer p.diskMu.Unlock()
-	return map[string]any{"schema": "gateway-profile-v1", "request_scope": "all", "scope_policy": "metric-v2", "started_at": float64(p.started.UnixNano()) / 1e9, "retained_start": p.oldest, "retained_end": p.lastWrite, "queue_events": len(p.queue), "dropped_events": p.dropped.Load(), "write_errors": p.writes.Load(), "stored_bytes": p.storedBytes, "index_entries": entries, "index_lookback_seconds": 3600, "index_ready": warm >= 3600, "domains": domains, "prefix_unit": "messages", "max_analysis_seconds": 86400}
+	return map[string]any{"schema": "gateway-profile-v1", "request_scope": "all", "scope_policy": "metric-v2", "started_at": float64(p.started.UnixNano()) / 1e9, "retained_start": p.oldest, "retained_end": p.lastWrite, "queue_events": len(p.queue), "dropped_events": p.dropped.Load(), "write_errors": p.writes.Load(), "stored_bytes": p.storedBytes, "max_analysis_seconds": 86400}
 }
 func (p *requestProfiler) metrics(w io.Writer) {
 	p.mu.Lock()
@@ -712,7 +574,6 @@ func (p *requestProfiler) metrics(w io.Writer) {
 	for k, v := range p.types {
 		metricTypes[k] = v
 	}
-	indexLen, indexReady := len(p.index), time.Since(p.indexReset) >= time.Hour
 	p.mu.Unlock()
 	profileLiveMetrics(now, active, backends, values, metricTypes)
 	names := make([]string, 0, len(values))
@@ -736,7 +597,7 @@ func (p *requestProfiler) metrics(w io.Writer) {
 		scope := profileMetricScope(name)
 		fmt.Fprintf(w, "%s%s %g\n", name, profileExtra(tags, "request_scope", scope), values[k])
 	}
-	fmt.Fprintf(w, "aigate_profile_dropped_events_total{request_scope=\"all\"} %d\naigate_profile_write_errors_total{request_scope=\"all\"} %d\naigate_profile_queue_events{request_scope=\"all\"} %d\naigate_profile_index_entries{request_scope=\"all\"} %d\naigate_profile_index_ready{request_scope=\"all\"} %d\naigate_profile_start_time_seconds{request_scope=\"all\"} %g\n", p.dropped.Load(), p.writes.Load(), len(p.queue), indexLen, profileBoolInt(indexReady), float64(p.started.Unix()))
+	fmt.Fprintf(w, "aigate_profile_dropped_events_total{request_scope=\"all\"} %d\naigate_profile_write_errors_total{request_scope=\"all\"} %d\naigate_profile_queue_events{request_scope=\"all\"} %d\naigate_profile_start_time_seconds{request_scope=\"all\"} %g\n", p.dropped.Load(), p.writes.Load(), len(p.queue), float64(p.started.Unix()))
 	fmt.Fprintf(w, "aigate_profile_counter_start_time_seconds{request_scope=\"all\"} %g\n", p.counterStarted)
 	p.diskMu.Lock()
 	fmt.Fprintf(w, "aigate_profile_stored_bytes{request_scope=\"all\"} %d\naigate_profile_last_write_seconds{request_scope=\"all\"} %g\n", p.storedBytes, p.lastWrite)
@@ -762,7 +623,11 @@ func profileBoolInt(b bool) int {
 }
 func (p *requestProfiler) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+os.Getenv(p.c.APIKeyEnv))) != 1 {
+		key := p.c.APIKey
+		if key == "" {
+			key = os.Getenv(p.c.APIKeyEnv)
+		}
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+key)) != 1 {
 			http.Error(w, "unauthorized", 401)
 			return
 		}
@@ -866,6 +731,17 @@ func (p *requestProfiler) restoreCounters() {
 			return
 		}
 	}
+	// Retired observations must not reappear after restoring an older checkpoint.
+	for name := range saved.Values {
+		if retiredProfileMetric(name) {
+			delete(saved.Values, name)
+		}
+	}
+	for name := range saved.Types {
+		if retiredProfileMetric(name) {
+			delete(saved.Types, name)
+		}
+	}
 	p.values = saved.Values
 	p.types = saved.Types
 	p.groups = saved.Groups
@@ -901,4 +777,13 @@ func (p *requestProfiler) saveCounters() {
 	if err != nil {
 		p.writes.Add(1)
 	}
+}
+
+func retiredProfileMetric(name string) bool {
+	for _, prefix := range []string{"aigate_prefix_", "aigate_message_count", "aigate_tool_count", "aigate_profile_index_"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }

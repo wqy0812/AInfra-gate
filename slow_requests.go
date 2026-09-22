@@ -340,13 +340,12 @@ func slowRemoveFiles(path string) error {
 	return os.Remove(path)
 }
 
-func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
-	entries, err := os.ReadDir(s.c.Directory)
+func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
+	entries, err := os.ReadDir(directory)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var records []slowStoredRecord
-	var total int64
 	for _, entry := range entries {
 		name := entry.Name()
 		pending := strings.HasPrefix(name, ".pending-")
@@ -360,31 +359,42 @@ func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
 		if !entry.IsDir() || !slowRequestID(id) {
 			continue
 		}
-		path := filepath.Join(s.c.Directory, name)
+		path := filepath.Join(directory, name)
 		files, size, err := slowRecordFiles(path)
 		if err != nil { // foreign content is protected, never recursively deleted
-			return err
+			return nil, err
 		}
 		if pending {
 			if err := slowRemoveFiles(path); err != nil {
-				return err
+				return nil, err
 			}
 			continue
 		}
 		if len(files) != 2 {
-			return fmt.Errorf("incomplete slow request record: %s", name)
+			return nil, fmt.Errorf("incomplete slow request record: %s", name)
 		}
 		info, err := os.Lstat(filepath.Join(path, "meta.json"))
 		if err != nil || info.Size() > 16<<10 {
-			return fmt.Errorf("invalid slow request metadata: %s", name)
+			return nil, fmt.Errorf("invalid slow request metadata: %s", name)
 		}
 		data, err := os.ReadFile(filepath.Join(path, "meta.json"))
 		var meta slowRequestMeta
 		if err != nil || decodeJSON(data, &meta) != nil || meta.Schema != slowRequestSchema || meta.RequestID != id || meta.EndedAt.IsZero() {
-			return fmt.Errorf("invalid slow request metadata: %s", name)
+			return nil, fmt.Errorf("invalid slow request metadata: %s", name)
 		}
 		records = append(records, slowStoredRecord{path, meta.EndedAt, size})
-		total += size
+	}
+	return records, nil
+}
+
+func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
+	records, err := slowStoredRecords(s.c.Directory)
+	if err != nil {
+		return err
+	}
+	var total int64
+	for _, record := range records {
+		total += record.bytes
 	}
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].ended.Equal(records[j].ended) {

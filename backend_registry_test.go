@@ -47,7 +47,7 @@ func TestOnlineBackendsCLIAndNewRoute(t *testing.T) {
 	var out bytes.Buffer
 	cli := func(args ...string) error {
 		out.Reset()
-		return run(append(args, "--config", cfg, "--json"), &out, io.Discard)
+		return legacyRun(append(args, "--config", cfg, "--json"), &out, io.Discard)
 	}
 	write := func(req BackendWriteRequest, args ...string) error {
 		t.Helper()
@@ -315,7 +315,7 @@ func TestOnlineBackendMigrationAndRestart(t *testing.T) {
 	}
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	os.WriteFile(configPath, encodeJSON(c), 0600)
-	if err = run([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
+	if err = legacyRun([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := os.ReadFile(c.Management.StateFile)
@@ -350,7 +350,7 @@ func TestOnlineBackendMigrationAndRestart(t *testing.T) {
 	c.Backends["api1"].HeadersEnv = map[string]string{"Authorization": "AIGATE_REMOVED_BOOTSTRAP_SECRET"}
 	t.Setenv("AIGATE_REMOVED_BOOTSTRAP_SECRET", "")
 	os.WriteFile(configPath, encodeJSON(c), 0600)
-	if err = run([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
+	if err = legacyRun([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	g, err = newGateway(c, io.Discard)

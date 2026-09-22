@@ -63,7 +63,7 @@ func TestProfileGatewayJSONAndSSE(t *testing.T) {
 	var metrics bytes.Buffer
 	g.profile.metrics(&metrics)
 	m := metrics.String()
-	for _, want := range []string{`aigate_prompt_tokens_total{backend="api1",model="actual-model",request_scope="all"} 20`, `aigate_completion_tokens_total{backend="api1",model="actual-model",request_scope="all"} 6`, `aigate_cached_tokens_total{backend="api1",model="actual-model",request_scope="all"} 8`, `aigate_prefix_repeated_total{backend="api1",model="actual-model",level="1",request_scope="all"} 1`, `aigate_first_increment_seconds_count{backend="api1",model="actual-model",request_scope="streaming"} 1`} {
+	for _, want := range []string{`aigate_prompt_tokens_total{backend="api1",model="actual-model",request_scope="all"} 20`, `aigate_completion_tokens_total{backend="api1",model="actual-model",request_scope="all"} 6`, `aigate_cached_tokens_total{backend="api1",model="actual-model",request_scope="all"} 8`, `aigate_first_increment_seconds_count{backend="api1",model="actual-model",request_scope="streaming"} 1`} {
 		if !strings.Contains(m, want) {
 			t.Errorf("missing %s", want)
 		}
@@ -98,7 +98,7 @@ func TestProfileBoundedIndexMissingUsageAndAnalysis(t *testing.T) {
 		t.Fatal(e)
 	}
 	b, _ := json.Marshal(result)
-	if !bytes.Contains(b, []byte(`"repeated":1`)) || !bytes.Contains(b, []byte(`"families":2`)) {
+	if !bytes.Contains(b, []byte(`"requests":3`)) || bytes.Contains(b, []byte(`"prefix_levels"`)) {
 		t.Fatal(string(b))
 	}
 	var m bytes.Buffer
@@ -109,11 +109,6 @@ func TestProfileBoundedIndexMissingUsageAndAnalysis(t *testing.T) {
 	if strings.Contains(m.String(), `aigate_prompt_tokens_total{backend="api1",model="model",request_scope="all"} 1`) {
 		t.Fatal("invented usage")
 	}
-	p.mu.Lock()
-	if len(p.index) > 2 {
-		t.Fatal("unbounded index")
-	}
-	p.mu.Unlock()
 }
 func TestProfileObserverUsageDoesNotCollectText(t *testing.T) {
 	o := newSSEObserver(false)
@@ -144,7 +139,7 @@ func TestProfilePayloadLimitDoesNotRejectBusiness(t *testing.T) {
 	r := p.begin("limit")
 	p.input(r, []byte(`{"messages":[]}`), c.Backends["api1"], "api1", "model")
 	p.end(r, &auditEntry{Outcome: "completed"}, false)
-	if r.quality != "payload_limit" {
+	if r.quality != "" {
 		t.Fatal(r.quality)
 	}
 }
@@ -183,7 +178,7 @@ func TestProfileSlowScrapeDoesNotHoldRequestLock(t *testing.T) {
 	close(w.release)
 	<-done
 }
-func TestProfileComparisonDomainAndRetention(t *testing.T) {
+func TestProfileRetiredMetricsAndRetention(t *testing.T) {
 	p, c := profileFixture(t)
 	b := c.Backends["api1"]
 	for i, payload := range []string{`{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"one"}]}`, `{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"two"}]}`, `{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"one"}]}`} {
@@ -193,7 +188,7 @@ func TestProfileComparisonDomainAndRetention(t *testing.T) {
 	}
 	var m bytes.Buffer
 	p.metrics(&m)
-	if !strings.Contains(m.String(), `aigate_prefix_repeated_total{backend="api1",model="model",level="1",request_scope="all"} 1`) {
+	if strings.Contains(m.String(), "aigate_prefix_") || strings.Contains(m.String(), "aigate_message_count") || strings.Contains(m.String(), "aigate_tool_count") {
 		t.Fatal(m.String())
 	}
 	old := filepath.Join(p.c.Directory, "events-v2-1000000000000-old.jsonl")
@@ -422,7 +417,7 @@ func TestProfileDroppedEndAndLiveRequests(t *testing.T) {
 	}
 }
 
-func TestProfileSharedPrefixCoverage(t *testing.T) {
+func TestProfileNoMessageStructureCollected(t *testing.T) {
 	p, c := profileFixture(t)
 	payload := []byte(`{"messages":[{"role":"user","content":"same"}]}`)
 	for i := 0; i < 3; i++ {
@@ -440,14 +435,29 @@ func TestProfileSharedPrefixCoverage(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := raw.(map[string]any)
-	shared := result["observed_shared_prefix_bytes"].(map[string]any)
-	quality := result["quality"].(map[string]any)
-	if shared["count"] != 2 || shared["p50"] != float64(0) || shared["max"].(float64) <= 0 || shared["mean"].(float64) != shared["max"].(float64)/2 {
-		t.Fatalf("unobserved prefix included or valid zero excluded: %v", shared)
+	for _, field := range []string{"prefix_levels", "observed_shared_prefix_bytes", "prefix_basis"} {
+		if _, exists := result[field]; exists {
+			t.Fatalf("retired field: %s", field)
+		}
 	}
-	if quality["shared_prefix_observed"] != 2 || quality["shared_prefix_missing"] != 1 {
-		t.Fatalf("unexpected coverage: %v", quality)
+	if result["requests"] != 3 {
+		t.Fatal(result)
 	}
+	for _, path := range p.files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{`"marks":`, `"domain":`, `"messages":`, `"tools":`} {
+			if bytes.Contains(data, []byte(field)) {
+				t.Fatalf("retired event field: %s", field)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join(p.c.Directory, "hmac.key")); !os.IsNotExist(err) {
+		t.Fatal("profile still creates HMAC key")
+	}
+
 }
 
 func TestProfileDiskLimitDefaultAndOverride(t *testing.T) {
@@ -489,5 +499,31 @@ func TestProfileAnalysisAfterRestartWithCoarseFileTime(t *testing.T) {
 	result := raw.(map[string]any)
 	if result["requests"] != 1 || result["pending"] != 0 || result["unknown"] != 0 || result["outcomes"].(map[string]int)["completed"] != 1 {
 		t.Fatalf("lost persisted lifecycle after restart: %v", result)
+	}
+}
+
+func TestProfileRestoreDropsRetiredMetrics(t *testing.T) {
+	p, _ := profileFixture(t)
+	p.mu.Lock()
+	for _, name := range []string{"prefix_eligible_total", "prefix_gap_seconds_count", "message_count_count", "tool_count_count", "profile_index_evictions_total"} {
+		p.add(name, "", 7)
+	}
+	p.add("prompt_tokens_total", "", 123)
+	p.mu.Unlock()
+	p.close()
+	next, err := newRequestProfiler(p.c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.close()
+	var out bytes.Buffer
+	next.metrics(&out)
+	for _, name := range []string{"aigate_prefix_", "aigate_message_count", "aigate_tool_count", "aigate_profile_index_"} {
+		if strings.Contains(out.String(), name) {
+			t.Fatalf("restored retired metric %s", name)
+		}
+	}
+	if !strings.Contains(out.String(), `aigate_prompt_tokens_total{request_scope="all"} 123`) {
+		t.Fatal("lost retained token counter")
 	}
 }

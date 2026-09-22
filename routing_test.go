@@ -88,7 +88,7 @@ func TestRoutingFileRecoveryAndAtomicSwitchCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := run([]string{"switch", "single", "api1", "--config", configFile}, &out, io.Discard); err != nil {
+	if err := legacyRun([]string{"switch", "single", "api1", "--config", configFile}, &out, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	r, data = request(t, s, "POST", "/v1/chat/completions", basicBody, "")

@@ -406,7 +406,7 @@ func TestManagedStateLockRestartAndReadOnlyCheck(t *testing.T) {
 	c := managedConfig(t, one, two)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	os.WriteFile(configPath, encodeJSON(c), 0600)
-	if err := run([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
+	if err := legacyRun([]string{"check", "--config", configPath}, io.Discard, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(c.Management.StateFile); !os.IsNotExist(err) {
@@ -475,7 +475,7 @@ func TestManagedLocalCLI(t *testing.T) {
 	cli := func(args ...string) {
 		t.Helper()
 		out.Reset()
-		if err := run(append(args, "--config", cfgPath, "--json"), &out, io.Discard); err != nil {
+		if err := legacyRun(append(args, "--config", cfgPath, "--json"), &out, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -497,7 +497,7 @@ func TestManagedLocalCLI(t *testing.T) {
 	if strings.Contains(logs.String(), "aigate-echo-") || strings.Contains(logs.String(), "private") {
 		t.Fatal("management exposed generated output")
 	}
-	if err := run([]string{"status", "--config", cfgPath, "--admin-url", "http://127.0.0.1:8081"}, io.Discard, io.Discard); err == nil {
+	if err := legacyRun([]string{"status", "--config", cfgPath, "--admin-url", "http://127.0.0.1:8081"}, io.Discard, io.Discard); err == nil {
 		t.Fatal("removed HTTP option accepted")
 	}
 }

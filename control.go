@@ -152,6 +152,18 @@ func (m *Management) control(req controlRequest) (any, *ManagementError) {
 			return op, nil
 		}
 		return nil, &ManagementError{Status: 404, Code: "not_found", Message: "操作不存在"}
+	case "gateway-addresses":
+		var urls []string
+		if strictDecode(req.Payload, &urls) != nil || len(urls) > 256 {
+			return invalid()
+		}
+		return m.registerGatewayAddresses(urls)
+	case "test-acquire", "test-release", "test-status":
+		var body TestOccupancyRequest
+		if strictDecode(req.Payload, &body) != nil {
+			return invalid()
+		}
+		return m.testControl(req.Command, body)
 	case "backend-create", "backend-edit":
 		var body BackendWriteRequest
 		if len(req.Payload) > 64<<10 || strictDecode(req.Payload, &body) != nil {

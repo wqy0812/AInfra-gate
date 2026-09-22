@@ -32,19 +32,23 @@ type Operation struct {
 }
 
 type ManagedState struct {
-	Registry          *BackendRegistryState    `json:"registry,omitempty"`
-	SchemaVersion     int                      `json:"schema_version"`
-	Revision          uint64                   `json:"revision"`
-	RouteVersion      uint64                   `json:"route_version"`
-	ActiveBackend     string                   `json:"active_backend"`
-	RollbackCandidate string                   `json:"rollback_candidate,omitempty"`
-	RollbackArmed     bool                     `json:"rollback_armed"`
-	CleanShutdown     bool                     `json:"clean_shutdown"`
-	Backends          map[string]*BackendState `json:"backends"`
-	Operations        []*Operation             `json:"operations"`
+	ReleasedTestTokens map[string]bool          `json:"released_test_tokens,omitempty"`
+	GatewayAddresses   []string                 `json:"gateway_addresses,omitempty"`
+	TestOccupancy      *TestOccupancy           `json:"test_occupancy,omitempty"`
+	Registry           *BackendRegistryState    `json:"registry,omitempty"`
+	SchemaVersion      int                      `json:"schema_version"`
+	Revision           uint64                   `json:"revision"`
+	RouteVersion       uint64                   `json:"route_version"`
+	ActiveBackend      string                   `json:"active_backend"`
+	RollbackCandidate  string                   `json:"rollback_candidate,omitempty"`
+	RollbackArmed      bool                     `json:"rollback_armed"`
+	CleanShutdown      bool                     `json:"clean_shutdown"`
+	Backends           map[string]*BackendState `json:"backends"`
+	Operations         []*Operation             `json:"operations"`
 }
 
 type BackendCounters struct {
+	Tests     int    `json:"tests"`
 	Model     string `json:"model,omitempty"`
 	Business  int    `json:"business"`
 	Streams   int    `json:"streams"`
@@ -64,11 +68,12 @@ func (m *Management) noteModel(name, model string) {
 
 type ManagementStatus struct {
 	ManagedState
-	Counts   map[string]BackendCounters `json:"counts"`
-	Order    []string                   `json:"order"`
-	Busy     string                     `json:"busy,omitempty"`
-	Alert    string                     `json:"alert,omitempty"`
-	Failures int                        `json:"consecutive_failures"`
+	TestControlVersion int                        `json:"test_control_version"`
+	Counts             map[string]BackendCounters `json:"counts"`
+	Order              []string                   `json:"order"`
+	Busy               string                     `json:"busy,omitempty"`
+	Alert              string                     `json:"alert,omitempty"`
+	Failures           int                        `json:"consecutive_failures"`
 }
 
 type Management struct {
@@ -191,7 +196,10 @@ func newManagement(g *Gateway) (*Management, error) {
 	m.persist = func(s ManagedState) error { return writeManagedState(g.config.Management.StateFile, s) }
 	for name, b := range s.Backends {
 		m.counts[name] = &BackendCounters{}
-		if !s.CleanShutdown && !b.Maintenance {
+		// A failed completion write can leave durable test inflight even after
+		// an otherwise clean shutdown. It still requires explicit confirmation.
+		unknownTest := s.TestOccupancy != nil && s.TestOccupancy.Backend == name && s.TestOccupancy.Inflight > 0
+		if (!s.CleanShutdown || unknownTest) && !b.Maintenance {
 			b.DrainUnknown = true
 		}
 		if b.LastWarmup != nil {
@@ -243,7 +251,11 @@ func (m *Management) status() ManagementStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pruneFailuresLocked()
-	s := ManagementStatus{ManagedState: m.cloneLocked(), Counts: map[string]BackendCounters{}, Order: append([]string(nil), m.state.Registry.Order...), Busy: m.busy, Alert: m.alert, Failures: len(m.failures)}
+	s := ManagementStatus{TestControlVersion: 1, ManagedState: m.cloneLocked(), Counts: map[string]BackendCounters{}, Order: append([]string(nil), m.state.Registry.Order...), Busy: m.busy, Alert: m.alert, Failures: len(m.failures)}
+	if s.TestOccupancy != nil {
+		s.TestOccupancy.TokenHash = ""
+	}
+	s.ReleasedTestTokens = nil
 	s.Registry = nil // Persisted credentials must never enter public status responses.
 	for _, op := range s.Operations {
 		op.Fingerprint = ""
@@ -282,12 +294,17 @@ type backendLease struct {
 	runtime       *backendRuntime
 	version       uint64
 	probe, stream bool
+	test          bool
 	once          sync.Once
 }
 
 func (m *Management) acquire(name string, probe, stream, restore bool) (*backendLease, *GatewayError) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.acquireLocked(name, probe, stream, restore)
+}
+
+func (m *Management) acquireLocked(name string, probe, stream, restore bool) (*backendLease, *GatewayError) {
 	if m.closed {
 		return nil, fault(503, "gateway_stopping", "网关正在退出")
 	}
@@ -297,6 +314,9 @@ func (m *Management) acquire(name string, probe, stream, restore bool) (*backend
 	b := m.state.Backends[name]
 	if b == nil || (b.Maintenance && !restore) {
 		return nil, fault(503, "backend_in_maintenance", "后端处于维护锁定状态")
+	}
+	if err := m.checkRouterLocked(m.state.Registry.Configs[name]); err != nil {
+		return nil, fault(503, "gateway_target_forbidden", "目标为网关，须迁移为 Router")
 	}
 	c := m.counts[name]
 	if probe {
@@ -316,6 +336,14 @@ func (l *backendLease) release(outcome string) {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		c := m.counts[l.name]
+		if l.test {
+			c.Tests--
+			s := m.cloneLocked()
+			if s.TestOccupancy != nil {
+				s.TestOccupancy.Inflight--
+				_ = m.persistTestInflightLocked(s)
+			}
+		}
 		if l.probe {
 			c.Probes--
 		} else {

@@ -107,6 +107,8 @@ type auditEntry struct {
 	generation     *generationResult
 	RequestID      string  `json:"request_id"`
 	QuestionPrefix string  `json:"question_prefix"`
+	TestTask       string  `json:"test_task,omitempty"`
+	RouteVersion   uint64  `json:"route_version,omitempty"`
 	Status         int     `json:"status"`
 	Outcome        string  `json:"outcome"`
 	Backend        *string `json:"backend"`
@@ -249,6 +251,12 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.QuestionPrefix = questionPrefix(body.question)
+	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok {
+		entry.RouteVersion, entry.TestTask = meta.revision, meta.task
+		if body.stream {
+			meta.stream()
+		}
+	}
 	if body.stream && g.slow != nil {
 		// Keep the original bytes alive; makePayload may change the parsed fields.
 		entry.slowInput = data
@@ -264,7 +272,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	outcome := "ignored"
 	if g.management != nil {
 		var lease *backendLease
-		lease, err = g.management.acquire("", false, body.stream, false)
+		lease, err = g.management.acquireRequest(r.Header.Get("X-Code-Eval-Token"), body.stream)
 		if err == nil {
 			defer func() {
 				if r.Context().Err() != nil {
@@ -273,10 +281,19 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 				lease.release(outcome)
 			}()
 			name = lease.name
+			entry.RouteVersion = lease.version
+			if lease.test {
+				entry.TestTask = g.management.status().TestOccupancy.TaskID
+			}
+			w.Header().Set("X-Aigate-Backend", name)
+			w.Header().Set("X-Aigate-Route-Version", fmt.Sprint(lease.version))
 			entry.profile.liveBackend(name)
 			backend = lease.runtime.backend
 			model, err = g.pool.discoverRuntime(r.Context(), lease.runtime)
 			g.management.noteModel(name, model)
+			if err == nil && lease.test && model != g.management.status().TestOccupancy.Model {
+				err = fault(409, "test_model_changed", "实际模型与测试快照不一致")
+			}
 			if err != nil {
 				outcome = "backend_failure"
 			}
@@ -284,13 +301,19 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	} else {
 		name, backend, model, err = g.pool.choose(r.Context())
 	}
+	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok && err == nil && meta.model != "" && meta.model != model {
+		err = fault(409, "test_model_changed", "实际模型与测试快照不一致")
+	}
 	if err != nil {
 		sendError(w, entry, err)
 		return
 	}
 	entry.Backend, entry.Model = &name, &model
+	w.Header().Set("X-Aigate-Model", model)
 	entry.profile.liveStage("preparing_upstream")
 	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
+		pr.e.TestTask = entry.TestTask
+		pr.e.RouteVersion = entry.RouteVersion
 		pr.e.Backend = name
 		pr.e.Model = model
 	}
