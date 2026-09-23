@@ -238,11 +238,41 @@ func questionPrefix(question string) string {
 	return question
 }
 
+const requestBodyTimeout = 5 * time.Minute
+const maxRequestBodyBytes int64 = 30_000_000
+
+func readChatBody(w http.ResponseWriter, r *http.Request, timeout time.Duration) ([]byte, *GatewayError) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Now().Add(timeout))
+	defer controller.SetReadDeadline(time.Time{})
+	tooLarge := fault(http.StatusRequestEntityTooLarge, "request_body_too_large", "请求体不能超过 30 MB")
+	if r.ContentLength > maxRequestBodyBytes {
+		w.Header().Set("Connection", "close")
+		return nil, tooLarge
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	data, err := io.ReadAll(r.Body)
+	if err == nil {
+		return data, nil
+	}
+	// Do not let net/http drain an unfinished upload while writing the error.
+	w.Header().Set("Connection", "close")
+	var limitErr *http.MaxBytesError
+	if errors.As(err, &limitErr) {
+		return nil, tooLarge
+	}
+	var timeoutErr net.Error
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return nil, fault(http.StatusRequestTimeout, "request_body_timeout", "请求体上传超时")
+	}
+	return nil, fault(400, "invalid_request", "请求不符合固定 JSON 格式")
+}
+
 func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry) {
 	arrived := time.Now()
-	data, readErr := io.ReadAll(r.Body)
-	if readErr != nil {
-		sendError(w, entry, fault(400, "invalid_request", "请求不符合固定 JSON 格式"))
+	data, bodyErr := readChatBody(w, r, requestBodyTimeout)
+	if bodyErr != nil {
+		sendError(w, entry, bodyErr)
 		return
 	}
 	body, err := parseChat(data)
@@ -363,7 +393,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.profile.liveStage("reading_response")
-	data, readErr = io.ReadAll(response.Body)
+	data, readErr := io.ReadAll(response.Body)
 	if readErr != nil {
 		state.transportError(readErr, ctx, r.Context(), "response_read_error")
 		outcome = "backend_failure"

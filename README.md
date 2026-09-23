@@ -6,6 +6,8 @@
 
 业务入口为 `POST /v1/chat/completions` 和 `GET /v1/models`；模型由 Router 发现，响应可使用本网关的 `public_model_name`。元数据兼容规则和 overrides 随 Router 交换；入口名称、入口凭据、连接池与观测策略留在本网关。
 
+`POST /v1/chat/completions` 请求体上传总时限为 5 分钟，大小上限为 30 MB（30,000,000 字节）。上传超时返回 HTTP 408，超限返回 HTTP 413；请求体读取完成后清除读取截止时间，后续生成与 SSE 使用原有生成超时。
+
 所有管理动作经过平台 API。网关仅开放鉴权的 `/control/v2/status`、`/control/v2/commands`、`/control/v2/commands/{seq}` 给 Engine。二进制不再支持 `check`、`switch`、`status`、`backends` 等管理 CLI、`--config`、路由文件或 Unix 管理 socket。
 
 两网关交换 Router：验证主动目标 → 双方暂停新请求并确认 → 平台事务交换绑定 → 主动方激活并单独成功 → 被动方直接激活。被动 Router 故障不阻塞、不回退主动方；被动网关控制不可达则继续暂停并重试。已受理请求，包括 SSE 和等待模型发现/连接池的请求，保持原快照直到结束。
