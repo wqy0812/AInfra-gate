@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -107,8 +108,56 @@ func (s *generationResult) observeStream(o *sseObserver, complete bool) {
 	}
 }
 
+// Bound observation work without imposing a limit on the forwarded response.
+const maxNonstreamObservationBytes = 4 << 20
+
+// Observe the original representation, independently of forwarding and aliases.
+// Unknown extensions are not evidence of a successful or failed generation.
+func (s *generationResult) observeNonstream(data []byte, headers http.Header) {
+	if s == nil {
+		return
+	}
+	s.result = "unknown"
+	for _, encoding := range headers.Values("Content-Encoding") {
+		if encoding = strings.TrimSpace(encoding); encoding != "" && !strings.EqualFold(encoding, "identity") {
+			return
+		}
+	}
+	if len(data) > maxNonstreamObservationBytes {
+		return
+	}
+	if !json.Valid(data) {
+		s.fail("protocol_error")
+		return
+	}
+	var fields rawObject
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
+		return
+	}
+	if problem, exists := fields["error"]; exists && !isNull(problem) {
+		s.fail("response_error")
+		return
+	}
+	var choices []struct {
+		Message      rawObject `json:"message"`
+		FinishReason string    `json:"finish_reason"`
+	}
+	if json.Unmarshal(fields["choices"], &choices) != nil || len(choices) == 0 {
+		return
+	}
+	for _, choice := range choices {
+		role, _ := rawString(choice.Message["role"])
+		if role != "assistant" || choice.FinishReason == "" {
+			return
+		}
+	}
+	// Completion evidence does not require text: tools, reasoning, refusals and
+	// content filtering can all finish with empty or absent content.
+	s.result = ""
+}
+
 // Preserve representation headers, never hop-by-hop headers or upstream cookies.
-func copyErrorHeaders(dst, src http.Header) {
+func copyRepresentationHeaders(dst, src http.Header) {
 	blocked := map[string]bool{}
 	for _, line := range src.Values("Connection") {
 		for _, name := range strings.Split(line, ",") {
@@ -135,7 +184,7 @@ func (g *Gateway) forwardGenerationError(w http.ResponseWriter, r *http.Request,
 	s := entry.generation
 	s.fail(upstreamHTTPClass(response.StatusCode))
 	entry.Status, entry.Outcome = response.StatusCode, "rejected"
-	copyErrorHeaders(w.Header(), response.Header)
+	copyRepresentationHeaders(w.Header(), response.Header)
 	controller := http.NewResponseController(w)
 	deadline, _ := ctx.Deadline()
 	_ = controller.SetWriteDeadline(deadline)

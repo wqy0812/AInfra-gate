@@ -10,27 +10,22 @@ import (
 func TestReasoningOnlyResponseHTTP(t *testing.T) {
 	for _, tc := range []struct {
 		name, message string
-		valid         bool
 	}{
-		{"null_content", `{"role":"assistant","content":null,"reasoning_content":"thinking","tool_calls":null}`, true},
-		{"missing_content", `{"role":"assistant","reasoning_content":"thinking"}`, true},
-		{"empty_reasoning", `{"role":"assistant","content":null,"reasoning_content":""}`, false},
-		{"null_reasoning", `{"role":"assistant","content":null,"reasoning_content":null}`, false},
-		{"missing_reasoning", `{"role":"assistant","content":null}`, false},
-		{"object_reasoning", `{"role":"assistant","reasoning_content":{"text":"thinking"}}`, false},
-		{"number_reasoning", `{"role":"assistant","reasoning_content":1}`, false},
-		{"wrong_role", `{"role":"user","reasoning_content":"thinking"}`, false},
-		{"wrong_content", `{"role":"assistant","content":{},"reasoning_content":"thinking"}`, false},
+		{"null_content", `{"role":"assistant","content":null,"reasoning_content":"thinking","tool_calls":null}`},
+		{"missing_content", `{"role":"assistant","reasoning_content":"thinking"}`},
+		{"empty_reasoning", `{"role":"assistant","content":null,"reasoning_content":""}`},
+		{"null_reasoning", `{"role":"assistant","content":null,"reasoning_content":null}`},
+		{"missing_reasoning", `{"role":"assistant","content":null}`},
+		{"object_reasoning", `{"role":"assistant","reasoning_content":{"text":"thinking"}}`},
+		{"number_reasoning", `{"role":"assistant","reasoning_content":1}`},
+		{"wrong_role", `{"role":"user","reasoning_content":"thinking"}`},
+		{"wrong_content", `{"role":"assistant","content":{},"reasoning_content":"thinking"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			body := `{"id":"xpu-probe","model":"router-model","choices":[{"index":0,"message":` + tc.message + `,"finish_reason":"length"}],"usage":{"completion_tokens":1,"large":9007199254740993},"metadata":{"weight_version":"default"}}`
 			u := upstreamServer(t, "router-model", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) })
 			_, s, _ := serveTest(t, fixtureConfig(t, u.URL))
 			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-			if !tc.valid {
-				requireError(t, r, data, 502, "invalid_upstream_response")
-				return
-			}
 			if r.StatusCode != 200 {
 				t.Fatalf("status=%d body=%s", r.StatusCode, data)
 			}

@@ -81,6 +81,70 @@ func TestPublicModelABSwitchAndAttribution(t *testing.T) {
 	}
 }
 
+func TestPublicModelLeavesUnrecognizedResponsesUntouched(t *testing.T) {
+	for _, body := range []string{
+		`{"error":"downstream"}`,
+		`{ "error":{"message":"downstream"}, "model":"real" }`,
+		`{"error":null,"model":"real","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		`{"error":"downstream","model":"real","choices":[{"message":{"role":"assistant","content":"ok"}}]}`,
+		`{"model":"real"}`,
+		`{"choices":[]}`,
+		`{"model":"real","choices":[]}`,
+		`{"choices":[1]}`,
+		`{"choices":[null]}`,
+		`{"choices":[{"message":null}]}`,
+		`{"choices":[{"message":{"role":"user","content":"input"}}]}`,
+		`{"choices":[{"message":{"role":"assistant","content":"ok"}},1]}`,
+		`not-json`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			u := upstreamServer(t, "real", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, body)
+			})
+			c := fixtureConfig(t, u.URL)
+			c.PublicModelName = "public"
+			_, s, _ := serveTest(t, c)
+			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
+			if r.StatusCode != 200 || string(data) != body {
+				t.Fatalf("upstream response changed: status=%d", r.StatusCode)
+			}
+		})
+	}
+}
+
+func TestPublicModelRecognizesChatWithoutRestrictingContent(t *testing.T) {
+	for _, message := range []string{
+		`{"role":"assistant","content":"answer"}`,
+		`{"role":"assistant","content":""}`,
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"call1","function":{"name":"tool","arguments":"{}"}}]}`,
+		`{"role":"assistant","reasoning_content":"thinking"}`,
+		`{"role":"assistant","refusal":"cannot answer"}`,
+		`{"role":"assistant","content":null}`,
+		`{"role":"assistant","content":[{"type":"text","text":"answer"}]}`,
+	} {
+		t.Run(message, func(t *testing.T) {
+			// Missing model and finish_reason still identify a chat envelope; they
+			// do not prove generation completion for the independent observer.
+			body := `{"choices":[{"message":` + message + `}],"usage":{"large":9007199254740993},"metadata":{"model":"nested-real"}}`
+			u := upstreamServer(t, "real", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, body)
+			})
+			c := fixtureConfig(t, u.URL)
+			c.PublicModelName = "public"
+			_, s, _ := serveTest(t, c)
+			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
+			if r.StatusCode != 200 {
+				t.Fatal(r.StatusCode)
+			}
+			var expected rawObject
+			_ = json.Unmarshal([]byte(body), &expected)
+			expected["model"] = encodeJSON("public")
+			equivalentJSON(t, data, encodeJSON(expected))
+		})
+	}
+}
+
 func TestPublicModelManagedSwitch(t *testing.T) {
 	one, two := newProtocolBackend(t), newProtocolBackend(t)
 	c := managedConfig(t, one, two)

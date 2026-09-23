@@ -59,10 +59,7 @@ func TestWorkspaceCompatibilityHTTP(t *testing.T) {
 						t.Fatal("SSE changed")
 					}
 					if !stream {
-						var expected rawObject
-						_ = json.Unmarshal([]byte(goodResponse), &expected)
-						expected["model"] = encodeJSON("router-model")
-						equivalentJSON(t, data, encodeJSON(expected))
+						equivalentJSON(t, data, []byte(goodResponse))
 					}
 					body["model"] = encodeJSON("router-model")
 					if tc.expected != "" {

@@ -29,7 +29,7 @@ func TestSingleBackendCacheAndModels(t *testing.T) {
 				_, _ = fmt.Fprintf(w, `{"data":[{"id":"model%d"}]}`, i+1)
 				return
 			}
-			_, _ = io.WriteString(w, goodResponse)
+			_, _ = io.WriteString(w, strings.Replace(goodResponse, `"model":"ignored"`, fmt.Sprintf(`"model":"model%d"`, i+1), 1))
 		}))
 		t.Cleanup(servers[i].Close)
 	}
@@ -52,8 +52,12 @@ func TestSingleBackendCacheAndModels(t *testing.T) {
 }
 
 func TestRoutingFileRecoveryAndAtomicSwitchCLI(t *testing.T) {
-	u1 := upstreamServer(t, "model1", nil)
-	u2 := upstreamServer(t, "model2", nil)
+	u1 := upstreamServer(t, "model1", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Replace(goodResponse, `"model":"ignored"`, `"model":"model1"`, 1))
+	})
+	u2 := upstreamServer(t, "model2", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Replace(goodResponse, `"model":"ignored"`, `"model":"model2"`, 1))
+	})
 	c := fixtureConfig(t, u1.URL, u2.URL)
 	c.RoutingFile = filepath.Join(t.TempDir(), "routing.json")
 	if err := publishPolicy(c, Policy{Mode: "single", Backend: "api1"}); err != nil {

@@ -156,7 +156,7 @@ func TestGenerationProtocolAndTransportCounts(t *testing.T) {
 	}{
 		{"json", "application/json", goodResponse, "", "completed", false},
 		{"invalid_json", "application/json", "{", "protocol_error", "error", false},
-		{"invalid_response", "application/json", `{"error":"secret"}`, "protocol_error", "error", false},
+		{"invalid_response", "application/json", `{"error":"secret"}`, "response_error", "error", false},
 		{"wrong_sse_type", "application/json", goodResponse, "protocol_error", "error", true},
 		{"sse", "text/event-stream", good, "", "completed", true},
 		{"sse_error", "text/event-stream", "data: {\"error\":{\"message\":\"secret\"}}\n\n", "stream_error", "error", true},
@@ -169,6 +169,9 @@ func TestGenerationProtocolAndTransportCounts(t *testing.T) {
 				return generationResponse(200, tc.contentType, tc.body), nil
 			})
 			w := generationRequest(g, tc.stream)
+			if !tc.stream && (w.Code != 200 || w.Body.String() != tc.body || w.Header().Get("Content-Type") != tc.contentType) {
+				t.Fatal("non-streaming upstream response changed")
+			}
 			if tc.name == "sse_error" && (w.Code != 200 || w.Body.String() != tc.body) {
 				t.Fatal("SSE error changed")
 			}

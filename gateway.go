@@ -401,24 +401,44 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 
-	result, err := normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
-	if err != nil {
-		state.fail("protocol_error")
-		outcome = "backend_failure"
-		sendError(w, entry, err)
-		return
+	result := data
+	if backend.Adapter == "openai" {
+		state.observeNonstream(data, response.Header)
+		// The OpenAI backend owns its response format. Only the configured public
+		// model alias may change its body; an unrecognized body passes through.
+		if g.config.PublicModelName != "" {
+			result = rewriteChatResponseModel(data, g.config.PublicModelName)
+		}
+	} else {
+		result, err = normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
+		if err != nil {
+			state.fail("protocol_error")
+			outcome = "backend_failure"
+			sendError(w, entry, err)
+			return
+		}
 	}
 	if entry.profile != nil {
 		var decoded struct {
 			Usage json.RawMessage `json:"usage"`
 		}
 		// Template normalization creates a new response envelope without usage.
-		// Observe the upstream counters after validating the response.
+		// Observe upstream counters without requiring a particular response shape.
 		if json.Unmarshal(data, &decoded) == nil {
 			entry.profile.usage = usageCounters(decoded.Usage)
 		}
 	}
-	sendJSON(w, entry, 200, result)
+	if backend.Adapter == "openai" {
+		entry.profile.liveStage("writing_client")
+		copyRepresentationHeaders(w.Header(), response.Header)
+		w.WriteHeader(response.StatusCode)
+		entry.Status = response.StatusCode
+		if _, err := w.Write(result); err == nil {
+			entry.Outcome = "completed"
+		}
+	} else {
+		sendJSON(w, entry, 200, result)
+	}
 	if entry.Outcome == "completed" {
 		outcome = "success"
 	} else {

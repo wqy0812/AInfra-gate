@@ -289,6 +289,31 @@ func truthy(raw json.RawMessage) bool {
 	}
 }
 
+// Recognize the chat envelope without constraining its message content or
+// requiring completion evidence. Error and unfamiliar bodies stay byte-exact.
+func rewriteChatResponseModel(data []byte, model string) []byte {
+	var fields rawObject
+	if json.Unmarshal(data, &fields) != nil || fields == nil {
+		return data
+	}
+	if _, hasError := fields["error"]; hasError {
+		return data
+	}
+	var choices []struct {
+		Message rawObject `json:"message"`
+	}
+	if json.Unmarshal(fields["choices"], &choices) != nil || len(choices) == 0 {
+		return data
+	}
+	for _, choice := range choices {
+		if role, _ := rawString(choice.Message["role"]); role != "assistant" {
+			return data
+		}
+	}
+	fields["model"] = encodeJSON(model)
+	return encodeJSON(fields)
+}
+
 func normalizeResponse(data []byte, b *Backend, model, id string) ([]byte, *GatewayError) {
 	if !json.Valid(data) {
 		return nil, fault(502, "invalid_upstream_json", "下游未返回合法 JSON")
