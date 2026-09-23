@@ -504,7 +504,6 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 }
 
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) string {
-	entry.profile.liveStage("writing_client")
 	controller := http.NewResponseController(w)
 	deadline, _ := ctx.Deadline()
 	_ = controller.SetWriteDeadline(deadline)
@@ -512,9 +511,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
+	entry.profile.liveWriteStart()
 	w.WriteHeader(200)
 	entry.Status = 200
-	if controller.Flush() != nil {
+	flushErr := controller.Flush()
+	entry.profile.liveIOEnd()
+	if flushErr != nil {
 		entry.generation.writeFailure(ctx, r.Context())
 		return "client_failure"
 	}
@@ -550,7 +552,8 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	}
 	writeFailed := false
 	emit := func(data []byte) error {
-		entry.profile.liveStage("writing_client")
+		entry.profile.liveWriteStart()
+		defer entry.profile.liveIOEnd()
 		if _, err := w.Write(data); err != nil {
 			writeFailed = true
 			return err
@@ -564,6 +567,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	for {
 		entry.profile.liveStreamRead(observer)
 		n, readErr := response.Body.Read(*buffer)
+		entry.profile.liveIOEnd()
 		if n > 0 {
 			data := (*buffer)[:n]
 			observer.Feed(data)
@@ -627,11 +631,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		entry.Outcome = code
 		entry.profile.liveTerminal()
-		entry.profile.liveStage("writing_client")
 		// Permit a bounded final error write after the generation deadline expires.
 		_ = controller.SetWriteDeadline(time.Now().Add(time.Second))
+		entry.profile.liveWriteStart()
 		_, _ = fmt.Fprintf(w, "\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID))
 		_ = controller.Flush()
+		entry.profile.liveIOEnd()
 		return "backend_failure"
 	}
 }

@@ -289,12 +289,18 @@ func TestLiveGatewayBeforeCompletion(t *testing.T) {
 			close(headers)
 			if stream {
 				waitLiveStage(t, g.profile, "waiting_first_output")
+				if liveValue(liveValues(g.profile, time.Now().Add(time.Minute)), "stream_backend_wait_max_seconds", "api1") < 60 {
+					t.Fatal("first output read not timed")
+				}
 			} else {
 				waitLiveStage(t, g.profile, "reading_response")
 			}
 			close(body)
 			if stream {
 				waitLiveStage(t, g.profile, "streaming")
+				if liveValue(liveValues(g.profile, time.Now().Add(time.Minute)), "stream_backend_wait_max_seconds", "api1") < 60 {
+					t.Fatal("subsequent output read not timed")
+				}
 				close(more)
 				waitLiveStage(t, g.profile, "finishing_stream")
 				if liveValue(liveValues(g.profile, time.Now().Add(time.Minute)), "stream_idle_requests", "api1", "threshold_seconds", "5") != 0 {

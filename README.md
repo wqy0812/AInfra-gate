@@ -59,3 +59,7 @@ sum by (backend, model) (
 ```
 
 完整接口、状态机、迁移和待执行验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。历史配置与 CLI 文档保存于 [v1 历史说明](docs/LEGACY_README_V1.md)，不可用于启动 v2。
+
+### 流停顿方向
+
+新增 `aigate_stream_backend_wait_max_seconds`（当前读取中的流，自上次有效输出后累计 Read 等待）及 `aigate_stream_write_active_max_seconds`（当前一轮 Write + Flush 持续时间）。两者单位秒，按 backend 输出，`request_scope="streaming"`。首次输出前从首次读取响应体计时，写出耗时不计入后端等待；心跳/usage 不重置，完成或观察未知的流退出后端等待统计，最终写出仍计时。没有符合条件的请求输出零；旧指标保持原义。指标只区分供数与输出方向，不直接判定模型故障或客户端不读。

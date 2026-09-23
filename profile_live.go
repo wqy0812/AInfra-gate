@@ -6,6 +6,29 @@ import (
 	"time"
 )
 
+// IO timing is independent of display stages. Never hold the profiler lock over I/O.
+func (live *profileLiveRequest) beginIO(operation string, now time.Time) {
+	live.ioOperation, live.ioStarted = operation, now
+}
+
+func (live *profileLiveRequest) endIO(now time.Time) {
+	if live.ioOperation == "read" {
+		live.readWait += max(time.Duration(0), now.Sub(live.ioStarted))
+	}
+	live.ioOperation, live.ioStarted = "", time.Time{}
+}
+
+func (r *profileRequest) liveWriteStart() {
+	r.updateLive(func(live *profileLiveRequest) {
+		live.stage = "writing_client"
+		live.beginIO("write", time.Now())
+	})
+}
+
+func (r *profileRequest) liveIOEnd() {
+	r.updateLive(func(live *profileLiveRequest) { live.endIO(time.Now()) })
+}
+
 // Live values are never stored in the cumulative counter checkpoint.
 var profileLiveStages = []string{
 	"routing_discovery", "preparing_upstream",
@@ -21,6 +44,9 @@ type profileLiveRequest struct {
 	terminal          bool
 	unknown           bool
 	nonstream         bool
+	ioOperation       string
+	ioStarted         time.Time
+	readWait          time.Duration
 }
 
 func profileFrom(ctx context.Context) *profileRequest {
@@ -65,6 +91,9 @@ func (r *profileRequest) liveTerminal() {
 
 func (r *profileRequest) liveObserve(o *sseObserver) {
 	r.updateLive(func(live *profileLiveRequest) {
+		if !o.LastUsefulAt.Equal(live.lastUseful) {
+			live.readWait = 0
+		}
 		live.lastUseful = o.LastUsefulAt
 		live.unknown = o.Unknown || o.Invalid
 		live.terminal = live.terminal || o.HasError || o.valid()
@@ -78,7 +107,10 @@ func (r *profileRequest) liveStreamRead(o *sseObserver) {
 	} else if o.Useful {
 		stage = "streaming"
 	}
-	r.liveStage(stage)
+	r.updateLive(func(live *profileLiveRequest) {
+		live.stage = stage
+		live.beginIO("read", time.Now())
+	})
 }
 
 // Input maps are private scrape snapshots. Durations use Go's monotonic clock.
@@ -87,14 +119,14 @@ func profileLiveMetrics(now time.Time, active map[uint64]profileLiveRequest, bac
 	// even after a vanished series has aged out of the current query window.
 	types["aigate_live_backend_groups"] = "gauge"
 	values["aigate_live_backend_groups"] = float64(len(backends))
-	base := []string{"streams_waiting_first_output", "stream_first_output_wait_max_seconds", "stream_idle_requests", "stream_idle_max_seconds", "inflight_requests_by_stage", "inflight_oldest_age_seconds", "inflight_oldest_stage", "stream_observation_unknown"}
+	base := []string{"streams_waiting_first_output", "stream_first_output_wait_max_seconds", "stream_idle_requests", "stream_idle_max_seconds", "inflight_requests_by_stage", "inflight_oldest_age_seconds", "inflight_oldest_stage", "stream_observation_unknown", "stream_backend_wait_max_seconds", "stream_write_active_max_seconds"}
 	for _, name := range base {
 		types["aigate_"+name] = "gauge"
 	}
 	tagsFor := func(backend string) string { return profileExtra("", "backend", backend) }
 	for backend := range backends {
 		tags := tagsFor(backend)
-		for _, name := range []string{base[0], base[1], base[3], base[5], base[7]} {
+		for _, name := range []string{base[0], base[1], base[3], base[5], base[7], base[8], base[9]} {
 			values["aigate_"+name+tags] = 0
 		}
 		for _, threshold := range profileIdleThresholds {
@@ -113,6 +145,14 @@ func profileLiveMetrics(now time.Time, active map[uint64]profileLiveRequest, bac
 		previous, found := oldest[live.backend]
 		if !found || live.start.Before(active[previous].start) || (live.start.Equal(active[previous].start) && seq < previous) {
 			oldest[live.backend] = seq
+		}
+		if !live.nonstream && live.ioOperation == "write" {
+			key := "aigate_stream_write_active_max_seconds" + tags
+			values[key] = max(values[key], max(0, now.Sub(live.ioStarted).Seconds()))
+		}
+		if !live.nonstream && !live.terminal && !live.unknown && live.ioOperation == "read" {
+			key := "aigate_stream_backend_wait_max_seconds" + tags
+			values[key] = max(values[key], live.readWait.Seconds()+max(0, now.Sub(live.ioStarted).Seconds()))
 		}
 		if live.nonstream || live.terminal {
 			continue
