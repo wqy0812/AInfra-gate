@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -18,7 +17,6 @@ type Config struct {
 	DiscoveryTimeoutSeconds float64             `json:"discovery_timeout_seconds"`
 	ModelCacheSeconds       float64             `json:"model_cache_seconds"`
 	DiscoveryRetrySeconds   float64             `json:"discovery_retry_seconds"`
-	PublicModelName         string              `json:"public_model_name"`
 	GatewayAPIKeyEnv        string              `json:"gateway_api_key_env"`
 	RoutingFile             string              `json:"routing_file"`
 	Routing                 Policy              `json:"routing"`
@@ -105,11 +103,6 @@ func parseConfig(data []byte, path string) (*Config, error) {
 	if err := decodeJSON(data, &root); err != nil {
 		return nil, err
 	}
-	if raw, ok := root["public_model_name"]; ok {
-		if _, valid := rawString(raw); !valid {
-			return nil, fmt.Errorf("public_model_name 必须为字符串")
-		}
-	}
 	d := json.NewDecoder(bytes.NewReader(root["backends"]))
 	if token, err := d.Token(); err != nil || token != json.Delim('{') {
 		return nil, fmt.Errorf("配置中必须包含 backends")
@@ -190,9 +183,6 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
-	if strings.TrimSpace(c.PublicModelName) != c.PublicModelName {
-		return fmt.Errorf("public_model_name 不能为纯空白或含首尾空白")
-	}
 	if c.GatewayAPIKeyEnv != "" && os.Getenv(c.GatewayAPIKeyEnv) == "" {
 		return fmt.Errorf("缺少环境变量 %s", c.GatewayAPIKeyEnv)
 	}
@@ -258,12 +248,4 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
-}
-
-// Public naming never changes downstream discovery or audit attribution.
-func (c *Config) publicModel(actual string) string {
-	if c.PublicModelName != "" {
-		return c.PublicModelName
-	}
-	return actual
 }

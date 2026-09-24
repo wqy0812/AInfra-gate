@@ -1,5 +1,4 @@
 {
-  "public_model_name": "my-model",
   "timeout_seconds": 300,
   "gateway_api_key_env": "GATEWAY_API_KEY",
   "discovery_timeout_seconds": 10,

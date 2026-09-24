@@ -4,9 +4,9 @@
 
 ## 控制方式
 
-业务入口为 `POST /v1/chat/completions` 和 `GET /v1/models`；模型由 Router 发现，响应可使用本网关的 `public_model_name`。元数据兼容规则和 overrides 随 Router 交换；入口名称、入口凭据、连接池与观测策略留在本网关。
+业务入口为 `POST /v1/chat/completions` 和 `GET /v1/models`；模型由 Router 发现，模型列表使用发现的实际 ID，OpenAI 响应保留后端返回的模型名。元数据兼容规则和 overrides 随 Router 交换；入口名称、入口凭据、连接池与观测策略留在本网关。
 
-客户端请求的 `model` 可以填写任意字符串，也可以省略或为 null；网关发往 Router 前替换为发现的实际模型名，不要求客户端名称与后端匹配。`public_model_name` 用于对外响应中的模型别名，与请求模型的替换规则独立。
+客户端请求的 `model` 可以填写任意字符串，也可以省略或为 null；网关发往 Router 前替换为发现的实际模型名，不要求客户端名称与后端匹配。登记和更换模型时仍填写实际模型 ID。
 
 `POST /v1/chat/completions` 请求体上传总时限为 5 分钟，大小上限为 30 MB（30,000,000 字节）。上传超时返回 HTTP 408，超限返回 HTTP 413；请求体读取完成后清除读取截止时间，后续生成与 SSE 使用原有生成超时。
 
@@ -14,9 +14,11 @@
 
 两网关交换 Router：验证主动目标 → 双方暂停新请求并确认 → 平台事务交换绑定 → 主动方激活并单独成功 → 被动方直接激活。被动 Router 故障不阻塞、不回退主动方；被动网关控制不可达则继续暂停并重试。已受理请求，包括 SSE 和等待模型发现/连接池的请求，保持原快照直到结束。
 
+普通请求审计仅记录请求 ID、后端、模型、耗时、状态和路由/任务等元数据，不再记录用户消息前缀（`question_prefix`）。
+
 ## 启动
 
-只需 Go 标准库，没有第三方依赖。构建与测试始终显式使用 vendor 模式。以下命令是后续执行说明，当前改造尚未完成测试验收。
+只需 Go 标准库，没有第三方依赖。构建与测试始终显式使用 vendor 模式。
 
 ```sh
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate .
@@ -33,7 +35,7 @@ export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
 
 OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应使用既有事件流转发及响应头规则，模板适配器仍执行响应转换。
 
-配置 `public_model_name` 后，非流式 2xx JSON 仅在 choices 非空且每个候选均有 assistant message 时改写顶层 `model`；不限制 message 的正文形式，也不要求 finish_reason 才能改写。顶层存在 `error`（包括 null）或无法识别为聊天响应时，正文逐字节保留，不因含有 `model` 就修改。非 2xx 错误正文始终透传。别名识别与下述完成状态观测相互独立。
+OpenAI 普通响应和 SSE 正文不改写模型名称，也不补写缺失的 `model` 字段。旧配置及历史运行快照中的 `public_model_name` 在读取时忽略；平台不再接受包含该字段的新运行配置，历史记录无需改写。
 
 非流式 OpenAI 2xx 响应增加旁路观测，不改变返回状态、正文或接流状态，也不重试、切换 Router。启用 `profile.enabled` 后，由现有观测监听器的鉴权 `/metrics` 提供：
 
@@ -63,3 +65,7 @@ sum by (backend, model) (
 ### 流停顿方向
 
 新增 `aigate_stream_backend_wait_max_seconds`（当前读取中的流，自上次有效输出后累计 Read 等待）及 `aigate_stream_write_active_max_seconds`（当前一轮 Write + Flush 持续时间）。两者单位秒，按 backend 输出，`request_scope="streaming"`。首次输出前从首次读取响应体计时，写出耗时不计入后端等待；心跳/usage 不重置，完成或观察未知的流退出后端等待统计，最终写出仍计时。没有符合条件的请求输出零；旧指标保持原义。指标只区分供数与输出方向，不直接判定模型故障或客户端不读。
+
+### 流异常诊断
+
+启用画像时，记录单次**输出中途读取等待超过 60 秒**或**客户端 Write + Flush 超过 60 秒**的异常；阻塞期间即可查询。仅保存最后一条用户文本的前 10 个和后 10 个字符，在平台独立“异常诊断”页面按关键词和触发时间搜索。默认保留 72 小时 / 256 MiB；原有超过 300 秒的慢请求捕获保持不变。接口、计时口径和存储说明见 [流异常诊断](docs/STREAM_INCIDENTS.md)。

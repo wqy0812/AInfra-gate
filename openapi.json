@@ -17,7 +17,7 @@
     },
     "/v1/models": {
       "get": {
-        "summary": "Discover the active backend model, using public_model_name when configured",
+        "summary": "Discover the active backend model with its actual ID",
         "security": [
           {
             "bearerAuth": []
@@ -26,7 +26,7 @@
         ],
         "responses": {
           "200": {
-            "description": "One active model; public_model_name changes its ID but successful downstream discovery is still required"
+            "description": "One active model with its discovered backend ID; successful downstream discovery is required"
           },
           "default": {
             "$ref": "#/components/responses/Error"
@@ -55,7 +55,7 @@
         },
         "responses": {
           "200": {
-            "description": "Chat completion or SSE stream; public_model_name rewrites the top-level model. Stream errors are sent as error data events. With public naming enabled, malformed or oversized (1 MiB) SSE events terminate with invalid_upstream_stream.",
+            "description": "OpenAI chat completion or SSE stream preserves the backend body and model field, including a missing model field. Transport failures are sent as error data events; observation does not rewrite upstream events.",
             "headers": {
               "X-Request-ID": {
                 "schema": {
@@ -103,7 +103,7 @@
           "model": {
             "type": "string",
             "nullable": true,
-            "description": "Ignored on input; downstream uses the discovered model. Responses use public_model_name when configured."
+            "description": "Ignored on input; downstream uses the discovered model. OpenAI responses preserve the backend model field without adding or replacing it."
           },
           "messages": {
             "type": "array",

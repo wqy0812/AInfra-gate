@@ -31,6 +31,7 @@ type Gateway struct {
 	profile    *requestProfiler
 	slow       *slowRequestStore
 	now        func() time.Time
+	incidents  *incidentStore // owned by ControlledGateway, shared across route snapshots
 }
 
 func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
@@ -102,18 +103,18 @@ func (g *Gateway) Close() {
 }
 
 type auditEntry struct {
-	slowInput      []byte
-	profile        *profileRequest
-	generation     *generationResult
-	RequestID      string  `json:"request_id"`
-	QuestionPrefix string  `json:"question_prefix"`
-	TestTask       string  `json:"test_task,omitempty"`
-	RouteVersion   uint64  `json:"route_version,omitempty"`
-	Status         int     `json:"status"`
-	Outcome        string  `json:"outcome"`
-	Backend        *string `json:"backend"`
-	Model          *string `json:"model"`
-	DurationMS     float64 `json:"duration_ms"`
+	started      time.Time
+	slowInput    []byte
+	profile      *profileRequest
+	generation   *generationResult
+	RequestID    string  `json:"request_id"`
+	TestTask     string  `json:"test_task,omitempty"`
+	RouteVersion uint64  `json:"route_version,omitempty"`
+	Status       int     `json:"status"`
+	Outcome      string  `json:"outcome"`
+	Backend      *string `json:"backend"`
+	Model        *string `json:"model"`
+	DurationMS   float64 `json:"duration_ms"`
 }
 
 func sendJSON(w http.ResponseWriter, entry *auditEntry, status int, data []byte) {
@@ -149,6 +150,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	entry := &auditEntry{RequestID: hex.EncodeToString(id[:]), Status: 500, Outcome: "incomplete"}
 	w.Header().Set("X-Request-ID", entry.RequestID)
 	started := g.now()
+	entry.started = started
 	if r.URL.Path == "/v1/chat/completions" {
 		defer func() {
 			ended := g.now()
@@ -211,7 +213,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		models := make([]any, 0, len(ids))
 		for _, id := range ids {
-			models = append(models, map[string]any{"id": g.config.publicModel(id), "object": "model", "created": 0, "owned_by": "aigate"})
+			models = append(models, map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "aigate"})
 		}
 		sendJSON(w, entry, 200, encodeJSON(map[string]any{"object": "list", "data": models}))
 		return
@@ -225,17 +227,6 @@ func upstreamError(err error, ctx context.Context) *GatewayError {
 		return fault(504, "upstream_timeout", "下游请求超时")
 	}
 	return fault(502, "upstream_unavailable", "无法连接下游服务")
-}
-
-func questionPrefix(question string) string {
-	count := 0
-	for index := range question {
-		if count == 10 {
-			return question[:index]
-		}
-		count++
-	}
-	return question
 }
 
 const requestBodyTimeout = 5 * time.Minute
@@ -280,7 +271,10 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		sendError(w, entry, err)
 		return
 	}
-	entry.QuestionPrefix = questionPrefix(body.question)
+	if body.stream && g.incidents != nil {
+		head, tail, length := questionEdges(body.question)
+		r = r.WithContext(context.WithValue(r.Context(), incidentQuestionKey{}, incidentQuestion{head, tail, length}))
+	}
 	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok {
 		entry.RouteVersion, entry.TestTask = meta.revision, meta.task
 		if body.stream {
@@ -404,13 +398,8 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	result := data
 	if backend.Adapter == "openai" {
 		state.observeNonstream(data, response.Header)
-		// The OpenAI backend owns its response format. Only the configured public
-		// model alias may change its body; an unrecognized body passes through.
-		if g.config.PublicModelName != "" {
-			result = rewriteChatResponseModel(data, g.config.PublicModelName)
-		}
 	} else {
-		result, err = normalizeResponse(data, backend, g.config.publicModel(model), entry.RequestID)
+		result, err = normalizeResponse(data, backend, model, entry.RequestID)
 		if err != nil {
 			state.fail("protocol_error")
 			outcome = "backend_failure"
@@ -503,7 +492,30 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	return response, nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) string {
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) (outcome string) {
+	var diagnostic *incidentRequest
+	if g.incidents != nil {
+		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC()}
+		if entry.Backend != nil {
+			base.Router = *entry.Backend
+		}
+		if entry.Model != nil {
+			base.Model = *entry.Model
+		}
+		if question, ok := r.Context().Value(incidentQuestionKey{}).(incidentQuestion); ok {
+			base.QuestionHead, base.QuestionTail, base.QuestionLength = question.head, question.tail, question.length
+		}
+		diagnostic = g.incidents.begin(base)
+		defer func() {
+			reason := outcome
+			if r.Context().Err() != nil {
+				reason = "client_cancelled"
+			} else if ctx.Err() != nil {
+				reason = "timeout"
+			}
+			diagnostic.finish(time.Now(), reason)
+		}()
+	}
 	controller := http.NewResponseController(w)
 	deadline, _ := ctx.Deadline()
 	_ = controller.SetWriteDeadline(deadline)
@@ -512,9 +524,12 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	entry.profile.liveWriteStart()
+	diagnostic.startWrite(time.Now(), 0)
 	w.WriteHeader(200)
 	entry.Status = 200
+	diagnostic.startFlush(time.Now(), 0)
 	flushErr := controller.Flush()
+	diagnostic.endWrite(time.Now(), flushErr)
 	entry.profile.liveIOEnd()
 	if flushErr != nil {
 		entry.generation.writeFailure(ctx, r.Context())
@@ -546,19 +561,22 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			}
 		}()
 	}
-	var rewrite *sseModelWriter
-	if g.config.PublicModelName != "" {
-		rewrite = &sseModelWriter{model: g.config.PublicModelName}
-	}
 	writeFailed := false
 	emit := func(data []byte) error {
 		entry.profile.liveWriteStart()
 		defer entry.profile.liveIOEnd()
-		if _, err := w.Write(data); err != nil {
+		diagnostic.startWrite(time.Now(), len(data))
+		n, err := w.Write(data)
+		diagnostic.wrote(n)
+		if err != nil {
+			diagnostic.endWrite(time.Now(), err)
 			writeFailed = true
 			return err
 		}
-		if err := controller.Flush(); err != nil {
+		diagnostic.startFlush(time.Now(), n)
+		err = controller.Flush()
+		diagnostic.endWrite(time.Now(), err)
+		if err != nil {
 			writeFailed = true
 			return err
 		}
@@ -566,19 +584,17 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	}
 	for {
 		entry.profile.liveStreamRead(observer)
+		diagnostic.startRead(time.Now())
 		n, readErr := response.Body.Read(*buffer)
+		diagnostic.readReturned(time.Now(), n)
 		entry.profile.liveIOEnd()
 		if n > 0 {
 			data := (*buffer)[:n]
 			observer.Feed(data)
+			diagnostic.observe(time.Now(), observer)
 			entry.profile.liveObserve(observer)
 			entry.generation.observeStream(observer, false)
-			var err error
-			if rewrite != nil {
-				err = rewrite.feed(data, emit)
-			} else {
-				err = emit(data)
-			}
+			err := emit(data)
 			if writeFailed {
 				entry.generation.writeFailure(ctx, r.Context())
 				return "client_failure"
@@ -589,11 +605,6 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		if readErr == io.EOF && r.Context().Err() == nil {
 			entry.generation.observeStream(observer, true)
-		}
-		if readErr == io.EOF && rewrite != nil {
-			if err := rewrite.finish(); err != nil {
-				readErr = err
-			}
 		}
 		if readErr == nil {
 			continue
@@ -613,19 +624,8 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			entry.Outcome = "completed"
 			return "success"
 		}
-		if errors.Is(readErr, errSSEModel) {
-			if observer.Unknown {
-				entry.generation.result = "unknown"
-			} else {
-				entry.generation.fail("protocol_error")
-			}
-		} else {
-			entry.generation.transportError(readErr, ctx, r.Context(), "response_read_error")
-		}
+		entry.generation.transportError(readErr, ctx, r.Context(), "response_read_error")
 		code := "upstream_stream_error"
-		if errors.Is(readErr, errSSEModel) {
-			code = "invalid_upstream_stream"
-		}
 		if upstreamError(readErr, ctx).Code == "upstream_timeout" {
 			code = "upstream_timeout"
 		}

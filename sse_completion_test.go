@@ -87,12 +87,12 @@ func TestSSECompletionBoundaries(t *testing.T) {
 func TestSSECompletionGatewayModes(t *testing.T) {
 	for _, profiled := range []bool{false, true} {
 		for _, managed := range []bool{false, true} {
-			for _, aliased := range []bool{false, true} {
-				t.Run(fmt.Sprintf("profile=%t/managed=%t/alias=%t", profiled, managed, aliased), func(t *testing.T) {
+			for _, legacyAlias := range []bool{false, true} {
+				t.Run(fmt.Sprintf("profile=%t/managed=%t/legacyAlias=%t", profiled, managed, legacyAlias), func(t *testing.T) {
 					t.Setenv("AIGATE_PROFILE_KEY", "fixture-key")
 					c := fixtureConfig(t, "http://backend.invalid")
-					if aliased {
-						c.PublicModelName = "public-model"
+					if legacyAlias {
+						c = withLegacyModelAlias(t, c)
 					}
 					if profiled {
 						c.Profile.Enabled = true
@@ -134,11 +134,8 @@ func TestSSECompletionGatewayModes(t *testing.T) {
 						if w.Code != 200 {
 							t.Fatalf("status=%d", w.Code)
 						}
-						if !aliased && w.Body.String() != data {
+						if w.Body.String() != data {
 							t.Fatal("forwarding changed")
-						}
-						if aliased && !strings.Contains(w.Body.String(), `"model":"public-model"`) {
-							t.Fatal("lost public model")
 						}
 						if !strings.Contains(logs.String(), `"outcome":"`+outcome+`"`) {
 							t.Fatalf("wrong audit: %s", logs.String())

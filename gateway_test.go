@@ -158,10 +158,10 @@ func TestForwardFieldsAuthAndPrivateAudit(t *testing.T) {
 	if json.Unmarshal([]byte(strings.TrimSpace(logs.String())), &entry) != nil {
 		t.Fatal("invalid audit")
 	}
-	if entry.QuestionPrefix != "一二三四五六七八九十" || entry.RequestID != response.Header.Get("X-Request-ID") || entry.Outcome != "completed" {
+	if entry.RequestID != response.Header.Get("X-Request-ID") || entry.Outcome != "completed" {
 		t.Fatal("incorrect audit")
 	}
-	for _, word := range []string{"秘密尾部", "private", "secret"} {
+	for _, word := range []string{"question_prefix", "一二三四五六七八九十", "秘密尾部", "private", "secret"} {
 		if strings.Contains(logs.String(), word) {
 			t.Fatal("audit exposed private contents")
 		}
@@ -193,9 +193,11 @@ func TestValidationAndAuthentication(t *testing.T) {
 		t.Fatal("invalid requests reached upstream")
 	}
 	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-		var e auditEntry
-		_ = json.Unmarshal([]byte(line), &e)
-		if e.QuestionPrefix != "" {
+		var e map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatal("invalid audit")
+		}
+		if _, exists := e["question_prefix"]; exists || strings.Contains(line, "private") {
 			t.Fatal("rejected input logged")
 		}
 	}

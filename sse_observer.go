@@ -247,3 +247,7 @@ func (o *sseObserver) errorMessage() string {
 	}
 	return ""
 }
+
+func isDataLine(line []byte) bool {
+	return bytes.Equal(line, []byte("data")) || bytes.HasPrefix(line, []byte("data:"))
+}

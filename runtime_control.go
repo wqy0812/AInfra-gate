@@ -74,6 +74,7 @@ type runtimeTest struct {
 	hash            string
 }
 type ControlledGateway struct {
+	incidents          *incidentStore
 	mu                 sync.Mutex
 	id, boot, key      string
 	cidrs              []netip.Prefix
@@ -170,6 +171,7 @@ func (c *ControlledGateway) Close() {
 	c.cancel()
 	c.mu.Unlock()
 	c.wg.Wait()
+	c.incidents.close()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.active = nil
@@ -319,7 +321,23 @@ func (c *ControlledGateway) ProfileHandler() http.Handler {
 		g.refs++
 		c.mu.Unlock()
 		defer func() { c.mu.Lock(); defer c.mu.Unlock(); g.refs--; c.cleanupLocked() }()
+		if r.URL.Path == "/profile/v1/stream-incidents" {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) != 1 {
+				runtimeError(w, 401, "unauthorized")
+				return
+			}
+			if g.g.incidents == nil {
+				runtimeError(w, 503, "incident_storage_unavailable")
+				return
+			}
+			g.g.incidents.serveHTTP(w, r)
+			return
+		}
 		g.g.profile.handler().ServeHTTP(w, r)
+		if r.URL.Path == "/metrics" && r.Method == http.MethodGet && g.g.incidents != nil &&
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) == 1 {
+			fmt.Fprintf(w, "aigate_stream_incident_dropped_total %d\naigate_stream_incident_write_errors_total %d\n", g.g.incidents.dropped.Load(), g.g.incidents.failures.Load())
+		}
 	})
 }
 
@@ -345,7 +363,10 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
 	if decodeJSON(s.Settings, &settings) != nil || settings == nil {
 		return fmt.Errorf("invalid_settings")
 	}
-	allowedSettings := map[string]bool{"timeout_seconds": true, "discovery_timeout_seconds": true, "model_cache_seconds": true, "discovery_retry_seconds": true, "public_model_name": true, "http_pool": true, "profile": true, "slow_requests": true}
+	// Historical snapshots may contain the retired alias. Ignore it on load.
+	delete(settings, "public_model_name")
+	s.Settings = encodeJSON(settings)
+	allowedSettings := map[string]bool{"timeout_seconds": true, "discovery_timeout_seconds": true, "model_cache_seconds": true, "discovery_retry_seconds": true, "http_pool": true, "profile": true, "slow_requests": true}
 	for key := range settings {
 		if !allowedSettings[key] {
 			return fmt.Errorf("unknown_setting")
@@ -413,6 +434,16 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
 	}
 	if sharedSlow != nil {
 		g.slow = sharedSlow
+	}
+	if profileEnabled {
+		if c.incidents == nil {
+			var incidentErr error
+			c.incidents, incidentErr = newIncidentStore(filepath.Join(c.dataRoot, "stream-incidents"), c.id, c.boot, c.audit)
+			if incidentErr != nil {
+				fmt.Fprintln(c.audit, `{"event":"stream_incident_storage_unavailable"}`)
+			}
+		}
+		g.incidents = c.incidents
 	}
 	if s.APIKey != "" {
 		g.apiKey = "Bearer " + s.APIKey

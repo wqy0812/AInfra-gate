@@ -124,7 +124,7 @@ func TestV2SSEOldSnapshotSurvivesSwap(t *testing.T) {
 	activateV2(t, c, "swap", snapshotV2("r2", two.server.URL, 2))
 	w := httptest.NewRecorder()
 	c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(basicBody)))
-	if w.Code != 200 || w.Header().Get("X-Aigate-Backend") != "r2" || !strings.Contains(w.Body.String(), `"model":"public"`) {
+	if w.Code != 200 || w.Header().Get("X-Aigate-Backend") != "r2" || strings.Contains(w.Body.String(), `"model":`) {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	c.mu.Lock()
@@ -208,5 +208,44 @@ func TestV2TestReleaseTombstone(t *testing.T) {
 	status, result := controlRequestV2(t, c, RuntimeCommand{ProtocolVersion: 2, OperationID: "test", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: seq, ExpectedRevision: 1, Action: "test-acquire", Payload: encodeJSON(map[string]any{"task_id": "task", "token": token, "model": "m", "router_id": "r1", "binding_revision": 1})})
 	if status != 200 || result.Error != "test_already_released" {
 		t.Fatal(status, result)
+	}
+}
+
+func TestV2HistoricalAliasCannotChangeBackendResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, contentType, body string
+		status                  int
+		stream                  bool
+	}{
+		{"json", "application/json", `{ "model":"后端/Real-Model", "choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}] }`, 200, false},
+		{"missing", "application/json", `{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`, 200, false},
+		{"error", "application/json", `{ "error":"unavailable", "model":"backend-error" }`, 503, false},
+		{"stream", "text/event-stream", "data: {\"model\":\"backend-stream\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"total_tokens\":8}}\n\ndata: [DONE]\n\n", 200, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := upstreamServer(t, "discovered-model", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			})
+			c := controlledFixture(t)
+			s := snapshotV2("r1", u.URL, 1) // Contains a historical public_model_name.
+			original := string(s.Settings)
+			activateV2(t, c, "restore", s)
+			if string(s.Settings) != original || strings.Contains(string(c.active.snapshot.Settings), "public_model_name") {
+				t.Fatal("legacy alias must be ignored without mutating the source snapshot")
+			}
+			w := httptest.NewRecorder()
+			c.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil))
+			if w.Code != 200 || !strings.Contains(w.Body.String(), `"id":"discovered-model"`) {
+				t.Fatalf("model discovery changed: %s", w.Body.String())
+			}
+			w = httptest.NewRecorder()
+			body := encodeJSON(map[string]any{"messages": []any{map[string]string{"role": "user", "content": "hello"}}, "stream": tc.stream})
+			c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
+			if w.Code != tc.status || w.Body.String() != tc.body {
+				t.Fatalf("backend response changed: %d %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
