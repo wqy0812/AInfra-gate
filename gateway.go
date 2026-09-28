@@ -103,18 +103,24 @@ func (g *Gateway) Close() {
 }
 
 type auditEntry struct {
-	started      time.Time
-	slowInput    []byte
-	profile      *profileRequest
-	generation   *generationResult
-	RequestID    string  `json:"request_id"`
-	TestTask     string  `json:"test_task,omitempty"`
-	RouteVersion uint64  `json:"route_version,omitempty"`
-	Status       int     `json:"status"`
-	Outcome      string  `json:"outcome"`
-	Backend      *string `json:"backend"`
-	Model        *string `json:"model"`
-	DurationMS   float64 `json:"duration_ms"`
+	started          time.Time
+	slowInput        []byte
+	profile          *profileRequest
+	generation       *generationResult
+	RequestID        string             `json:"request_id"`
+	TestTask         string             `json:"test_task,omitempty"`
+	RouteVersion     uint64             `json:"route_version,omitempty"`
+	Status           int                `json:"status"`
+	Outcome          string             `json:"outcome"`
+	Backend          *string            `json:"backend"`
+	Model            *string            `json:"model"`
+	DurationMS       float64            `json:"duration_ms"`
+	ClientRequestID  string             `json:"client_request_id,omitempty"`
+	Connection       *connectionSummary `json:"connection,omitempty"`
+	Transport        *transportSnapshot `json:"transport,omitempty"`
+	GenerationResult string             `json:"generation_result,omitempty"`
+	ErrorClass       string             `json:"error_class,omitempty"`
+	diagnostic       *requestTransport
 }
 
 func sendJSON(w http.ResponseWriter, entry *auditEntry, status int, data []byte) {
@@ -125,7 +131,10 @@ func sendJSON(w http.ResponseWriter, entry *auditEntry, status int, data []byte)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	entry.Status = status
-	if _, err := w.Write(data); err == nil {
+	n, writeErr := w.Write(data)
+	entry.diagnostic.bytes(false, n)
+	entry.diagnostic.failure("client_response_write", writeErr, nil, nil)
+	if writeErr == nil {
 		entry.Outcome = "completed"
 		if status >= 400 {
 			entry.Outcome = "rejected"
@@ -152,9 +161,24 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := g.now()
 	entry.started = started
 	if r.URL.Path == "/v1/chat/completions" {
+		entry.ClientRequestID = diagnosticClientID(r.Header.Get("X-Request-ID"))
+		if conn, ok := r.Context().Value(connectionContextKey{}).(connectionSummary); ok {
+			entry.Connection = &conn
+		}
+		entry.diagnostic = newRequestTransport()
+		r = r.WithContext(context.WithValue(r.Context(), requestTransportKey{}, entry.diagnostic))
+		entry.diagnostic.stage("handler_entered")
 		defer func() {
 			ended := g.now()
 			entry.DurationMS = float64(ended.Sub(started).Microseconds()) / 1000
+			if entry.generation != nil {
+				entry.GenerationResult, entry.ErrorClass = entry.generation.result, entry.generation.errorClass
+			}
+			if entry.Outcome != "completed" || entry.Status >= 400 || entry.ErrorClass != "" || entry.GenerationResult == "client_cancelled" || entry.GenerationResult == "client_disconnected" || r.Context().Err() != nil {
+				entry.diagnostic.stage("handler_finished")
+				entry.Transport = entry.diagnostic.snapshot()
+				entry.Transport.ClientContext = contextStatus(r.Context())
+			}
 			g.audit.Print(string(encodeJSON(entry)))
 			if g.slow != nil {
 				g.slow.capture(entry, started, ended, r.Context().Err() != nil)
@@ -246,6 +270,7 @@ func readChatBody(w http.ResponseWriter, r *http.Request, timeout time.Duration)
 	if err == nil {
 		return data, nil
 	}
+	transportFrom(r.Context()).failure("client_request_body_read", err, nil, r.Context())
 	// Do not let net/http drain an unfinished upload while writing the error.
 	w.Header().Set("Connection", "close")
 	var limitErr *http.MaxBytesError
@@ -261,6 +286,7 @@ func readChatBody(w http.ResponseWriter, r *http.Request, timeout time.Duration)
 
 func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry) {
 	arrived := time.Now()
+	entry.diagnostic.stage("request_body_read")
 	data, bodyErr := readChatBody(w, r, requestBodyTimeout)
 	if bodyErr != nil {
 		sendError(w, entry, bodyErr)
@@ -271,6 +297,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		sendError(w, entry, err)
 		return
 	}
+	entry.diagnostic.stage("request_body_ready")
 	if body.stream && g.incidents != nil {
 		head, tail, length := questionEdges(body.question)
 		r = r.WithContext(context.WithValue(r.Context(), incidentQuestionKey{}, incidentQuestion{head, tail, length}))
@@ -292,6 +319,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
 	}
 	var name, model string
+	entry.diagnostic.stage("routing_discovery")
 	var backend *Backend
 	outcome := "ignored"
 	if g.management != nil {
@@ -333,6 +361,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	entry.Backend, entry.Model = &name, &model
+	entry.diagnostic.stage("routing_ready")
 	w.Header().Set("X-Aigate-Model", model)
 	entry.profile.liveStage("preparing_upstream")
 	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
@@ -347,6 +376,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), seconds(g.config.TimeoutSeconds))
 	defer cancel()
+	defer func() { entry.diagnostic.contexts(ctx, r.Context()) }()
 	entry.generation = &generationResult{stream: body.stream}
 	state := entry.generation
 	if body.stream {
@@ -388,7 +418,9 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	entry.profile.liveStage("reading_response")
 	data, readErr := io.ReadAll(response.Body)
+	entry.diagnostic.bytes(true, len(data))
 	if readErr != nil {
+		entry.diagnostic.failure("upstream_body_read", readErr, ctx, r.Context())
 		state.transportError(readErr, ctx, r.Context(), "response_read_error")
 		outcome = "backend_failure"
 		sendError(w, entry, upstreamError(readErr, ctx))
@@ -422,7 +454,10 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		copyRepresentationHeaders(w.Header(), response.Header)
 		w.WriteHeader(response.StatusCode)
 		entry.Status = response.StatusCode
-		if _, err := w.Write(result); err == nil {
+		n, writeErr := w.Write(result)
+		entry.diagnostic.bytes(false, n)
+		entry.diagnostic.failure("client_response_write", writeErr, ctx, r.Context())
+		if writeErr == nil {
 			entry.Outcome = "completed"
 		}
 	} else {
@@ -437,6 +472,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 }
 
 func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend, model string) (*http.Response, *GatewayError) {
+	diagnostic := transportFrom(ctx)
 	profileFrom(ctx).liveStage("preparing_upstream")
 	payload, err := makePayload(body, backend, model)
 	if err != nil {
@@ -448,7 +484,7 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	if pr, ok := ctx.Value(profileContextKey{}).(*profileRequest); ok && g.profile != nil {
 		g.profile.input(pr, payload, backend, pr.e.Backend, model)
 	}
-	req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, backend.URL, bytes.NewReader(payload))
+	req, requestErr := http.NewRequestWithContext(diagnostic.trace(ctx), http.MethodPost, backend.URL, bytes.NewReader(payload))
 	if requestErr != nil {
 		return nil, upstreamError(requestErr, ctx)
 	}
@@ -465,8 +501,11 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 	profileFrom(ctx).liveStage("waiting_upstream_headers")
 	response, requestErr := g.client.Do(req)
 	if requestErr != nil {
+		diagnostic.failure("upstream_round_trip", requestErr, ctx, nil)
 		return nil, upstreamError(requestErr, ctx)
 	}
+	diagnostic.stage("response_headers_received")
+	diagnostic.status(response.StatusCode)
 	if state != nil {
 		state.status = response.StatusCode
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -493,6 +532,7 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 }
 
 func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) (outcome string) {
+	entry.diagnostic.stage("stream_started")
 	var diagnostic *incidentRequest
 	if g.incidents != nil {
 		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC()}
@@ -529,6 +569,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	entry.Status = 200
 	diagnostic.startFlush(time.Now(), 0)
 	flushErr := controller.Flush()
+	entry.diagnostic.failure("client_headers_flush", flushErr, ctx, r.Context())
 	diagnostic.endWrite(time.Now(), flushErr)
 	entry.profile.liveIOEnd()
 	if flushErr != nil {
@@ -567,6 +608,8 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		defer entry.profile.liveIOEnd()
 		diagnostic.startWrite(time.Now(), len(data))
 		n, err := w.Write(data)
+		entry.diagnostic.bytes(false, n)
+		entry.diagnostic.failure("client_body_write", err, ctx, r.Context())
 		diagnostic.wrote(n)
 		if err != nil {
 			diagnostic.endWrite(time.Now(), err)
@@ -575,6 +618,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		diagnostic.startFlush(time.Now(), n)
 		err = controller.Flush()
+		entry.diagnostic.failure("client_body_flush", err, ctx, r.Context())
 		diagnostic.endWrite(time.Now(), err)
 		if err != nil {
 			writeFailed = true
@@ -586,6 +630,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		entry.profile.liveStreamRead(observer)
 		diagnostic.startRead(time.Now())
 		n, readErr := response.Body.Read(*buffer)
+		entry.diagnostic.bytes(true, n)
+		if readErr != nil && readErr != io.EOF {
+			entry.diagnostic.failure("upstream_body_read", readErr, ctx, r.Context())
+		}
 		diagnostic.readReturned(time.Now(), n)
 		entry.profile.liveIOEnd()
 		if n > 0 {
@@ -614,6 +662,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		if readErr == io.EOF {
 			if observer != nil && !observer.valid() {
+				entry.diagnostic.failure("upstream_incomplete_eof", readErr, ctx, r.Context())
 				entry.Outcome = "upstream_protocol_error"
 				if observer.completionClass() == "unknown" {
 					entry.Outcome = "protocol_unknown"
@@ -634,8 +683,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		// Permit a bounded final error write after the generation deadline expires.
 		_ = controller.SetWriteDeadline(time.Now().Add(time.Second))
 		entry.profile.liveWriteStart()
-		_, _ = fmt.Fprintf(w, "\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID))
-		_ = controller.Flush()
+		n, finalErr := fmt.Fprintf(w, "\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID))
+		entry.diagnostic.bytes(false, n)
+		entry.diagnostic.failure("client_error_write", finalErr, ctx, r.Context())
+		entry.diagnostic.failure("client_error_flush", controller.Flush(), ctx, r.Context())
 		entry.profile.liveIOEnd()
 		return "backend_failure"
 	}

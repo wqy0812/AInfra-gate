@@ -79,6 +79,7 @@ type ControlledGateway struct {
 	id, boot, key      string
 	cidrs              []netip.Prefix
 	audit              io.Writer
+	connections        *connectionDiagnostics
 	active, candidate  *runtimeGeneration
 	generations        []*runtimeGeneration
 	admission, retired bool
@@ -117,6 +118,7 @@ func newControlledGateway(id, key string, cidrs []string, audit io.Writer) (*Con
 		c.cidrs = append(c.cidrs, p)
 	}
 	c.retentionStop = make(chan struct{})
+	c.connections = newConnectionDiagnostics(audit, c.boot)
 	c.retentionWake = make(chan struct{}, 1)
 	c.wg.Add(1)
 	go c.retainObservations()
@@ -164,6 +166,7 @@ func (c *ControlledGateway) closeGenerationLocked(g *runtimeGeneration) {
 	}
 }
 func (c *ControlledGateway) Close() {
+	defer c.connections.close()
 	c.retentionOnce.Do(func() { close(c.retentionStop) })
 	c.mu.Lock()
 	c.admission = false
@@ -203,7 +206,7 @@ func (c *ControlledGateway) statusLocked() map[string]any {
 	if c.candidate != nil {
 		candidate = map[string]any{"operation_id": c.candidate.owner, "binding_revision": c.candidate.snapshot.BindingRevision, "router_id": c.candidate.snapshot.RouterID}
 	}
-	return map[string]any{"protocol_version": 2, "gateway_id": c.id, "boot_id": c.boot, "admission": c.admission, "retired": c.retired, "binding_revision": c.revisionLocked(), "last_command_seq": c.sequence, "current": current, "candidate": candidate, "counts": counts, "test_occupancy": c.test, "quiesce_owner": c.quiesceOwner}
+	return map[string]any{"protocol_version": 2, "gateway_id": c.id, "boot_id": c.boot, "admission": c.admission, "retired": c.retired, "binding_revision": c.revisionLocked(), "last_command_seq": c.sequence, "current": current, "candidate": candidate, "counts": counts, "test_occupancy": c.test, "quiesce_owner": c.quiesceOwner, "business_read_header_timeout_seconds": businessReadHeaderTimeout.Seconds()}
 }
 func runtimeResponse(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -334,6 +337,10 @@ func (c *ControlledGateway) ProfileHandler() http.Handler {
 			return
 		}
 		g.g.profile.handler().ServeHTTP(w, r)
+		if r.URL.Path == "/metrics" && r.Method == http.MethodGet && c.connections != nil &&
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) == 1 {
+			fmt.Fprintf(w, "aigate_connection_diagnostic_dropped_total %d\naigate_connection_diagnostic_write_errors_total %d\n", c.connections.dropped.Load(), c.connections.writeErrors.Load())
+		}
 		if r.URL.Path == "/metrics" && r.Method == http.MethodGet && g.g.incidents != nil &&
 			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) == 1 {
 			fmt.Fprintf(w, "aigate_stream_incident_dropped_total %d\naigate_stream_incident_write_errors_total %d\n", g.g.incidents.dropped.Load(), g.g.incidents.failures.Load())

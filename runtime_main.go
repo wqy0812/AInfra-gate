@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+const businessReadHeaderTimeout = 30 * time.Second
+
+func businessHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: businessReadHeaderTimeout}
+}
+
 func run(args []string, out, stderr io.Writer) error {
 	if len(args) > 0 && args[0] == "version" {
 		_, e := fmt.Fprintln(out, "aigate control/v2")
@@ -50,18 +56,21 @@ func run(args []string, out, stderr io.Writer) error {
 	}
 	defer c.Close()
 	c.dataRoot = *dataRoot
-	servers := []*http.Server{{Addr: *listen, Handler: c, ReadHeaderTimeout: 10 * time.Second}, {Addr: *control, Handler: c.ControlHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}}
+	servers := []*http.Server{businessHTTPServer(*listen, c), {Addr: *control, Handler: c.ControlHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}}
 	if *profile != "" {
 		servers = append(servers, &http.Server{Addr: *profile, Handler: c.ProfileHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second})
 	}
 	listeners := []net.Listener{}
-	for _, s := range servers {
+	for i, s := range servers {
 		l, e := net.Listen("tcp", s.Addr)
 		if e != nil {
 			for _, old := range listeners {
 				_ = old.Close()
 			}
 			return e
+		}
+		if i == 0 {
+			l = installConnectionDiagnostics(s, l, c.connections)
 		}
 		listeners = append(listeners, l)
 		defer s.Close()

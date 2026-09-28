@@ -190,7 +190,8 @@ func (g *Gateway) forwardGenerationError(w http.ResponseWriter, r *http.Request,
 	_ = controller.SetWriteDeadline(deadline)
 	defer controller.SetWriteDeadline(time.Time{})
 	w.WriteHeader(response.StatusCode)
-	if controller.Flush() != nil {
+	if err := controller.Flush(); err != nil {
+		entry.diagnostic.failure("client_headers_flush", err, ctx, r.Context())
 		s.writeFailure(ctx, r.Context())
 		return
 	}
@@ -199,13 +200,21 @@ func (g *Gateway) forwardGenerationError(w http.ResponseWriter, r *http.Request,
 	for {
 		entry.profile.liveStage("reading_response")
 		n, err := response.Body.Read(*buffer)
+		entry.diagnostic.bytes(true, n)
+		if err != nil && !errors.Is(err, io.EOF) {
+			entry.diagnostic.failure("upstream_error_body_read", err, ctx, r.Context())
+		}
 		if n > 0 {
 			entry.profile.liveStage("writing_client")
-			if _, writeErr := w.Write((*buffer)[:n]); writeErr != nil {
+			written, writeErr := w.Write((*buffer)[:n])
+			entry.diagnostic.bytes(false, written)
+			if writeErr != nil {
+				entry.diagnostic.failure("client_error_body_write", writeErr, ctx, r.Context())
 				s.writeFailure(ctx, r.Context())
 				return
 			}
-			if controller.Flush() != nil {
+			if err := controller.Flush(); err != nil {
+				entry.diagnostic.failure("client_error_body_flush", err, ctx, r.Context())
 				s.writeFailure(ctx, r.Context())
 				return
 			}
