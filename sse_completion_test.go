@@ -40,6 +40,16 @@ func TestSSECompletionBoundaries(t *testing.T) {
 		{"pending_data", `{}`, one + done + "data: {}\n", "stream_incomplete"},
 		{"pending_line", `{}`, one + done + "data: {}", "stream_incomplete"},
 		{"usage", `{}`, one + "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n" + done, ""},
+		{"comments_after_done", `{}`, one + done + ": heartbeat\r\n\r\n\n", ""},
+		{"done_before_output", `{}`, done + one, "protocol_error"},
+		{"duplicate_done", `{}`, one + done + done, "protocol_error"},
+		{"usage_after_done", `{}`, one + done + "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n", "protocol_error"},
+		{"output_after_done", `{}`, one + done + completionEvent(0, map[string]any{"content": "late"}, nil), "protocol_error"},
+		{"output_after_finish", `{}`, one + completionEvent(0, map[string]any{"content": "late"}, nil) + done, "protocol_error"},
+		{"duplicate_finish", `{}`, one + completionEvent(0, map[string]any{}, "stop") + done, "protocol_error"},
+		{"reasoning_after_finish", `{}`, one + completionEvent(0, map[string]any{"reasoning_content": "late"}, nil) + done, "protocol_error"},
+		{"refusal_after_finish", `{}`, one + completionEvent(0, map[string]any{"refusal": "late"}, nil) + done, "protocol_error"},
+		{"tools_after_finish", `{}`, one + completionEvent(0, map[string]any{"tool_calls": []any{map[string]any{"index": 0}}}, nil) + done, "protocol_error"},
 		{"missing_index", `{"n":2}`, empty + two + done, "protocol_error"},
 		{"negative_index", `{}`, completionEvent(-1, map[string]any{}, "stop") + done, "protocol_error"},
 		{"large_index", `{}`, completionEvent(1, map[string]any{}, "stop") + done, "protocol_error"},
@@ -81,6 +91,58 @@ func TestSSECompletionBoundaries(t *testing.T) {
 		if !probe.valid() || probe.validProbe() || probe.errorMessage() == "" {
 			t.Fatal("probe accepted empty/refusal output")
 		}
+	}
+}
+
+func TestSSETerminalOrderBusinessAndProbe(t *testing.T) {
+	const done = "data: [DONE]\n\n"
+	first := completionEvent(0, map[string]any{"content": "first"}, "stop")
+	for _, wire := range []string{done + first, first + done + first,
+		first + completionEvent(0, map[string]any{"content": "late"}, nil) + done, first + done + done} {
+		g := generationGateway(t, func(r *http.Request) (*http.Response, error) {
+			return generationResponse(200, "text/event-stream", wire), nil
+		})
+		response := generationRequest(g, true)
+		if response.Code != 200 || response.Body.String() != wire {
+			t.Fatal("terminal validation changed forwarded bytes")
+		}
+		requireGenerationCount(t, g.profile, true, "error", "protocol_error", "200", 1)
+		probe := newSSEObserver(true)
+		for i := range wire {
+			probe.Feed([]byte{wire[i]})
+		}
+		if probe.validProbe() || probe.errorMessage() == "" || strings.Contains(probe.Content, "late") {
+			t.Fatal("probe accepted terminal-order violation or retained late output")
+		}
+	}
+}
+
+func TestSSETerminalOrderWarmup(t *testing.T) {
+	c := fixtureConfig(t, "http://backend.invalid")
+	c.Management = ManagementConfig{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}
+	c.Management.defaults(c, "/tmp/config.json")
+	g, err := newGateway(c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	first := completionEvent(0, map[string]any{"content": "first"}, "stop")
+	const done = "data: [DONE]\n\n"
+	wire := ""
+	g.client.Transport = generationTransport(func(r *http.Request) (*http.Response, error) {
+		return generationResponse(200, "text/event-stream", wire), nil
+	})
+	payload := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "probe"}}, "stream": true}
+	for _, data := range []string{done + first, first + done + first,
+		first + completionEvent(0, map[string]any{"content": "late"}, nil) + done, first + done + done} {
+		wire = data
+		if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err == nil {
+			t.Fatal("warmup accepted terminal-order violation")
+		}
+	}
+	wire = first + "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n" + done + ": heartbeat\n\n"
+	if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err != nil {
+		t.Fatal(err)
 	}
 }
 

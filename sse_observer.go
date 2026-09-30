@@ -110,6 +110,10 @@ func (o *sseObserver) consumeLine() {
 }
 
 func (o *sseObserver) event(data []byte) {
+	if o.Done {
+		o.Invalid = true
+		return
+	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 		o.Done = true
 		return
@@ -168,8 +172,13 @@ func (o *sseObserver) event(data []byte) {
 			o.Unknown = true
 			return
 		}
-		o.finishedChoices[index] = o.finishedChoices[index] || (c.Finish != nil && *c.Finish != "")
 		useful := c.Delta.Content != "" || len(c.Delta.Tools) > 0 || c.Delta.Refusal != "" || c.Delta.Reasoning != "" || c.Delta.ReasoningText != ""
+		finished := c.Finish != nil && *c.Finish != ""
+		if o.finishedChoices[index] && (useful || finished) {
+			o.Invalid = true
+			continue
+		}
+		o.finishedChoices[index] = o.finishedChoices[index] || finished
 		if useful {
 			o.Useful = true
 			o.LastUsefulAt = time.Now()
