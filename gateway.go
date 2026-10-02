@@ -153,6 +153,7 @@ func sendError(w http.ResponseWriter, entry *auditEntry, err *GatewayError) {
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
+		abandonRequestBody(w, r)
 		http.Error(w, "request ID unavailable", 500)
 		return
 	}
@@ -186,10 +187,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 	if r.URL.Path == "/health" && r.Method == http.MethodGet {
+		abandonRequestBody(w, r)
 		sendJSON(w, entry, 200, []byte(`{"status":"ok"}`))
 		return
 	}
 	if r.URL.Path == "/openapi.json" && r.Method == http.MethodGet {
+		abandonRequestBody(w, r)
 		serveOpenAPI(w)
 		return
 	}
@@ -201,15 +204,18 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wantMethod = http.MethodPost
 	}
 	if wantMethod == "" {
+		abandonRequestBody(w, r)
 		sendError(w, entry, fault(404, "not_found", "接口不存在"))
 		return
 	}
 	if r.Method != wantMethod {
+		abandonRequestBody(w, r)
 		w.Header().Set("Allow", wantMethod)
 		sendError(w, entry, fault(405, "method_not_allowed", "请求方法不支持"))
 		return
 	}
 	if g.apiKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(g.apiKey)) != 1 {
+		abandonRequestBody(w, r)
 		sendError(w, entry, fault(401, "unauthorized", "网关凭据无效"))
 		return
 	}
@@ -231,6 +237,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			ids, err = g.pool.models(r.Context())
 		}
+		abandonRequestBody(w, r)
 		if err != nil {
 			sendError(w, entry, err)
 			return
@@ -259,20 +266,19 @@ const maxRequestBodyBytes int64 = 30_000_000
 func readChatBody(w http.ResponseWriter, r *http.Request, timeout time.Duration) ([]byte, *GatewayError) {
 	controller := http.NewResponseController(w)
 	_ = controller.SetReadDeadline(time.Now().Add(timeout))
-	defer controller.SetReadDeadline(time.Time{})
 	tooLarge := fault(http.StatusRequestEntityTooLarge, "request_body_too_large", "请求体不能超过 30 MB")
 	if r.ContentLength > maxRequestBodyBytes {
-		w.Header().Set("Connection", "close")
+		abandonRequestBody(w, r)
 		return nil, tooLarge
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	data, err := io.ReadAll(r.Body)
 	if err == nil {
+		_ = controller.SetReadDeadline(time.Time{})
 		return data, nil
 	}
 	transportFrom(r.Context()).failure("client_request_body_read", err, nil, r.Context())
-	// Do not let net/http drain an unfinished upload while writing the error.
-	w.Header().Set("Connection", "close")
+	abandonRequestBody(w, r)
 	var limitErr *http.MaxBytesError
 	if errors.As(err, &limitErr) {
 		return nil, tooLarge
@@ -527,6 +533,14 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 		response.Body.Close()
 		state.fail("protocol_error")
 		return nil, fault(502, "invalid_upstream_stream", "下游未返回 SSE 流")
+	}
+	if body.stream {
+		if err := decodeSSEBody(response); err != nil {
+			response.Body.Close()
+			diagnostic.failure("upstream_content_decode", err, ctx, nil)
+			state.fail("protocol_error")
+			return nil, err
+		}
 	}
 	return response, nil
 }

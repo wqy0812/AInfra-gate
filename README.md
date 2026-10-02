@@ -15,6 +15,8 @@
 
 `POST /v1/chat/completions` 请求体上传总时限为 5 分钟，大小上限为 30 MB（30,000,000 字节）。上传超时返回 HTTP 408，超限返回 HTTP 413；请求体读取完成后清除读取截止时间，后续生成与 SSE 使用原有生成超时。
 
+暂停准入、无效测试令牌等提前拒绝不等待客户端上传完正文。HTTP/1.x 返回响应后关闭该连接；HTTP/2 只关闭该请求的正文流，其他请求可继续复用连接。
+
 业务监听器读取 HTTP 请求头的时限为 **30 秒**。控制和观测监听器继续使用各自的 5 秒读头时限。请求头未读完即关闭的连接、生成请求的上游阶段和读写错误可通过[传输诊断](docs/TRANSPORT_DIAGNOSTICS.md)排查；不需要客户端改造。
 
 所有管理动作经过平台 API。网关仅开放鉴权的 `/control/v2/status`、`/control/v2/commands`、`/control/v2/commands/{seq}` 给 Engine。二进制不再支持 `check`、`switch`、`status`、`backends` 等管理 CLI、`--config`、路由文件或 Unix 管理 socket。
@@ -42,7 +44,7 @@ export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
 
 ## 业务响应与旁路观测
 
-OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应使用既有事件流转发及响应头规则，模板适配器仍执行响应转换。
+OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。模板适配器仍执行响应转换。
 
 OpenAI 普通响应和 SSE 正文不改写模型名称，也不补写缺失的 `model` 字段。旧配置及历史运行快照中的 `public_model_name` 在读取时忽略；平台不再接受包含该字段的新运行配置，历史记录无需改写。
 

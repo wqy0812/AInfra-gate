@@ -626,6 +626,9 @@ func (c *ControlledGateway) testCommandLocked(cmd RuntimeCommand, result *Runtim
 }
 
 func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/v1/models" {
+		abandonRequestBody(w, r)
+	}
 	if r.URL.Path == "/health" {
 		runtimeResponse(w, 200, map[string]string{"status": "ok"})
 		return
@@ -642,6 +645,7 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g := c.active
 	if g == nil || !c.admission || c.retired {
 		c.mu.Unlock()
+		abandonRequestBody(w, r)
 		w.Header().Set("Retry-After", "1")
 		runtimeError(w, 503, "gateway_not_accepting")
 		return
@@ -652,6 +656,7 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		lease = c.test
 		if lease == nil || lease.Releasing || subtle.ConstantTimeCompare([]byte(lease.hash), []byte(testHash(token))) != 1 {
 			c.mu.Unlock()
+			abandonRequestBody(w, r)
 			runtimeError(w, 409, "test_target_changed")
 			return
 		}

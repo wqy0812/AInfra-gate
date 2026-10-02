@@ -61,7 +61,8 @@ func TestRequestBodyDeadlineHTTP(t *testing.T) {
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(3 * time.Second))
 		fmt.Fprint(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{")
-		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -69,6 +70,9 @@ func TestRequestBodyDeadlineHTTP(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 		if err != nil || resp.StatusCode != 408 || !strings.Contains(string(body), "request_body_timeout") {
 			t.Fatalf("status=%d body=%s err=%v", resp.StatusCode, body, err)
+		}
+		if _, err := reader.ReadByte(); err != io.EOF {
+			t.Fatalf("timed-out upload left its connection open: %v", err)
 		}
 	})
 	t.Run("completed_upload_clears_deadline", func(t *testing.T) {
