@@ -157,9 +157,12 @@ func (p *BackendPool) fetchModel(parent context.Context, b *Backend) (string, er
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("discovery status")
+	}
+	if err := decodeUpstreamBody(resp); err != nil {
+		return "", err
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {

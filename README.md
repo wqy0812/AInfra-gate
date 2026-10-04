@@ -42,6 +42,12 @@ export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
 
 首次启动的业务接口返回 503；`/health` 仅表示进程存活。进程处于暂停状态时，新业务返回 503 和 `Retry-After: 1`。Router 非 2xx 仍按现有透传规则返回，网关不自动切回。
 
+## 单元测试覆盖率
+
+运行 `./scripts/test_coverage.sh`，可传 Go 测试参数（例如 `-run TestRuntime -race`）。入口使用离线 vendor 模式，覆盖网关及 `cmd/` 中的命令；本地忽略的 `deploy/` 发布工具不进入分母。结果输出到 `dist/coverage/coverage.out` 和 `dist/coverage/index.html`，测试失败时保留报告与失败退出码。
+
+控制协议、配置边界、画像 HTTP/分析队列及预算、观测存储故障、控制进程启动与 SIGTERM 收尾均有离线回归。网络夹具仅使用本机临时监听器，磁盘夹具使用临时目录，不访问部署节点或真实模型。
+
 ## 业务响应与旁路观测
 
 OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。模板适配器仍执行响应转换。
@@ -71,7 +77,7 @@ sum by (backend, model) (
 )
 ```
 
-完整接口、状态机、迁移和待执行验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。历史配置与 CLI 文档保存于 [v1 历史说明](docs/LEGACY_README_V1.md)，不可用于启动 v2。
+完整接口、状态机、迁移和验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。历史配置与 CLI 文档保存于 [v1 历史归档](docs/archive/v1/README.md)，不可用于启动 v2。
 
 ### 流停顿方向
 

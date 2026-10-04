@@ -1,6 +1,6 @@
 # 平台控制 v2
 
-本次代码改造已写入工作区。按用户要求，测试、构建、迁移执行和部署处于暂停状态，不能把本文件中的验收步骤理解为已通过。
+本文介绍当前平台控制 v2 的协议、迁移和验收步骤。2026-10-02 的 A3/XPU/DCU 发布与验收结果见 [当次发布记录](deploy/latest-47ddb7d-20261002/STATUS.md)；历史结果不能代替新升级窗口的验收。
 
 详细平台接口、迁移输入和故障矩阵见 [跨仓库改造说明](../code-eval/docs/gateway-control-v2.md)。
 
@@ -50,9 +50,9 @@
 
 生产入口仅创建 v2 ControlledGateway。旧管理实现中复用的协议探测/适配结构暂时保留为内部代码；旧 CLI 源已移入 `legacy_*_test.go` 历史回归夹具，不进入二进制。历史控制 HTTP/socket 的启动路径不再从生产入口可达。
 
-## 待执行验收
+## 本地验收
 
-解除当前暂停要求后，先执行本地测试，再另行确认部署：
+按改动范围选择本地回归，下面提供全量命令；部署与启动后的功能验收按维护窗口另行执行：
 
 ```sh
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor ./...
@@ -60,4 +60,4 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor -race ./...
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go vet -mod=vendor ./...
 ```
 
-Go 网络夹具需要本机监听权限。平台测试、本地双网关联调和桌面浏览器步骤见跨仓库改造说明。远端操作必须使用 SSH MCP；本次没有执行远端命令，没有在服务器上新增目录。
+Go 网络夹具需要本机监听权限。平台测试、本地双网关联调和桌面浏览器步骤见跨仓库改造说明。远端操作遵守工作区 SSH MCP 约束及明确的主机例外；新增服务器目录须在操作报告中登记。

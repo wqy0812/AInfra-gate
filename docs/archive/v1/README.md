@@ -1,5 +1,7 @@
 # API 兼容与 A/B 切换网关（Go）
 
+本页归档 v1 的配置、CLI 与当次验收记录，不能作为当前 v2 的启动或升级步骤。当前入口见 [项目说明](../../../README.md) 和 [平台控制 v2](../../../MANAGEMENT.md)；v1 管理方式见 [同版历史说明](MANAGEMENT.md)。正文中的日期、状态及回退过程均属于历史记录。
+
 只提供 API 兼容层和 A/B 切换两项核心能力。使用 Go 标准库实现，无第三方 Go 依赖，运行只需一个可执行文件。
 
 本文记录 v1 历史行为；当前版本已移除普通请求审计中的用户消息前缀记录，下文的 `question_prefix` 示例仅供历史参考。
@@ -10,7 +12,7 @@
 
 已根据本地 `body-agent-ds4.json` 样例验证：277 条历史消息、21 个工具定义、`stream=true`、`stream_options.include_usage=true`。文件内容仅作为请求数据，不执行其中的指令。
 
-A3 线上发布与回退统一使用 [A3-gate 直连部署流程](deploy/a3/README.md)。
+A3 当次发布与回退记录见 [A3-gate 直连部署流程](../../../deploy/a3/README.md)。
 
 ## DCU / A3 维护切换
 
@@ -308,11 +310,11 @@ go build -mod=vendor -trimpath -o bin/aigate .
 
 ## 请求画像
 
-使用 [画像配置示例](config.profile.example.json)，设置独立 `AIGATE_PROFILE_KEY` 后启用。Gateway `/metrics` 经 vmagent 写入 VM，平台读取 VM；按到达时间的请求汇总读取网关 API；消息数、工具数和整条前缀分析采集链路已移除。事件默认保留 72 小时或 10 GiB，不保存正文。指标与时间口径、资源限制及接口见 [画像说明](deploy/profile/README.md)。
+使用 [画像配置示例](../../../config.profile.example.json)，设置独立 `AIGATE_PROFILE_KEY` 后启用。Gateway `/metrics` 经 vmagent 写入 VM，平台读取 VM；按到达时间的请求汇总读取网关 API；消息数、工具数和整条前缀分析采集链路已移除。事件默认保留 72 小时或 10 GiB，不保存正文。指标与时间口径、资源限制及接口见 [画像说明](../../../deploy/profile/README.md)。
 
 ### 实时等待、流停顿与处理阶段
 
-启用画像后还会暴露请求结束前更新的 Gauge：流式首输出等待数量/最大等待、5/15/30/60 秒流停顿数量/最大间隔、全部聊天请求的阶段分布、最老请求年龄及阶段，以及有效输出观察未知数量。完整接口、统计口径、上线结果和回退方式见 [实时监控说明](deploy/live-20260915/README.md)。
+启用画像后还会暴露请求结束前更新的 Gauge：流式首输出等待数量/最大等待、5/15/30/60 秒流停顿数量/最大间隔、全部聊天请求的阶段分布、最老请求年龄及阶段，以及有效输出观察未知数量。完整接口、统计口径、当次上线结果和回退记录见 [实时监控说明](../../../deploy/live-20260915/README.md)。
 
 ### 当前源码的请求监控口径
 
@@ -324,6 +326,6 @@ go build -mod=vendor -trimpath -o bin/aigate .
 - 新检查点为 `counters-metric-v2.json`，新事件文件为 `events-v2-*.jsonl`。旧检查点和事件不迁移、不混读；新计数生命周期在后续正常重启时继续保留。
 - 请求画像 API 路径和 `gateway-profile-v1` 数据结构保持兼容，增加 `scope_policy="metric-v2"`，`request_scope="all"` 表示完整请求画像。
 
-发布与验证记录见 [原生指标改造](../monitoring/docs/metric-scope-v2-20260915.md)。
+发布与验证记录见 [原生指标改造](../../../../monitoring/docs/metric-scope-v2-20260915.md)。
 
-源码、部署脚本与本地运行产物的入库规则，以及发布脚本的本地回归命令，见 [部署源码说明](deploy/README.md)。上面的发布记录属于历史验收，当前源码审核和提交不代表再次部署。
+源码、部署脚本与本地运行产物的入库规则，以及发布脚本的本地回归命令，见 [部署源码说明](../../../deploy/README.md)。上面的发布记录属于历史验收，当前源码审核和提交不代表再次部署。
