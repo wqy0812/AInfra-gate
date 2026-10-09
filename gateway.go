@@ -694,6 +694,10 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		entry.Outcome = code
 		entry.profile.liveTerminal()
+		if observer != nil && observer.Done {
+			// The read failure is still recorded, but nothing may follow [DONE].
+			return "backend_failure"
+		}
 		// Permit a bounded final error write after the generation deadline expires.
 		_ = controller.SetWriteDeadline(time.Now().Add(time.Second))
 		entry.profile.liveWriteStart()

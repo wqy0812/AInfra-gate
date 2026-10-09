@@ -130,7 +130,7 @@ func TestRuntimeSnapshotRejectsInvalidConfigurationBeforeDiscovery(t *testing.T)
 			tc.change(&s)
 			cmd := RuntimeCommand{OperationID: "owner", Payload: encodeJSON(s)}
 			c.mu.Lock()
-			e := c.prepareLocked(cmd)
+			e := c.prepareLocked(cmd, &RuntimeResult{})
 			candidate := c.candidate
 			c.mu.Unlock()
 			if e == nil || e.Error() != tc.code || candidate != nil {

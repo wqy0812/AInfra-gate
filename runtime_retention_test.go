@@ -36,6 +36,7 @@ func TestRuntimeRetentionAfterRotationAndRestart(t *testing.T) {
 	s.BindingRevision = 2
 	s.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"new","retention_hours":1}}`)
 	activateV2(t, c, "rotate", s)
+	c.waitClosingObservers() // drained observers close asynchronously, outside c.mu
 	if !old.closed {
 		t.Fatal("old writer still running")
 	}

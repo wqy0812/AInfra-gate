@@ -62,6 +62,7 @@ type runtimeGeneration struct {
 	counts   RuntimeCounts
 	owner    string
 	refs     int
+	pins     int // an in-progress prepare shares this generation's observers
 	closed   bool
 }
 type runtimeTest struct {
@@ -73,8 +74,12 @@ type runtimeTest struct {
 	Releasing       bool   `json:"releasing"`
 	hash            string
 }
+
+// Lock order is cmdMu, then mu. Business requests take only mu, so no disk I/O
+// runs under mu: commands and retention sweeps serialize on cmdMu instead.
 type ControlledGateway struct {
-	incidents          *incidentStore
+	incidents          *incidentStore // guarded by cmdMu
+	cmdMu              sync.Mutex
 	mu                 sync.Mutex
 	id, boot, key      string
 	cidrs              []netip.Prefix
@@ -95,6 +100,7 @@ type ControlledGateway struct {
 	retentionStop      chan struct{}
 	retentionWake      chan struct{}
 	retentionOnce      sync.Once
+	closingDirs        map[string]chan struct{} // observer directory -> closed once released
 }
 type runtimeRequestKey struct{}
 type runtimeRequest struct {
@@ -108,7 +114,7 @@ func newControlledGateway(id, key string, cidrs []string, audit io.Writer) (*Con
 		return nil, fmt.Errorf("gateway ID, control key (32+ bytes) and allowed CIDRs are required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &ControlledGateway{id: id, boot: randomID(), key: key, audit: audit, ctx: ctx, cancel: cancel, dataRoot: "/var/lib/aigate", results: map[uint64]*RuntimeResult{}, released: map[string]bool{}}
+	c := &ControlledGateway{id: id, boot: randomID(), key: key, audit: audit, ctx: ctx, cancel: cancel, dataRoot: "/var/lib/aigate", results: map[uint64]*RuntimeResult{}, released: map[string]bool{}, closingDirs: map[string]chan struct{}{}}
 	for _, v := range cidrs {
 		p, e := netip.ParsePrefix(v)
 		if e != nil {
@@ -133,7 +139,7 @@ func (c *ControlledGateway) revisionLocked() uint64 {
 }
 func (c *ControlledGateway) cleanupLocked() {
 	for _, g := range c.generations {
-		if g != c.active && g != c.candidate && g.refs == 0 && !g.closed {
+		if g != c.active && g != c.candidate && g.refs == 0 && g.pins == 0 && !g.closed {
 			g.closed = true
 			c.closeGenerationLocked(g)
 		}
@@ -159,10 +165,52 @@ func (c *ControlledGateway) closeGenerationLocked(g *runtimeGeneration) {
 		}
 	}
 	if g.g.profile != nil && !profileUsed {
-		g.g.profile.close()
+		c.closeObserverLocked(g.g.profile.c.Directory, g.g.profile.close)
 	}
 	if g.g.slow != nil && !slowUsed {
-		g.g.slow.close()
+		c.closeObserverLocked(g.g.slow.c.Directory, g.g.slow.close)
+	}
+}
+
+// Closing an observer drains its queue and syncs files. It runs outside c.mu,
+// which the last request of a draining generation holds when it gets here;
+// prepare waits for the directory before reopening it.
+func (c *ControlledGateway) closeObserverLocked(dir string, stop func()) {
+	done := make(chan struct{})
+	c.closingDirs[dir] = done
+	go func() {
+		defer close(done)
+		stop()
+	}()
+}
+
+// closingLocked returns the shutdown still holding dir, if any.
+func (c *ControlledGateway) closingLocked(dir string) chan struct{} {
+	done := c.closingDirs[dir]
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		delete(c.closingDirs, dir)
+		return nil
+	default:
+		return done
+	}
+}
+
+// waitClosingObservers waits for the observer shutdowns already started.
+func (c *ControlledGateway) waitClosingObservers() {
+	var closing []chan struct{}
+	c.mu.Lock()
+	for dir := range c.closingDirs {
+		if done := c.closingLocked(dir); done != nil {
+			closing = append(closing, done)
+		}
+	}
+	c.mu.Unlock()
+	for _, done := range closing {
+		<-done
 	}
 }
 func (c *ControlledGateway) Close() {
@@ -174,9 +222,11 @@ func (c *ControlledGateway) Close() {
 	c.cancel()
 	c.mu.Unlock()
 	c.wg.Wait()
+	// An in-flight command finishes first; later ones see the retired instance.
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
 	c.incidents.close()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.active = nil
 	c.candidate = nil
 	for _, g := range c.generations {
@@ -185,6 +235,8 @@ func (c *ControlledGateway) Close() {
 			c.closeGenerationLocked(g)
 		}
 	}
+	c.mu.Unlock()
+	c.waitClosingObservers()
 }
 func (c *ControlledGateway) statusLocked() map[string]any {
 	var current any
@@ -260,6 +312,8 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			runtimeError(w, 400, "invalid_request")
 			return
 		}
+		c.cmdMu.Lock()
+		defer c.cmdMu.Unlock()
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if cmd.ProtocolVersion != 2 || cmd.GatewayID != c.id || !validOperationID(cmd.OperationID) || cmd.Sequence == 0 {
@@ -348,7 +402,8 @@ func (c *ControlledGateway) ProfileHandler() http.Handler {
 	})
 }
 
-func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
+// Called with c.cmdMu and c.mu held; c.mu is released while observers open.
+func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand, result *RuntimeResult) error {
 	if c.test != nil {
 		return fmt.Errorf("test_occupied")
 	}
@@ -412,6 +467,7 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
 	cfg.SlowRequests.Directory = filepath.Join(c.dataRoot, "slow-requests", slowPolicy)
 	var sharedProfile *requestProfiler
 	var sharedSlow *slowRequestStore
+	var pinned []*runtimeGeneration
 	for _, old := range c.generations {
 		if old.closed {
 			continue
@@ -423,14 +479,54 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
 			sharedSlow = old.g.slow
 		}
 	}
+	// A new observer must wait until a closing one releases the same directory.
+	var waits []chan struct{}
 	if sharedProfile != nil {
 		cfg.Profile.Enabled = false
+	} else if profileEnabled {
+		if done := c.closingLocked(cfg.Profile.Directory); done != nil {
+			waits = append(waits, done)
+		}
 	}
 	if sharedSlow != nil {
 		cfg.SlowRequests.Enabled = false
+	} else if slowEnabled {
+		if done := c.closingLocked(cfg.SlowRequests.Directory); done != nil {
+			waits = append(waits, done)
+		}
+	}
+	// Keep shared observers open while c.mu is released below.
+	for _, old := range c.generations {
+		if old.closed {
+			continue
+		}
+		if (sharedProfile != nil && old.g.profile == sharedProfile) || (sharedSlow != nil && old.g.slow == sharedSlow) {
+			old.pins++
+			pinned = append(pinned, old)
+		}
+	}
+	// Opening observers reads and cleans their directories. Release c.mu so
+	// business requests continue; c.cmdMu keeps other commands and retention
+	// sweeps out, and status queries see this command as running.
+	result.Status = "running"
+	c.mu.Unlock()
+	for _, done := range waits {
+		<-done
 	}
 	// No environment mutation: secrets arrive in the authenticated snapshot.
 	g, e := newGateway(cfg, c.audit)
+	if e == nil && profileEnabled && c.incidents == nil {
+		var incidentErr error
+		c.incidents, incidentErr = newIncidentStore(filepath.Join(c.dataRoot, "stream-incidents"), c.id, c.boot, c.audit)
+		if incidentErr != nil {
+			fmt.Fprintln(c.audit, `{"event":"stream_incident_storage_unavailable"}`)
+		}
+	}
+	c.mu.Lock()
+	result.Status = "completed"
+	for _, old := range pinned {
+		old.pins--
+	}
 	if e != nil {
 		return fmt.Errorf("runtime_prepare_failed")
 	}
@@ -443,13 +539,6 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand) error {
 		g.slow = sharedSlow
 	}
 	if profileEnabled {
-		if c.incidents == nil {
-			var incidentErr error
-			c.incidents, incidentErr = newIncidentStore(filepath.Join(c.dataRoot, "stream-incidents"), c.id, c.boot, c.audit)
-			if incidentErr != nil {
-				fmt.Fprintln(c.audit, `{"event":"stream_incident_storage_unavailable"}`)
-			}
-		}
 		g.incidents = c.incidents
 	}
 	if s.APIKey != "" {
@@ -469,7 +558,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 	}
 	switch cmd.Action {
 	case "prepare":
-		return c.prepareLocked(cmd)
+		return c.prepareLocked(cmd, result)
 	case "validate":
 		g := c.candidate
 		if g == nil || g.owner != cmd.OperationID {

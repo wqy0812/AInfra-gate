@@ -249,3 +249,102 @@ func TestV2HistoricalAliasCannotChangeBackendResponse(t *testing.T) {
 		})
 	}
 }
+
+// A drained generation's observers close outside c.mu: business requests keep
+// running while its writer finishes, and a prepare that reopens the same
+// directory waits for the writer instead of blocking admission.
+func TestV2ObserverCloseAndReopenDoNotBlockBusiness(t *testing.T) {
+	p := newProtocolBackend(t)
+	c := controlledFixture(t)
+	slow := func(threshold string, revision uint64) RuntimeSnapshot {
+		s := snapshotV2("r1", p.server.URL, revision)
+		s.Settings = json.RawMessage(`{"slow_requests":{"enabled":true,"threshold_seconds":` + threshold + `}}`)
+		return s
+	}
+	send := func(owner, action string, payload any) (RuntimeCommand, chan RuntimeResult) {
+		c.mu.Lock()
+		cmd := RuntimeCommand{ProtocolVersion: 2, OperationID: owner, GatewayID: c.id, ExpectedBootID: c.boot, Sequence: c.sequence + 1, ExpectedRevision: c.revisionLocked(), Action: action, Payload: encodeJSON(payload)}
+		c.mu.Unlock()
+		done := make(chan RuntimeResult, 1)
+		go func() { _, result := controlRequestV2(t, c, cmd); done <- result }()
+		return cmd, done
+	}
+	await := func(done chan RuntimeResult) RuntimeResult {
+		select {
+		case result := <-done:
+			return result
+		case <-time.After(5 * time.Second):
+			t.Fatal("command blocked")
+			return RuntimeResult{}
+		}
+	}
+	business := func() {
+		w := httptest.NewRecorder()
+		finished := make(chan struct{})
+		go func() { c.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", nil)); close(finished) }()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Fatal("business request blocked by observer I/O")
+		}
+		if w.Code != 200 {
+			t.Fatalf("business request: %d", w.Code)
+		}
+	}
+	activateV2(t, c, "first", slow("300", 1))
+	old := c.active.g.slow
+	writing, release := make(chan struct{}), make(chan struct{})
+	old.write = func(slowRequestJob) error { close(writing); <-release; return nil }
+	old.enqueue(slowRequestJob{meta: slowRequestMeta{RequestID: strings.Repeat("a", 32)}, body: []byte("{}")})
+	<-writing
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	// A policy change retires the first writer while it is still writing.
+	for _, action := range []string{"prepare", "quiesce", "activate"} {
+		payload := any(map[string]any{})
+		if action == "prepare" {
+			payload = slow("600", 2)
+		} else if action == "activate" {
+			payload = map[string]any{"admission": true}
+		}
+		if _, done := send("second", action, payload); await(done).Status != "completed" {
+			t.Fatalf("%s failed", action)
+		}
+	}
+	business()
+	cmd, prepared := send("third", "prepare", slow("300", 3))
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		c.mu.Lock()
+		result := c.results[cmd.Sequence]
+		running := result != nil && result.Status == "running"
+		c.mu.Unlock()
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("prepare did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	business()
+	select {
+	case result := <-prepared:
+		t.Fatalf("prepare reopened a directory still held by its writer: %+v", result)
+	default:
+	}
+	close(release)
+	if result := await(prepared); result.Status != "completed" {
+		t.Fatalf("prepare after release: %+v", result)
+	}
+	c.mu.Lock()
+	reopened := c.candidate.g.slow
+	c.mu.Unlock()
+	if reopened == old || reopened.c.Directory != old.c.Directory {
+		t.Fatal("prepare did not reopen the released directory")
+	}
+}
