@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -123,7 +125,9 @@ func TestSSEEncodingFailures(t *testing.T) {
 			logs := &lockedBuffer{}
 			g.audit = log.New(logs, "", 0)
 			w := generationRequest(g, true)
-			if w.Code != tc.status || !strings.Contains(w.Body.String(), `"error"`) || !bodyClosed {
+			// After a forwarded [DONE] the failure is classified but no event follows.
+			delivered := tc.readBytes == len(plain)
+			if w.Code != tc.status || strings.Contains(w.Body.String(), `"error"`) == delivered || (delivered && w.Body.String() != plain) || !bodyClosed {
 				t.Fatalf("decode failure lost: status=%d body=%q closed=%t", w.Code, w.Body.String(), bodyClosed)
 			}
 			e := diagnosticAudit(t, logs)
@@ -137,6 +141,25 @@ func TestSSEEncodingFailures(t *testing.T) {
 			requireGenerationCount(t, g.profile, true, "error", tc.class, "200", 1)
 		})
 	}
+}
+
+func TestSSEReadErrorAfterDoneIsRecordedWithoutEvent(t *testing.T) {
+	plain := completionEvent(0, map[string]any{"content": "hello"}, "stop") + "data: [DONE]\n\n"
+	g := generationGateway(t, func(*http.Request) (*http.Response, error) {
+		res := generationResponse(200, "text/event-stream", "")
+		res.Body = io.NopCloser(io.MultiReader(strings.NewReader(plain), iotest.ErrReader(syscall.ECONNRESET)))
+		return res, nil
+	})
+	logs := &lockedBuffer{}
+	g.audit = log.New(logs, "", 0)
+	w := generationRequest(g, true)
+	if w.Code != 200 || w.Body.String() != plain {
+		t.Fatalf("event written after [DONE]: %q", w.Body.String())
+	}
+	if e := diagnosticAudit(t, logs); e.Outcome != "upstream_stream_error" || e.GenerationResult != "error" || e.ErrorClass != "response_read_error" {
+		t.Fatalf("read failure after [DONE] not recorded: %+v", e)
+	}
+	requireGenerationCount(t, g.profile, true, "error", "response_read_error", "200", 1)
 }
 
 type encodingTestBody struct {

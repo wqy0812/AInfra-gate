@@ -41,11 +41,17 @@ func (c *ControlledGateway) retainObservations() {
 }
 
 func (c *ControlledGateway) cleanupObservations(now time.Time) error {
-	// Prevent prepare from reopening a directory between the liveness check and
-	// deletion. No observer acquires c.mu, so closing/locking it cannot invert locks.
+	// Let observers already closing release their directories first. c.cmdMu
+	// keeps prepare from reopening a directory between the liveness check and
+	// deletion. c.mu covers only the snapshot: the sweep walks the disk and
+	// must not stall business admission or completion. A generation closing
+	// later stays protected, or locked by its writer, until the next sweep.
+	c.waitClosingObservers()
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.active == nil {
+		c.mu.Unlock()
 		return nil
 	} // a draft is not a retention policy
 	protected := map[string]bool{}
@@ -60,9 +66,10 @@ func (c *ControlledGateway) cleanupObservations(now time.Time) error {
 			protected[g.g.slow.c.Directory] = true
 		}
 	}
-	cfg := c.active.g.config
-	profileErr := cleanObservationRoot(filepath.Join(c.dataRoot, "request-profile"), false, now, cfg.Profile.RetentionHours, cfg.Profile.MaxDiskBytes, protected)
-	slowErr := cleanObservationRoot(filepath.Join(c.dataRoot, "slow-requests"), true, now, cfg.SlowRequests.RetentionHours, cfg.SlowRequests.MaxDiskBytes, protected)
+	profile, slow := c.active.g.config.Profile, c.active.g.config.SlowRequests
+	c.mu.Unlock()
+	profileErr := cleanObservationRoot(filepath.Join(c.dataRoot, "request-profile"), false, now, profile.RetentionHours, profile.MaxDiskBytes, protected)
+	slowErr := cleanObservationRoot(filepath.Join(c.dataRoot, "slow-requests"), true, now, slow.RetentionHours, slow.MaxDiskBytes, protected)
 	if profileErr != nil {
 		return profileErr
 	}
