@@ -50,7 +50,7 @@ export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
 
 ## 业务响应与旁路观测
 
-OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。读取错误发生在已转发 `[DONE]` 之后时，仍按读取错误记录，但不再追加错误事件，`[DONE]` 始终是最后一个事件。模板适配器仍执行响应转换。
+OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。观察器已识别并转发 `[DONE]` 后发生读取错误时，仍按读取错误记录，但网关不再追加错误事件；此规则不覆盖观察器因解析上限停止解析而未识别 `[DONE]` 的情况，也不拦截上游在 `[DONE]` 后发送的数据。模板适配器仍执行响应转换。
 
 OpenAI 普通响应和 SSE 正文不改写模型名称，也不补写缺失的 `model` 字段。旧配置及历史运行快照中的 `public_model_name` 在读取时忽略；平台不再接受包含该字段的新运行配置，历史记录无需改写。
 

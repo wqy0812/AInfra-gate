@@ -55,7 +55,7 @@
         },
         "responses": {
           "200": {
-            "description": "OpenAI chat completion or SSE stream preserves the backend body and model field, including a missing model field. Transport failures are sent as error data events, except after [DONE], which is always the last event; observation does not rewrite upstream events.",
+            "description": "OpenAI chat completion or SSE stream preserves the backend body and model field, including a missing model field. Transport failures are sent as error data events, except when the observer has recognized [DONE] and it has been forwarded. This exception does not apply when observation limits prevent [DONE] recognition, and does not filter upstream data after [DONE]; observation does not rewrite upstream events.",
             "headers": {
               "X-Request-ID": {
                 "schema": {
