@@ -5,67 +5,12 @@ import (
 	"errors"
 	"io"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestManagementConfigurationLimits(t *testing.T) {
-	c := fixtureConfig(t, "http://127.0.0.1:1")
-	c.Management.Enabled = true
-	c.Management.defaults(c, filepath.Join(t.TempDir(), "config.json"))
-	if e := c.Management.validate(c); e != nil {
-		t.Fatal(e)
-	}
-	for _, tc := range []struct {
-		name   string
-		change func(*ManagementConfig)
-	}{
-		{"rounds", func(m *ManagementConfig) { m.WarmupRounds = 21 }},
-		{"tokens", func(m *ManagementConfig) { m.WarmupMaxTokens = -1 }},
-		{"failure threshold", func(m *ManagementConfig) { m.FailureThreshold = 101 }},
-		{"nan", func(m *ManagementConfig) { m.WarmupStepSeconds = math.NaN() }},
-		{"infinity", func(m *ManagementConfig) { m.DrainTimeoutSeconds = math.Inf(1) }},
-		{"duration overflow", func(m *ManagementConfig) { m.WarmupTimeoutSeconds = 1e20 }},
-		{"tiny duration", func(m *ManagementConfig) { m.RollbackRetrySeconds = 1e-20 }},
-		{"missing state", func(m *ManagementConfig) { m.StateFile = "" }},
-		{"missing socket", func(m *ManagementConfig) { m.Socket = "" }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m := c.Management
-			tc.change(&m)
-			if m.validate(c) == nil {
-				t.Fatal("invalid config accepted")
-			}
-		})
-	}
-	copy := *c
-	copy.RoutingFile = "routing.json"
-	if copy.Management.validate(&copy) == nil {
-		t.Fatal("routing file accepted")
-	}
-	copy = *c
-	copy.Backends = map[string]*Backend{"bad/name": c.Backends["api1"]}
-	if copy.Management.validate(&copy) == nil {
-		t.Fatal("invalid backend ID")
-	}
-	copy.Backends = map[string]*Backend{"api1": nil}
-	if copy.Management.validate(&copy) == nil {
-		t.Fatal("nil backend")
-	}
-	copy.Backends = map[string]*Backend{"api1": {Adapter: "template"}}
-	if copy.Management.validate(&copy) == nil {
-		t.Fatal("unsupported adapter")
-	}
-	m := ManagementConfig{Enabled: true, StateFile: "state.json", Socket: "control.sock"}
-	m.defaults(c, filepath.Join(t.TempDir(), "config.json"))
-	if !filepath.IsAbs(m.Socket) || !filepath.IsAbs(m.StateFile) {
-		t.Fatal("relative management paths")
-	}
-}
 
 func TestProfileConfigurationResourceBounds(t *testing.T) {
 	t.Setenv("AIGATE_PROFILE_BOUNDARY_KEY", "")

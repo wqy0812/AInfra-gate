@@ -68,7 +68,7 @@ func TestSSEEncodingStreaming(t *testing.T) {
 				}
 			})
 			cfg := fixtureConfig(t, u.URL)
-			cfg.Backends["api1"].Headers = map[string]string{"Accept-Encoding": tc.accept}
+			cfg.Backend.Headers = map[string]string{"Accept-Encoding": tc.accept}
 			cfg.Profile.Enabled, cfg.Profile.APIKey, cfg.Profile.Directory = true, "fixture-key", t.TempDir()
 			g, server, logs := serveTest(t, cfg)
 			client := &http.Client{Timeout: 3 * time.Second}
@@ -198,7 +198,7 @@ func TestSSEEncodingCancelAndTimeout(t *testing.T) {
 				<-r.Context().Done() // block before even sending the gzip header
 			})
 			cfg := fixtureConfig(t, u.URL)
-			cfg.Backends["api1"].Headers = map[string]string{"Accept-Encoding": "gzip"}
+			cfg.Backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
 			cfg.Profile.Enabled, cfg.Profile.APIKey, cfg.Profile.Directory = true, "fixture-key", t.TempDir()
 			if !cancelClient {
 				cfg.TimeoutSeconds = 0.08

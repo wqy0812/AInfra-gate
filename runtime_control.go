@@ -130,6 +130,10 @@ func newControlledGateway(id, key string, cidrs []string, audit io.Writer) (*Con
 	go c.retainObservations()
 	return c, nil
 }
+func testHash(token string) string {
+	h := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(h[:])
+}
 func runtimeDigest(v any) string { s := sha256.Sum256(encodeJSON(v)); return hex.EncodeToString(s[:]) }
 func (c *ControlledGateway) revisionLocked() uint64 {
 	if c.active != nil {
@@ -417,8 +421,7 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand, result *RuntimeRes
 	if s.Backend.Adapter != "openai" || len(s.Backend.HeadersEnv) > 0 || len(s.Backend.HeaderPrefixes) > 0 {
 		return fmt.Errorf("invalid_backend")
 	}
-	guard := ManagementHTTPConfig{Listen: "guard", GatewayURLs: s.GatewayAddresses}
-	if e := guard.checkRouter(s.Backend); e != nil {
+	if e := checkRouter(s.Backend, s.GatewayAddresses); e != nil {
 		return fmt.Errorf("gateway_target_forbidden")
 	}
 	var settings map[string]json.RawMessage
@@ -434,24 +437,23 @@ func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand, result *RuntimeRes
 			return fmt.Errorf("unknown_setting")
 		}
 	}
-	var typedSettings Config
+	var typedSettings RuntimeSettings
 	if strictDecode(s.Settings, &typedSettings) != nil {
 		return fmt.Errorf("invalid_settings")
 	}
 	if typedSettings.Profile.Directory != "" || typedSettings.Profile.Listen != "" || typedSettings.Profile.APIKeyEnv != "" || typedSettings.SlowRequests.Directory != "" {
 		return fmt.Errorf("bootstrap_setting_forbidden")
 	}
-	for _, key := range []string{"backends", "routing", "routing_file", "management", "gateway_api_key_env"} {
-		if _, ok := settings[key]; ok {
-			return fmt.Errorf("forbidden_setting")
-		}
-	}
-	settings["backends"] = encodeJSON(map[string]*Backend{s.RouterID: s.Backend})
-	settings["routing"] = encodeJSON(Policy{Mode: "single", Backend: s.RouterID})
-	cfg, e := parseConfig(encodeJSON(settings), "/runtime/config.json")
+	runtimeSettings, e := parseRuntimeSettings(s.Settings)
 	if e != nil {
 		return fmt.Errorf("invalid_settings")
 	}
+	// Keep normalized runtime fields and mutable maps separate from the received snapshot.
+	var backend Backend
+	if decodeJSON(encodeJSON(s.Backend), &backend) != nil {
+		return fmt.Errorf("invalid_backend")
+	}
+	cfg := &RuntimeConfig{RuntimeSettings: runtimeSettings, RouterID: s.RouterID, Backend: &backend}
 	if cfg.Profile.Enabled && cfg.Profile.APIKey == "" {
 		return fmt.Errorf("profile_key_required")
 	}
@@ -564,28 +566,12 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		if g == nil || g.owner != cmd.OperationID {
 			return fmt.Errorf("candidate_missing")
 		}
-		var policy struct {
-			Rounds         int     `json:"rounds"`
-			StepSeconds    float64 `json:"step_seconds"`
-			TimeoutSeconds float64 `json:"timeout_seconds"`
-			MaxTokens      int     `json:"max_tokens"`
-		}
+		var policy WarmupPolicy
 		if len(cmd.Payload) > 0 && string(cmd.Payload) != "{}" && strictDecode(cmd.Payload, &policy) != nil {
 			return fmt.Errorf("invalid_validation_policy")
 		}
-		if policy.Rounds == 0 {
-			policy.Rounds = 2
-		}
-		if policy.StepSeconds == 0 {
-			policy.StepSeconds = 120
-		}
-		if policy.TimeoutSeconds == 0 {
-			policy.TimeoutSeconds = 900
-		}
-		if policy.MaxTokens == 0 {
-			policy.MaxTokens = 1024
-		}
-		if policy.Rounds < 1 || policy.Rounds > 20 || policy.StepSeconds <= 0 || policy.TimeoutSeconds <= 0 || policy.MaxTokens < 1 {
+		policy.defaults()
+		if policy.validate() != nil {
 			return fmt.Errorf("invalid_validation_policy")
 		}
 		g.refs++
@@ -594,7 +580,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			report, e := validateControlledRuntime(c.ctx, g.g, ManagementConfig{WarmupRounds: policy.Rounds, WarmupStepSeconds: policy.StepSeconds, WarmupTimeoutSeconds: policy.TimeoutSeconds, WarmupMaxTokens: policy.MaxTokens})
+			report, e := validateControlledRuntime(c.ctx, g.g, policy)
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			g.refs--
@@ -798,18 +784,4 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Aigate-Backend", g.snapshot.RouterID)
 	w.Header().Set("X-Aigate-Route-Version", strconv.FormatUint(g.snapshot.BindingRevision, 10))
 	g.g.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), runtimeRequestKey{}, meta)))
-}
-
-// Reuses the proven protocol probes with an isolated in-memory accounting object.
-// It never invokes newManagement, its file lock, state reader, or state writer.
-func validateControlledRuntime(ctx context.Context, g *Gateway, policy ManagementConfig) (*WarmupReport, error) {
-	cfg := *g.config
-	cfg.Management = policy
-	disabled := false
-	cfg.Management.AutoRollback = &disabled
-	copyGateway := &Gateway{config: &cfg, pool: g.pool, client: g.client, transport: g.transport, audit: g.audit, now: g.now}
-	name := cfg.Routing.Backend
-	m := &Management{g: copyGateway, ctx: ctx, counts: map[string]*BackendCounters{name: {}}, state: ManagedState{ActiveBackend: name, Backends: map[string]*BackendState{name: {}}, Registry: registryFromConfig(&cfg)}}
-	m.persist = func(ManagedState) error { return nil }
-	return m.warmup(ctx, name, false, func(*WarmupReport) error { return nil })
 }

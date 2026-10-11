@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -30,66 +29,17 @@ type modelCache struct {
 }
 
 type BackendPool struct {
-	config       *Config
-	client       *http.Client
-	registryMu   sync.RWMutex
-	entries      map[string]*backendRuntime
-	policyMu     sync.Mutex
-	policyInfo   os.FileInfo
-	cachedPolicy Policy
+	config  *RuntimeConfig
+	client  *http.Client
+	runtime *backendRuntime
 }
 
-func newPool(c *Config, client *http.Client) *BackendPool {
-	p := &BackendPool{config: c, client: client, entries: map[string]*backendRuntime{}}
-	for _, name := range c.names {
-		p.entries[name] = &backendRuntime{backend: c.Backends[name], cache: &modelCache{}}
-	}
-	return p
+func newPool(c *RuntimeConfig, client *http.Client) *BackendPool {
+	return &BackendPool{config: c, client: client, runtime: &backendRuntime{backend: c.Backend, cache: &modelCache{}}}
 }
 
-func (p *BackendPool) policy() (Policy, *GatewayError) {
-	if p.config.RoutingFile == "" {
-		return p.config.Routing, nil
-	}
-	p.policyMu.Lock()
-	defer p.policyMu.Unlock()
-	bad := fault(503, "invalid_routing_config", "路由配置不可用，请检查 routing_file")
-	info, err := os.Stat(p.config.RoutingFile)
-	if err != nil {
-		p.policyInfo = nil
-		return Policy{}, bad
-	}
-	if old := p.policyInfo; old != nil && os.SameFile(old, info) && old.Size() == info.Size() && old.ModTime() == info.ModTime() {
-		return p.cachedPolicy, nil
-	}
-	p.policyInfo = nil
-	f, err := os.Open(p.config.RoutingFile)
-	if err != nil {
-		return Policy{}, bad
-	}
-	defer f.Close()
-	before, err := f.Stat()
-	if err != nil {
-		return Policy{}, bad
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return Policy{}, bad
-	}
-	after, err := f.Stat()
-	if err != nil {
-		return Policy{}, bad
-	}
-	var policy Policy
-	if before.Size() != after.Size() || before.ModTime() != after.ModTime() || decodeJSON(data, &policy) != nil || policy.validate(p.config) != nil {
-		return Policy{}, bad
-	}
-	p.cachedPolicy, p.policyInfo = policy, after
-	return policy, nil
-}
-
-func (p *BackendPool) discover(ctx context.Context, name string) (string, *GatewayError) {
-	return p.discoverRuntime(ctx, p.snapshot(name))
+func (p *BackendPool) discover(ctx context.Context) (string, *GatewayError) {
+	return p.discoverRuntime(ctx, p.runtime)
 }
 
 func (p *BackendPool) discoverRuntime(ctx context.Context, runtime *backendRuntime) (string, *GatewayError) {
@@ -204,17 +154,13 @@ func (p *BackendPool) fetchModel(parent context.Context, b *Backend) (string, er
 }
 
 func (p *BackendPool) choose(ctx context.Context) (string, *Backend, string, *GatewayError) {
-	policy, err := p.policy()
-	if err != nil {
-		return "", nil, "", err
-	}
-	runtime := p.snapshot(policy.Backend)
-	profileFrom(ctx).liveBackend(policy.Backend)
+	runtime := p.runtime
+	profileFrom(ctx).liveBackend(p.config.RouterID)
 	model, discoveryErr := p.discoverRuntime(ctx, runtime)
 	if discoveryErr != nil {
 		return "", nil, "", discoveryErr
 	}
-	return policy.Backend, runtime.backend, model, nil
+	return p.config.RouterID, runtime.backend, model, nil
 }
 
 func (p *BackendPool) models(ctx context.Context) ([]string, *GatewayError) {
@@ -230,16 +176,4 @@ func (p *BackendPool) models(ctx context.Context) ([]string, *GatewayError) {
 type backendRuntime struct {
 	backend *Backend
 	cache   *modelCache
-}
-
-func (p *BackendPool) snapshot(name string) *backendRuntime {
-	p.registryMu.RLock()
-	defer p.registryMu.RUnlock()
-	return p.entries[name]
-}
-
-func (p *BackendPool) publish(name string, backend *Backend) {
-	p.registryMu.Lock()
-	defer p.registryMu.Unlock()
-	p.entries[name] = &backendRuntime{backend: backend, cache: &modelCache{}}
 }

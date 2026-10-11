@@ -45,7 +45,7 @@ func TestWorkspaceCompatibilityHTTP(t *testing.T) {
 						}
 					})
 					c := fixtureConfig(t, u.URL)
-					c.Backends["api1"].Compatibility.MetadataValues = "workspace_object_json_string"
+					c.Backend.Compatibility.MetadataValues = "workspace_object_json_string"
 					_, s, _ := serveTest(t, c)
 					body := rawObject{"messages": json.RawMessage(`[{"role":"user","content":"test"}]`), "stream": encodeJSON(stream), "extra": json.RawMessage(`{"n":9007199254740993}`)}
 					if tc.metadata != "" {
@@ -67,7 +67,7 @@ func TestWorkspaceCompatibilityHTTP(t *testing.T) {
 					}
 					equivalentJSON(t, <-sent, encodeJSON(body))
 					// Applying the mode again must not double-encode workspace.
-					again, err := applyCompatibility(body, c.Backends["api1"].Compatibility)
+					again, err := applyCompatibility(body, c.Backend.Compatibility)
 					if err != nil {
 						t.Fatal(err)
 					}

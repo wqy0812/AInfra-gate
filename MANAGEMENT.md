@@ -48,7 +48,9 @@
 
 正在写入的当前、候选或尚未排空的旧代目录受保护，其磁盘占用计入总额；优先按时间淘汰已关闭目录中的数据。若受保护目录自身已超过总额，暂不删除在写文件，旧代排空后下一轮清理收敛。目录锁保护其他仍存活的写入进程；不会沿符号链接或递归删除外来内容。清理错误记录为 `observation_retention_error`。
 
-生产入口仅创建 v2 ControlledGateway。旧管理实现中复用的协议探测/适配结构暂时保留为内部代码；旧 CLI 源已移入 `legacy_*_test.go` 历史回归夹具，不进入二进制。历史控制 HTTP/socket 的启动路径不再从生产入口可达。
+生产入口仅创建 v2 ControlledGateway。每个运行代使用七项运行设置和单个 Router 后端组成的独立配置；预热为无持久化的协议探测函数，其生命周期与计数归 v2 控制层管理。旧管理状态机、HTTP/socket、路由文件热加载、CLI 夹具和 v1 示例配置已删除，历史版本通过 Git 查阅。在线交换、命令序号、boot 校验、测试占用和请求快照语义不变。
+
+`runtime_control_test.go`、`runtime_boundaries_test.go` 与 `runtime_config_test.go` 覆盖当前 v2 控制、配置和在线切流边界；`warmup_test.go` 与 SSE 相关测试覆盖协议探测。旧 `control_test.go` 只测试已删除的 Unix socket，不再作为 v2 验收入口。
 
 ## 本地验收
 

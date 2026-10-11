@@ -56,7 +56,7 @@ func TestJSONStringMetadataHTTP(t *testing.T) {
 				_, _ = io.WriteString(w, goodResponse)
 			})
 			c := fixtureConfig(t, u.URL)
-			c.Backends["api1"].Compatibility.MetadataValues = "json_string"
+			c.Backend.Compatibility.MetadataValues = "json_string"
 			_, s, _ := serveTest(t, c)
 			body := rawObject{"messages": json.RawMessage(`[{"role":"user","content":"test"}]`)}
 			if tc.input != "" {
@@ -78,7 +78,7 @@ func TestJSONStringMetadataHTTP(t *testing.T) {
 				body["metadata"] = json.RawMessage(tc.want)
 			}
 			equivalentJSON(t, <-sent, encodeJSON(body))
-			again, err := applyCompatibility(body, c.Backends["api1"].Compatibility)
+			again, err := applyCompatibility(body, c.Backend.Compatibility)
 			if err != nil {
 				t.Fatal(err)
 			}

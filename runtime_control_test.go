@@ -348,3 +348,151 @@ func TestV2ObserverCloseAndReopenDoNotBlockBusiness(t *testing.T) {
 		t.Fatal("prepare did not reopen the released directory")
 	}
 }
+
+func waitRuntimeCondition(t *testing.T, c *ControlledGateway, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		ready := condition()
+		c.mu.Unlock()
+		if ready {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("runtime condition timed out")
+}
+
+func TestV2DiscoveryAndConnectionWaitersKeepOriginalSnapshot(t *testing.T) {
+	for _, waitAt := range []string{"discovery", "connection"} {
+		t.Run(waitAt, func(t *testing.T) {
+			c := controlledFixture(t)
+			one, two := newProtocolBackend(t), newProtocolBackend(t)
+			var release sync.Once
+			gate := make(chan struct{})
+			defer release.Do(func() { close(gate) })
+			if waitAt == "discovery" {
+				one.discoveryGate = gate
+			} else {
+				one.streamGate = gate
+			}
+			s := snapshotV2("r1", one.server.URL, 1)
+			s.Settings = json.RawMessage(`{"http_pool":{"max_connections_per_host":1}}`)
+			activateV2(t, c, "bind", s)
+			old := c.active
+			server := httptest.NewServer(c)
+			defer server.Close()
+			var first *http.Response
+			if waitAt == "connection" {
+				var err error
+				first, err = server.Client().Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[{"role":"user"}],"stream":true}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer first.Body.Close()
+				if _, err := bufio.NewReader(first.Body).ReadString('\n'); err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				w := httptest.NewRecorder()
+				c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(basicBody)))
+				done <- w
+			}()
+			expected := 1
+			if first != nil {
+				expected = 2
+			}
+			waitRuntimeCondition(t, c, func() bool { return old.counts.Business == expected && one.gets.Load() == 1 })
+			activateV2(t, c, "swap", snapshotV2("r2", two.server.URL, 2))
+			next := httptest.NewRecorder()
+			c.ServeHTTP(next, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(basicBody)))
+			if next.Code != 200 || next.Header().Get("X-Aigate-Backend") != "r2" {
+				t.Fatal("new request did not switch")
+			}
+			if first != nil {
+				first.Body.Close()
+			} else {
+				release.Do(func() { close(gate) })
+			}
+			select {
+			case w := <-done:
+				if w.Code != 200 || w.Header().Get("X-Aigate-Backend") != "r1" || w.Header().Get("X-Aigate-Route-Version") != "1" {
+					t.Fatalf("waiter changed route: %d %v", w.Code, w.Header())
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("old waiter did not finish")
+			}
+			waitRuntimeCondition(t, c, func() bool { return old.counts.Business == 0 && old.counts.Streams == 0 && old.closed })
+		})
+	}
+}
+
+func TestV2TestLeaseTracksRealStreamUntilRelease(t *testing.T) {
+	c := controlledFixture(t)
+	p := newProtocolBackend(t)
+	p.streamGate = make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(p.streamGate) })
+	activateV2(t, c, "bind", snapshotV2("r1", p.server.URL, 1))
+	token := strings.Repeat("t", 32)
+	payload := map[string]any{"task_id": "task", "token": token, "model": "local-protocol-model", "router_id": "r1", "binding_revision": 1}
+	commandV2(t, c, "test", "test-acquire", payload)
+	commandV2(t, c, "test", "test-status", payload)
+	server := httptest.NewServer(c)
+	defer server.Close()
+	req, _ := http.NewRequest("POST", server.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user"}],"stream":true}`))
+	req.Header.Set("X-Code-Eval-Token", token)
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		t.Fatal(response.StatusCode)
+	}
+	if _, err := bufio.NewReader(response.Body).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	commandV2(t, c, "test", "test-release", payload)
+	waitRuntimeCondition(t, c, func() bool {
+		return c.test != nil && c.test.Releasing && c.test.Inflight == 1 && c.active.counts.Tests == 1
+	})
+	w := httptest.NewRecorder()
+	rejected := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(basicBody))
+	rejected.Header.Set("X-Code-Eval-Token", token)
+	c.ServeHTTP(w, rejected)
+	if w.Code != 409 {
+		t.Fatal("releasing token admitted new request")
+	}
+	release.Do(func() { close(p.streamGate) })
+	io.Copy(io.Discard, response.Body)
+	waitRuntimeCondition(t, c, func() bool { return c.test == nil && c.active.counts.Tests == 0 && c.active.counts.Business == 0 })
+	commandV2(t, c, "test", "test-status", payload)
+}
+
+func TestV2FailedValidationKeepsActiveRouteAndReleasesProbe(t *testing.T) {
+	c := controlledFixture(t)
+	one, two := newProtocolBackend(t), newProtocolBackend(t)
+	two.probeBad.Store(true)
+	activateV2(t, c, "bind", snapshotV2("r1", one.server.URL, 1))
+	active := c.active
+	commandV2(t, c, "verify", "prepare", snapshotV2("r2", two.server.URL, 2))
+	result := commandV2(t, c, "verify", "validate", map[string]any{"rounds": 1, "step_seconds": 1, "timeout_seconds": 3, "max_tokens": 32})
+	waitRuntimeCondition(t, c, func() bool { return c.results[result.Sequence].Status != "running" })
+	c.mu.Lock()
+	final := c.results[result.Sequence]
+	failed := final.Status == "failed" && final.Error == "validation_failed" && final.Report != nil && !final.Report.Passed && final.Report.FinishedAt != nil
+	unchanged := c.active == active && c.admission && c.candidate.counts.Probes == 0 && c.candidate.refs == 0
+	c.mu.Unlock()
+	if !failed || !unchanged || two.gets.Load() != 1 || two.posts.Load() != 1 {
+		t.Fatal("failed validation changed routing or leaked probes")
+	}
+	w := httptest.NewRecorder()
+	c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(basicBody)))
+	if w.Code != 200 || w.Header().Get("X-Aigate-Backend") != "r1" {
+		t.Fatal("validation failure affected business")
+	}
+}

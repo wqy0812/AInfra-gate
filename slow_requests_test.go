@@ -207,7 +207,7 @@ func TestSlowRequestOutcomesAndReplay(t *testing.T) {
 					}
 				})
 				// Adaptation must not leak into the retained raw body.
-				g.config.Backends["api1"].Compatibility.MetadataValues = "json_string"
+				g.config.Backend.Compatibility.MetadataValues = "json_string"
 				r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(slowTestBody)).WithContext(ctx)
 				r.Header.Set("Authorization", "Bearer private-client-key")
 				w := httptest.NewRecorder()
@@ -236,7 +236,7 @@ func TestSlowRequestOutcomesAndReplay(t *testing.T) {
 						replayed, _ = io.ReadAll(r.Body)
 						return slowCompletedResponse(), nil
 					})
-					replay.config.Backends["api1"].Compatibility.MetadataValues = "json_string"
+					replay.config.Backend.Compatibility.MetadataValues = "json_string"
 					rw := httptest.NewRecorder()
 					replay.ServeHTTP(rw, httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body)))
 					equivalentJSON(t, forwarded, replayed)

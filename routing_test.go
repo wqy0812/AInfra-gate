@@ -1,16 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +29,11 @@ func TestSingleBackendCacheAndModels(t *testing.T) {
 		}))
 		t.Cleanup(servers[i].Close)
 	}
-	_, s, _ := serveTest(t, fixtureConfig(t, servers[0].URL, servers[1].URL))
+	c := controlledFixture(t)
+	activateV2(t, c, "bind", snapshotV2("api1", servers[0].URL, 1))
+	commandV2(t, c, "candidate", "prepare", snapshotV2("api2", servers[1].URL, 2))
+	s := httptest.NewServer(c)
+	defer s.Close()
 	for _, expected := range []string{"model1", "model1", "model1", "model1", "model1"} {
 		r, list := request(t, s, "GET", "/v1/models", "", "")
 		if r.StatusCode != 200 || !strings.Contains(string(list), "model1") || strings.Contains(string(list), "model2") {
@@ -48,67 +48,6 @@ func TestSingleBackendCacheAndModels(t *testing.T) {
 	}
 	if counts[0].Load() != 1 || counts[1].Load() != 0 {
 		t.Fatal("discovery not cached or standby accessed")
-	}
-}
-
-func TestRoutingFileRecoveryAndAtomicSwitchCLI(t *testing.T) {
-	u1 := upstreamServer(t, "model1", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, strings.Replace(goodResponse, `"model":"ignored"`, `"model":"model1"`, 1))
-	})
-	u2 := upstreamServer(t, "model2", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, strings.Replace(goodResponse, `"model":"ignored"`, `"model":"model2"`, 1))
-	})
-	c := fixtureConfig(t, u1.URL, u2.URL)
-	c.RoutingFile = filepath.Join(t.TempDir(), "routing.json")
-	if err := publishPolicy(c, Policy{Mode: "single", Backend: "api1"}); err != nil {
-		t.Fatal(err)
-	}
-	_, s, _ := serveTest(t, c)
-	for _, invalid := range []string{`{"mode":"single","backend":"typo"}`, `{"mode":"round_robin"}`, `{"mode":"single"}`, `{`, `null`, `{"mode":"single","backend":"api2","extra":1}`} {
-		if err := os.WriteFile(c.RoutingFile, []byte(invalid), 0600); err != nil {
-			t.Fatal(err)
-		}
-		r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-		requireError(t, r, data, 503, "invalid_routing_config")
-		if err := publishPolicy(c, Policy{Mode: "single", Backend: "api2"}); err != nil {
-			t.Fatal(err)
-		}
-		r, data = request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-		if r.StatusCode != 200 || !strings.Contains(string(data), `"model":"model2"`) {
-			t.Fatal("routing failed to recover")
-		}
-	}
-	if err := os.Remove(c.RoutingFile); err != nil {
-		t.Fatal(err)
-	}
-	r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-	requireError(t, r, data, 503, "invalid_routing_config")
-	// The CLI resolves the path from the config directory, even without credentials.
-	configFile := filepath.Join(filepath.Dir(c.RoutingFile), "config.json")
-	cliConfig := *c
-	cliConfig.RoutingFile = "routing.json"
-	cliConfig.GatewayAPIKeyEnv = "AIGATE_TEST_MISSING_KEY"
-	if err := os.WriteFile(configFile, encodeJSON(cliConfig), 0600); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := legacyRun([]string{"switch", "single", "api1", "--config", configFile}, &out, io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	r, data = request(t, s, "POST", "/v1/chat/completions", basicBody, "")
-	if r.StatusCode != 200 || !strings.Contains(string(data), `"model":"model1"`) {
-		t.Fatal("CLI switch failed")
-	}
-	before, _ := os.ReadFile(c.RoutingFile)
-	for _, args := range [][]string{{"single", "typo"}, {"round_robin"}, {"round_robin", "api1"}, {"single"}, {"bad"}, {"--config"}} {
-		all := append([]string{"--config", configFile}, args...)
-		if err := switchCommand(all, &out); err == nil {
-			t.Fatal("invalid CLI accepted")
-		}
-		after, _ := os.ReadFile(c.RoutingFile)
-		if !bytes.Equal(before, after) {
-			t.Fatal("invalid switch changed file")
-		}
 	}
 }
 
@@ -131,11 +70,11 @@ func TestDiscoveryFailureAndNoGenerationRetry(t *testing.T) {
 			}))
 			defer u1.Close()
 			u2 := upstreamServer(t, "model2", func(w http.ResponseWriter, r *http.Request) { posts[1].Add(1); _, _ = io.WriteString(w, goodResponse) })
-			c := fixtureConfig(t, u1.URL, u2.URL)
-			if mode == "single" {
-				c.Routing = Policy{Mode: "single", Backend: "api1"}
-			}
-			_, s, _ := serveTest(t, c)
+			c := controlledFixture(t)
+			activateV2(t, c, "bind", snapshotV2("api1", u1.URL, 1))
+			commandV2(t, c, "candidate", "prepare", snapshotV2("api2", u2.URL, 2))
+			s := httptest.NewServer(c)
+			defer s.Close()
 			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
 			switch mode {
 			case "single":
@@ -156,7 +95,7 @@ func TestDiscoveryFailureAndNoGenerationRetry(t *testing.T) {
 }
 
 func expireModel(p *BackendPool, name string) {
-	c := p.snapshot(name).cache
+	c := p.runtime.cache
 	c.mu.Lock()
 	c.expires = time.Time{}
 	c.mu.Unlock()
@@ -181,7 +120,7 @@ func TestDiscoverySingleflightExpiryFailureRecovery(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			model, err := g.pool.discover(context.Background(), "api1")
+			model, err := g.pool.discover(context.Background())
 			if err != nil || model != "old" {
 				t.Error("singleflight result incorrect")
 			}
@@ -192,12 +131,12 @@ func TestDiscoverySingleflightExpiryFailureRecovery(t *testing.T) {
 		t.Fatal("concurrent cache miss issued multiple discoveries")
 	}
 	expireModel(g.pool, "api1")
-	if model, err := g.pool.discover(context.Background(), "api1"); err != nil || model != "new" {
+	if model, err := g.pool.discover(context.Background()); err != nil || model != "new" {
 		t.Fatal("cache did not refresh")
 	}
 	expireModel(g.pool, "api1")
 	for i := 0; i < 2; i++ {
-		if _, err := g.pool.discover(context.Background(), "api1"); err == nil {
+		if _, err := g.pool.discover(context.Background()); err == nil {
 			t.Fatal("stale model reused")
 		}
 	}
@@ -205,15 +144,14 @@ func TestDiscoverySingleflightExpiryFailureRecovery(t *testing.T) {
 		t.Fatal("failed discovery not cached or standby accessed")
 	}
 	expireModel(g.pool, "api1")
-	if model, err := g.pool.discover(context.Background(), "api1"); err != nil || model != "recovered" {
+	if model, err := g.pool.discover(context.Background()); err != nil || model != "recovered" {
 		t.Fatal("discovery did not recover")
 	}
 }
 
 func TestConcurrentSingleBackend(t *testing.T) {
 	u1 := upstreamServer(t, "one", nil)
-	u2 := upstreamServer(t, "two", nil)
-	g, _, _ := serveTest(t, fixtureConfig(t, u1.URL, u2.URL))
+	g, _, _ := serveTest(t, fixtureConfig(t, u1.URL))
 	var one, two atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -250,7 +188,7 @@ func TestPreferredModelCustomPathsAndDiscoveryAuth(t *testing.T) {
 	for _, preferred := range []string{"", "second", "missing"} {
 		t.Run(preferred, func(t *testing.T) {
 			c := fixtureConfig(t, u.URL)
-			b := c.Backends["api1"]
+			b := c.Backend
 			b.ModelsListPath = "result.models"
 			b.ModelIDPath = "name"
 			b.HeadersEnv = map[string]string{"Authorization": "MODEL_KEY"}
@@ -316,47 +254,16 @@ func TestCancelledDiscoveryDoesNotPoisonCache(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan struct{})
-	go func() { defer close(done); _, _ = g.pool.discover(ctx, "api1") }()
+	go func() { defer close(done); _, _ = g.pool.discover(ctx) }()
 	<-started
 	waitCtx, stop := context.WithCancel(context.Background())
 	stop()
-	if _, err := g.pool.discover(waitCtx, "api1"); err == nil {
+	if _, err := g.pool.discover(waitCtx); err == nil {
 		t.Fatal("cancelled waiter accepted")
 	}
 	cancel()
 	<-done
-	if model, err := g.pool.discover(context.Background(), "api1"); err != nil || model != "recovered" {
+	if model, err := g.pool.discover(context.Background()); err != nil || model != "recovered" {
 		t.Fatal("caller cancellation poisoned shared cache")
-	}
-}
-
-func TestConfigValidationAndOrder(t *testing.T) {
-	data := []byte(`{"routing":{"mode":"single","backend":"z"},"backends":{"z":{"adapter":"openai","url":"http://localhost/infer","models_url":"http://localhost/models"},"a":{"adapter":"openai","url":"http://localhost/infer","models_url":"http://localhost/models"}}}`)
-	c, err := parseConfig(data, "config.json")
-	if err != nil || c.validate() != nil || !reflect.DeepEqual(c.names, []string{"z", "a"}) {
-		t.Fatal("config order/defaults changed")
-	}
-	for _, mutate := range []func(*Config){
-		func(c *Config) { c.Routing.Mode = "round_robin" },
-		func(c *Config) { c.TimeoutSeconds = 0 }, func(c *Config) { c.HTTPPool.MaxConnsPerHost = -1 },
-		func(c *Config) { c.Backends["z"].URL = "http://user:secret@localhost/infer" },
-		func(c *Config) { c.Backends["z"].Adapter = "bad" }, func(c *Config) { c.Backends["z"].UpstreamModel = json.RawMessage(`null`) },
-		func(c *Config) { c.Backends["z"].Compatibility.DropFields = []string{"messages"} },
-		func(c *Config) { c.Backends["z"].Compatibility.MetadataValues = "bad" },
-		func(c *Config) { c.Backends["z"].Adapter = "template" },
-		func(c *Config) { c.GatewayAPIKeyEnv = "AIGATE_MISSING_TEST_KEY" },
-		func(c *Config) { c.Backends["z"].HeadersEnv = map[string]string{"X-Key": "AIGATE_MISSING_TEST_KEY"} },
-		func(c *Config) { c.Routing = Policy{Mode: "single", Backend: "missing"} },
-	} {
-		c, _ := parseConfig(data, "config.json")
-		mutate(c)
-		if c.validate() == nil {
-			t.Fatal("invalid config accepted")
-		}
-	}
-	for _, data := range []string{`{}`, `null`, `{"backends":null}`, `{"backends":[]}`, `{"backends":{"a":{},"a":{}}}`} {
-		if _, err := parseConfig([]byte(data), "config.json"); err == nil {
-			t.Fatal("invalid backends accepted")
-		}
 	}
 }

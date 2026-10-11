@@ -56,7 +56,7 @@ func TestDiscoveryResponseEncoding(t *testing.T) {
 			defer u.Close()
 			cfg := fixtureConfig(t, u.URL)
 			if tc.accept != "" {
-				cfg.Backends["api1"].Headers = map[string]string{"Accept-Encoding": tc.accept}
+				cfg.Backend.Headers = map[string]string{"Accept-Encoding": tc.accept}
 			}
 			_, server, _ := serveTest(t, cfg)
 			response, data := request(t, server, "GET", "/v1/models", "", "")
@@ -104,7 +104,7 @@ func TestDiscoveryResponseEncodingFailures(t *testing.T) {
 			}))
 			defer u.Close()
 			cfg := fixtureConfig(t, u.URL)
-			cfg.Backends["api1"].Headers = map[string]string{"Accept-Encoding": "gzip"}
+			cfg.Backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
 			_, server, _ := serveTest(t, cfg)
 			response, data := request(t, server, "POST", "/v1/chat/completions", `{"messages":[{"role":"user","content":"hello"}],"stream":true}`, "")
 			requireError(t, response, data, 503, "model_discovery_failed")
@@ -139,7 +139,7 @@ func TestDiscoveryEncodedBodyClosed(t *testing.T) {
 			if err := cfg.validate(); err != nil {
 				t.Fatal(err)
 			}
-			model, err := newPool(cfg, client).fetchModel(context.Background(), cfg.Backends["api1"])
+			model, err := newPool(cfg, client).fetchModel(context.Background(), cfg.Backend)
 			if (err != nil) != tc.wantError || (!tc.wantError && model != "discovered-model") || closed != 1 {
 				t.Fatalf("model=%q err=%v body closes=%d", model, err, closed)
 			}
@@ -171,7 +171,7 @@ func TestDiscoveryGzipCancelAndTimeout(t *testing.T) {
 			}))
 			defer u.Close()
 			cfg := fixtureConfig(t, u.URL)
-			cfg.Backends["api1"].Headers = map[string]string{"Accept-Encoding": "gzip"}
+			cfg.Backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
 			if !cancelClient {
 				cfg.DiscoveryTimeoutSeconds = 0.05
 			}
@@ -179,7 +179,7 @@ func TestDiscoveryGzipCancelAndTimeout(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan *GatewayError, 1)
-			go func() { _, err := g.pool.discover(ctx, "api1"); done <- err }()
+			go func() { _, err := g.pool.discover(ctx); done <- err }()
 			select {
 			case <-started:
 			case <-time.After(3 * time.Second):
@@ -204,7 +204,7 @@ func TestDiscoveryGzipCancelAndTimeout(t *testing.T) {
 			if !cancelClient {
 				expireModel(g.pool, "api1")
 			}
-			if model, err := g.pool.discover(context.Background(), "api1"); err != nil || model != "recovered" {
+			if model, err := g.pool.discover(context.Background()); err != nil || model != "recovered" {
 				t.Fatalf("gzip discovery did not recover: model=%q err=%v", model, err)
 			}
 		})

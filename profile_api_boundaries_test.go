@@ -173,37 +173,6 @@ func TestProfileAnalysisBudgetsAndCancellation(t *testing.T) {
 	}
 }
 
-func TestGatewayAddressesCanonicalMonotonicAndDurable(t *testing.T) {
-	m := &Management{g: &Gateway{config: &Config{}}, state: ManagedState{}}
-	m.g.config.Management.StateFile = filepath.Join(t.TempDir(), "state.json")
-	m.persist = func(s ManagedState) error { return writeManagedState(m.g.config.Management.StateFile, s) }
-	if _, e := m.registerGatewayAddresses([]string{"HTTP://Example.COM.:80/v1/models", "http://example.com/v1/chat/completions"}); e != nil {
-		t.Fatal(e)
-	}
-	if len(m.state.GatewayAddresses) != 1 || m.state.GatewayAddresses[0] != "http://example.com" {
-		t.Fatal(m.state.GatewayAddresses)
-	}
-	if _, e := m.registerGatewayAddresses(nil); e != nil {
-		t.Fatal(e)
-	}
-	if len(m.state.GatewayAddresses) != 1 {
-		t.Fatal("alias removed")
-	}
-	if _, e := m.registerGatewayAddresses([]string{"ftp://bad"}); e == nil || e.Status != 400 {
-		t.Fatal(e)
-	}
-	if len(m.state.GatewayAddresses) != 1 {
-		t.Fatal("invalid write changed aliases")
-	}
-	m.g.config.Management.StateFile = filepath.Join(t.TempDir(), "missing", "state.json")
-	if _, e := m.registerGatewayAddresses([]string{"http://other"}); e == nil || e.Status != 500 {
-		t.Fatal(e)
-	}
-	if len(m.state.GatewayAddresses) != 1 {
-		t.Fatal("failed persistence changed in-memory state")
-	}
-}
-
 func TestJSONTruthinessAndIdentifiers(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
@@ -221,13 +190,7 @@ func TestJSONTruthinessAndIdentifiers(t *testing.T) {
 	if !validOperationID("ABC_xyz-012") {
 		t.Fatal("valid ID rejected")
 	}
-	if (&ManagementError{Message: "failure"}).Error() != "failure" {
-		t.Fatal("error message")
-	}
 	if (&GatewayError{Message: "failure"}).Error() != "failure" {
 		t.Fatal("gateway error message")
-	}
-	if _, e := loadConfig(filepath.Join(t.TempDir(), "absent")); e == nil {
-		t.Fatal("missing config accepted")
 	}
 }

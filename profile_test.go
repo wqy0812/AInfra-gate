@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func profileFixture(t *testing.T) (*requestProfiler, *Config) {
+func profileFixture(t *testing.T) (*requestProfiler, *RuntimeConfig) {
 	t.Helper()
 	t.Setenv("AIGATE_PROFILE_KEY", "fixture-key")
 	c := fixtureConfig(t, "http://127.0.0.1:1")
@@ -85,7 +85,7 @@ func TestProfileGatewayJSONAndSSE(t *testing.T) {
 func TestProfileBoundedIndexMissingUsageAndAnalysis(t *testing.T) {
 	p, c := profileFixture(t)
 	p.c.MaxIndexEntries = 2
-	backend := c.Backends["api1"]
+	backend := c.Backend
 	_ = profileNow()
 	for i, text := range []string{"a", "b", "a"} {
 		r := p.begin(string(rune('a' + i)))
@@ -137,7 +137,7 @@ func TestProfilePayloadLimitDoesNotRejectBusiness(t *testing.T) {
 	p, c := profileFixture(t)
 	p.c.MaxPayloadBytes = 4
 	r := p.begin("limit")
-	p.input(r, []byte(`{"messages":[]}`), c.Backends["api1"], "api1", "model")
+	p.input(r, []byte(`{"messages":[]}`), c.Backend, "api1", "model")
 	p.end(r, &auditEntry{Outcome: "completed"}, false)
 	if r.quality != "" {
 		t.Fatal(r.quality)
@@ -180,7 +180,7 @@ func TestProfileSlowScrapeDoesNotHoldRequestLock(t *testing.T) {
 }
 func TestProfileRetiredMetricsAndRetention(t *testing.T) {
 	p, c := profileFixture(t)
-	b := c.Backends["api1"]
+	b := c.Backend
 	for i, payload := range []string{`{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"one"}]}`, `{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"two"}]}`, `{"messages":[{"role":"user","content":"same"}],"tools":[{"name":"one"}]}`} {
 		r := p.begin(strconv.Itoa(i))
 		p.input(r, []byte(payload), b, "api1", "model")
@@ -247,11 +247,8 @@ func BenchmarkGatewayProfile(b *testing.B) {
 				}
 			}))
 			defer upstream.Close()
-			raw := encodeJSON(map[string]any{"backends": map[string]any{"fixture": map[string]any{"adapter": "openai", "url": upstream.URL, "models_url": upstream.URL}}, "profile": map[string]any{"enabled": enabled, "directory": b.TempDir()}})
-			c, err := parseConfig(raw, filepath.Join(b.TempDir(), "config.json"))
-			if err != nil {
-				b.Fatal(err)
-			}
+			c := fixtureConfig(b, upstream.URL)
+			c.Profile.Enabled = enabled
 			g, err := newGateway(c, io.Discard)
 			if err != nil {
 				b.Fatal(err)
@@ -425,7 +422,7 @@ func TestProfileNoMessageStructureCollected(t *testing.T) {
 			p.c.MaxPayloadBytes = 4
 		}
 		r := p.begin(strconv.Itoa(i))
-		p.input(r, payload, c.Backends["api1"], "api1", "model")
+		p.input(r, payload, c.Backend, "api1", "model")
 		p.end(r, &auditEntry{Outcome: "completed"}, false)
 	}
 	p.close()
@@ -473,7 +470,7 @@ func TestProfileDiskLimitDefaultAndOverride(t *testing.T) {
 func TestProfileAnalysisAfterRestartWithCoarseFileTime(t *testing.T) {
 	p, c := profileFixture(t)
 	r := p.begin("before-restart")
-	p.input(r, []byte(`{"messages":[{"role":"user","content":"same"}]}`), c.Backends["api1"], "api1", "model")
+	p.input(r, []byte(`{"messages":[{"role":"user","content":"same"}]}`), c.Backend, "api1", "model")
 	p.end(r, &auditEntry{Outcome: "completed"}, false)
 	p.close()
 	files, err := filepath.Glob(filepath.Join(c.Profile.Directory, "events-v2-*.jsonl"))

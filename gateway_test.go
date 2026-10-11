@@ -34,17 +34,15 @@ func (b *lockedBuffer) String() string { b.mu.Lock(); defer b.mu.Unlock(); retur
 const basicBody = `{"messages":[{"role":"user","content":"一二三四五六七八九十秘密尾部"}]}`
 const goodResponse = `{"id":"upstream-id","model":"ignored","choices":[{"index":0,"message":{"role":"assistant","content":"回答"},"finish_reason":"stop"}],"usage":{"total_tokens":20},"extra":9007199254740993}`
 
-func fixtureConfig(t *testing.T, urls ...string) *Config {
+func fixtureConfig(t testing.TB, url string) *RuntimeConfig {
 	t.Helper()
-	backends := map[string]any{}
-	for i, url := range urls {
-		backends[fmt.Sprintf("api%d", i+1)] = map[string]any{"adapter": "openai", "url": url + "/infer", "models_url": url + "/v1/models"}
-	}
-	c, err := parseConfig(encodeJSON(map[string]any{"timeout_seconds": 2, "discovery_timeout_seconds": 1, "routing": Policy{Mode: "single", Backend: "api1"}, "backends": backends}), filepath.Join(t.TempDir(), "config.json"))
+	settings, err := parseRuntimeSettings([]byte(`{"timeout_seconds":2,"discovery_timeout_seconds":1}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return c
+	settings.Profile.Directory = filepath.Join(t.TempDir(), "request-profile")
+	settings.SlowRequests.Directory = filepath.Join(t.TempDir(), "slow-requests")
+	return &RuntimeConfig{RuntimeSettings: settings, RouterID: "api1", Backend: &Backend{Adapter: "openai", URL: url + "/infer", ModelsURL: url + "/v1/models"}}
 }
 
 func upstreamServer(t *testing.T, model string, post http.HandlerFunc) *httptest.Server {
@@ -65,7 +63,7 @@ func upstreamServer(t *testing.T, model string, post http.HandlerFunc) *httptest
 	return s
 }
 
-func serveTest(t *testing.T, c *Config) (*Gateway, *httptest.Server, *lockedBuffer) {
+func serveTest(t *testing.T, c *RuntimeConfig) (*Gateway, *httptest.Server, *lockedBuffer) {
 	t.Helper()
 	logs := &lockedBuffer{}
 	g, err := newGateway(c, logs)
@@ -138,7 +136,7 @@ func TestForwardFieldsAuthAndPrivateAudit(t *testing.T) {
 		_, _ = io.WriteString(w, goodResponse)
 	})
 	c := fixtureConfig(t, u.URL)
-	c.Backends["api1"].HeadersEnv = map[string]string{"X-Key": "UPSTREAM_KEY"}
+	c.Backend.HeadersEnv = map[string]string{"X-Key": "UPSTREAM_KEY"}
 	_, s, logs := serveTest(t, c)
 	body := `{"model":null,"messages":[{"role":"system","content":"system-private"},{"role":"user","content":"一二三四五六七八九十秘密尾部"},{"role":"assistant","content":null,"tool_calls":[{"id":"call1"}]}],"temperature":0.3,"max_tokens":77,"seed":9007199254740993,"patches":{},"result_format":"message"}`
 	response, data := request(t, s, "POST", "/v1/chat/completions", body, "Bearer client-secret")
@@ -171,10 +169,9 @@ func TestForwardFieldsAuthAndPrivateAudit(t *testing.T) {
 func TestValidationAndAuthentication(t *testing.T) {
 	var hits atomic.Int64
 	u := upstreamServer(t, "real", func(w http.ResponseWriter, r *http.Request) { hits.Add(1); _, _ = io.WriteString(w, goodResponse) })
-	t.Setenv("GATEWAY_KEY", "expected")
 	c := fixtureConfig(t, u.URL)
-	c.GatewayAPIKeyEnv = "GATEWAY_KEY"
-	_, s, logs := serveTest(t, c)
+	g, s, logs := serveTest(t, c)
+	g.apiKey = "Bearer expected"
 	for _, path := range []string{"/v1/models", "/v1/chat/completions"} {
 		method := "GET"
 		if strings.Contains(path, "chat") {
@@ -271,7 +268,7 @@ func TestTemplate(t *testing.T) {
 		_, _ = io.WriteString(w, `{"data":[{"answer":"你好"}]}`)
 	})
 	c := fixtureConfig(t, u.URL)
-	b := c.Backends["api1"]
+	b := c.Backend
 	b.Adapter = "template"
 	b.ResponseContentPath = "data.0.answer"
 	b.RequestTemplate = json.RawMessage(`{"engine":{"$ref":"model"},"history":{"$ref":"request.messages"},"question":{"$ref":"question"},"options":{"limit":{"$ref":"request.max_tokens","$default":50}},"fixed":[1,true]}`)
@@ -306,7 +303,7 @@ func TestTemplateMissingFields(t *testing.T) {
 	var posts atomic.Int64
 	u := upstreamServer(t, "real", func(w http.ResponseWriter, r *http.Request) { posts.Add(1); _, _ = io.WriteString(w, `{"data":{}}`) })
 	c := fixtureConfig(t, u.URL)
-	b := c.Backends["api1"]
+	b := c.Backend
 	b.Adapter = "template"
 	b.RequestTemplate = json.RawMessage(`{"x":{"$ref":"request.required"}}`)
 	b.ResponseContentPath = "data.answer"
@@ -362,7 +359,7 @@ func TestGenerationTimeoutAndConnectionFailure(t *testing.T) {
 			c.TimeoutSeconds = 0.08
 			g, s, _ := serveTest(t, c)
 			if mode == "connection" {
-				if _, err := g.pool.discover(context.Background(), "api1"); err != nil {
+				if _, err := g.pool.discover(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				u.Close()
@@ -414,7 +411,7 @@ func testRealLocalFixture(t *testing.T, mode string) {
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	})
 	c := fixtureConfig(t, u.URL)
-	c.Backends["api1"].Compatibility.MetadataValues = mode
+	c.Backend.Compatibility.MetadataValues = mode
 	_, s, _ := serveTest(t, c)
 	r, result := request(t, s, "POST", "/v1/chat/completions", string(data), "")
 	if r.StatusCode != 200 || string(result) != "data: [DONE]\n\n" {
@@ -500,12 +497,12 @@ func TestSSEFlushSwitchAndPassThrough(t *testing.T) {
 	}
 	u1 := upstreamServer(t, "model1", post(true))
 	u2 := upstreamServer(t, "model2", post(false))
-	c := fixtureConfig(t, u1.URL, u2.URL)
-	c.RoutingFile = filepath.Join(t.TempDir(), "routing.json")
-	if err := publishPolicy(c, Policy{Mode: "single", Backend: "api1"}); err != nil {
-		t.Fatal(err)
-	}
-	_, s, logs := serveTest(t, c)
+	c := controlledFixture(t)
+	logs := &lockedBuffer{}
+	c.audit = logs
+	activateV2(t, c, "bind", snapshotV2("api1", u1.URL, 1))
+	s := httptest.NewServer(c)
+	defer s.Close()
 	body := `{"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call1"}]}]}`
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(s.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
@@ -518,9 +515,7 @@ func TestSSEFlushSwitchAndPassThrough(t *testing.T) {
 	if err != nil || line != strings.Split(first, "\n")[0]+"\n" {
 		t.Fatal("first event not immediately forwarded")
 	}
-	if err := publishPolicy(c, Policy{Mode: "single", Backend: "api2"}); err != nil {
-		t.Fatal(err)
-	}
+	activateV2(t, c, "swap", snapshotV2("api2", u2.URL, 2))
 	r, data := request(t, s, "POST", "/v1/chat/completions", body, "")
 	if r.StatusCode != 200 || string(data) != first+tail {
 		t.Fatal("switched stream changed")

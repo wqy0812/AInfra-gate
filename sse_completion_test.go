@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -119,8 +118,7 @@ func TestSSETerminalOrderBusinessAndProbe(t *testing.T) {
 
 func TestSSETerminalOrderWarmup(t *testing.T) {
 	c := fixtureConfig(t, "http://backend.invalid")
-	c.Management = ManagementConfig{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}
-	c.Management.defaults(c, "/tmp/config.json")
+
 	g, err := newGateway(c, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -136,108 +134,90 @@ func TestSSETerminalOrderWarmup(t *testing.T) {
 	for _, data := range []string{done + first, first + done + first,
 		first + completionEvent(0, map[string]any{"content": "late"}, nil) + done, first + done + done} {
 		wire = data
-		if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err == nil {
+		if _, _, err := probeRuntime(context.Background(), g, 120, "real", payload); err == nil {
 			t.Fatal("warmup accepted terminal-order violation")
 		}
 	}
 	wire = first + "data: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\n" + done + ": heartbeat\n\n"
-	if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err != nil {
+	if _, _, err := probeRuntime(context.Background(), g, 120, "real", payload); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestSSECompletionGatewayModes(t *testing.T) {
 	for _, profiled := range []bool{false, true} {
-		for _, managed := range []bool{false, true} {
-			for _, legacyAlias := range []bool{false, true} {
-				t.Run(fmt.Sprintf("profile=%t/managed=%t/legacyAlias=%t", profiled, managed, legacyAlias), func(t *testing.T) {
-					t.Setenv("AIGATE_PROFILE_KEY", "fixture-key")
-					c := fixtureConfig(t, "http://backend.invalid")
-					if legacyAlias {
-						c = withLegacyModelAlias(t, c)
-					}
-					if profiled {
-						c.Profile.Enabled = true
-						c.Profile.Directory = t.TempDir()
-					}
-					if managed {
-						c.Management = ManagementConfig{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}
-						c.Management.defaults(c, "/tmp/config.json")
-					}
-					var logs bytes.Buffer
-					g, err := newGateway(c, &logs)
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer g.Close()
-					upstream := ""
-					expectedN := 1
-					g.client.Transport = generationTransport(func(r *http.Request) (*http.Response, error) {
-						if r.Method == "GET" {
-							return generationResponse(200, "application/json", `{"data":[{"id":"real"}]}`), nil
-						}
-						var body map[string]any
-						if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-							t.Fatal(err)
-						}
-						if body["n"] != float64(expectedN) {
-							t.Fatalf("effective n=%v want=%d", body["n"], expectedN)
-						}
-						return generationResponse(200, "text/event-stream", upstream), nil
-					})
-					send := func(n int, data, outcome string) {
-						t.Helper()
-						upstream = data
-						expectedN = n
-						logs.Reset()
-						r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"messages":[{"role":"user","content":"test"}],"stream":true,"n":%d}`, n)))
-						w := httptest.NewRecorder()
-						g.ServeHTTP(w, r)
-						if w.Code != 200 {
-							t.Fatalf("status=%d", w.Code)
-						}
-						if w.Body.String() != data {
-							t.Fatal("forwarding changed")
-						}
-						if !strings.Contains(logs.String(), `"outcome":"`+outcome+`"`) {
-							t.Fatalf("wrong audit: %s", logs.String())
-						}
-					}
-					empty := completionEvent(nil, map[string]any{"content": ""}, "stop") + "data: [DONE]\n\n"
-					for i := 0; i < 3; i++ {
-						send(1, empty, "completed")
-					}
-					if managed && g.management.status().Failures != 0 {
-						t.Fatal("empty completions counted toward rollback")
-					}
-					if profiled {
-						requireGenerationCount(t, g.profile, true, "completed", "", "200", 3)
-						if strings.Contains(generationMetrics(g.profile), "aigate_first_increment_seconds_count{") {
-							t.Fatal("invented first token")
-						}
-						if !strings.Contains(generationMetrics(g.profile), `outcome="completed",request_scope="all"} 3`) {
-							t.Fatal("profile outcome disagrees")
-						}
-					}
-					partial := completionEvent(0, map[string]any{"content": "one"}, "stop") + completionEvent(1, map[string]any{"content": "partial"}, nil) + "data: [DONE]\n\n"
-					send(2, partial, "upstream_protocol_error")
-					if managed && g.management.status().Failures != 1 {
-						t.Fatal("incomplete stream not counted toward rollback")
-					}
-					if profiled {
-						requireGenerationCount(t, g.profile, true, "error", "stream_incomplete", "200", 1)
-					}
-				})
+		t.Run(fmt.Sprintf("profile=%t", profiled), func(t *testing.T) {
+			t.Setenv("AIGATE_PROFILE_KEY", "fixture-key")
+			c := fixtureConfig(t, "http://backend.invalid")
+			if profiled {
+				c.Profile.Enabled = true
+				c.Profile.Directory = t.TempDir()
 			}
-		}
+			var logs bytes.Buffer
+			g, err := newGateway(c, &logs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer g.Close()
+			upstream := ""
+			expectedN := 1
+			g.client.Transport = generationTransport(func(r *http.Request) (*http.Response, error) {
+				if r.Method == "GET" {
+					return generationResponse(200, "application/json", `{"data":[{"id":"real"}]}`), nil
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["n"] != float64(expectedN) {
+					t.Fatalf("effective n=%v want=%d", body["n"], expectedN)
+				}
+				return generationResponse(200, "text/event-stream", upstream), nil
+			})
+			send := func(n int, data, outcome string) {
+				t.Helper()
+				upstream = data
+				expectedN = n
+				logs.Reset()
+				r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"messages":[{"role":"user","content":"test"}],"stream":true,"n":%d}`, n)))
+				w := httptest.NewRecorder()
+				g.ServeHTTP(w, r)
+				if w.Code != 200 {
+					t.Fatalf("status=%d", w.Code)
+				}
+				if w.Body.String() != data {
+					t.Fatal("forwarding changed")
+				}
+				if !strings.Contains(logs.String(), `"outcome":"`+outcome+`"`) {
+					t.Fatalf("wrong audit: %s", logs.String())
+				}
+			}
+			empty := completionEvent(nil, map[string]any{"content": ""}, "stop") + "data: [DONE]\n\n"
+			for i := 0; i < 3; i++ {
+				send(1, empty, "completed")
+			}
+			if profiled {
+				requireGenerationCount(t, g.profile, true, "completed", "", "200", 3)
+				if strings.Contains(generationMetrics(g.profile), "aigate_first_increment_seconds_count{") {
+					t.Fatal("invented first token")
+				}
+				if !strings.Contains(generationMetrics(g.profile), `outcome="completed",request_scope="all"} 3`) {
+					t.Fatal("profile outcome disagrees")
+				}
+			}
+			partial := completionEvent(0, map[string]any{"content": "one"}, "stop") + completionEvent(1, map[string]any{"content": "partial"}, nil) + "data: [DONE]\n\n"
+			send(2, partial, "upstream_protocol_error")
+			if profiled {
+				requireGenerationCount(t, g.profile, true, "error", "stream_incomplete", "200", 1)
+			}
+		})
 	}
 }
 
 func TestSSEEffectiveOverridesAndProbe(t *testing.T) {
 	c := fixtureConfig(t, "http://backend.invalid")
-	c.Management = ManagementConfig{Enabled: true, StateFile: filepath.Join(t.TempDir(), "state.json")}
-	c.Management.defaults(c, "/tmp/config.json")
-	c.Backends["api1"].Overrides = map[string]json.RawMessage{"n": json.RawMessage("2")}
+
+	c.Backend.Overrides = map[string]json.RawMessage{"n": json.RawMessage("2")}
 	var logs bytes.Buffer
 	g, err := newGateway(c, &logs)
 	if err != nil {
@@ -262,15 +242,15 @@ func TestSSEEffectiveOverridesAndProbe(t *testing.T) {
 		t.Fatal("business observer ignored override")
 	}
 	payload := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "probe"}}, "stream": true}
-	if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err == nil {
+	if _, _, err := probeRuntime(context.Background(), g, 120, "real", payload); err == nil {
 		t.Fatal("probe ignored override")
 	}
 	data = completionEvent(0, map[string]any{"content": ""}, "stop") + completionEvent(1, map[string]any{"content": ""}, "stop") + "data: [DONE]\n\n"
-	if _, observer, err := g.management.probe(context.Background(), "api1", "real", false, payload); err == nil || !observer.valid() {
+	if _, observer, err := probeRuntime(context.Background(), g, 120, "real", payload); err == nil || !observer.valid() {
 		t.Fatal("probe accepted complete empty output or rejected protocol completeness")
 	}
 	data = completionEvent(0, map[string]any{"content": "one"}, "stop") + completionEvent(1, map[string]any{"content": "two"}, "stop") + "data: [DONE]\n\n"
-	if _, _, err := g.management.probe(context.Background(), "api1", "real", false, payload); err != nil {
+	if _, _, err := probeRuntime(context.Background(), g, 120, "real", payload); err != nil {
 		t.Fatal(err)
 	}
 }

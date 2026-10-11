@@ -250,14 +250,14 @@ func TestGenerationExcludesDiscoveryAndProbes(t *testing.T) {
 	}
 	g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader("{")))
 	body, _ := parseChat([]byte(basicBody))
-	_, err := g.generate(context.Background(), body, g.config.Backends["api1"], "real")
+	_, err := g.generate(context.Background(), body, g.config.Backend, "real")
 	if err == nil || err.Status != 502 || err.UpstreamStatus != 503 {
 		t.Fatal("probe behavior changed")
 	}
 	g.client.Transport = generationTransport(func(r *http.Request) (*http.Response, error) {
 		return generationResponse(401, "text/plain", "private"), nil
 	})
-	cache := g.pool.snapshot("api1").cache
+	cache := g.pool.runtime.cache
 	cache.mu.Lock()
 	cache.model = ""
 	cache.mu.Unlock()

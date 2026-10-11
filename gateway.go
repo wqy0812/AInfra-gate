@@ -13,33 +13,26 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 type Gateway struct {
-	config     *Config
-	pool       *BackendPool
-	client     *http.Client
-	transport  *http.Transport
-	audit      *log.Logger
-	apiKey     string
-	buffers    sync.Pool
-	management *Management
-	profile    *requestProfiler
-	slow       *slowRequestStore
-	now        func() time.Time
-	incidents  *incidentStore // owned by ControlledGateway, shared across route snapshots
+	config    *RuntimeConfig
+	pool      *BackendPool
+	client    *http.Client
+	transport *http.Transport
+	audit     *log.Logger
+	apiKey    string
+	buffers   sync.Pool
+	profile   *requestProfiler
+	slow      *slowRequestStore
+	now       func() time.Time
+	incidents *incidentStore // owned by ControlledGateway, shared across route snapshots
 }
 
-func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
-	effective, err := effectiveManagedConfig(c)
-	if err != nil {
-		return nil, err
-	}
-	c = effective
+func newGateway(c *RuntimeConfig, audit io.Writer) (*Gateway, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
@@ -55,23 +48,9 @@ func newGateway(c *Config, audit io.Writer) (*Gateway, error) {
 		audit = io.Discard
 	}
 	g := &Gateway{config: c, client: client, transport: transport, audit: log.New(audit, "", 0), now: time.Now}
-	if c.GatewayAPIKeyEnv != "" {
-		g.apiKey = "Bearer " + os.Getenv(c.GatewayAPIKeyEnv)
-	}
 	g.buffers.New = func() any { b := make([]byte, 32*1024); return &b }
 	g.pool = newPool(c, client)
-	if _, err := g.pool.policy(); err != nil {
-		transport.CloseIdleConnections()
-		return nil, err
-	}
-	if c.Management.Enabled {
-		var err error
-		g.management, err = newManagement(g)
-		if err != nil {
-			transport.CloseIdleConnections()
-			return nil, err
-		}
-	}
+	var err error
 	if c.Profile.Enabled {
 		g.profile, err = newRequestProfiler(c.Profile)
 		if err != nil {
@@ -95,9 +74,6 @@ func (g *Gateway) Close() {
 	}
 	if g.profile != nil {
 		g.profile.close()
-	}
-	if g.management != nil {
-		g.management.close()
 	}
 	g.transport.CloseIdleConnections()
 }
@@ -220,23 +196,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/v1/models" {
-		var ids []string
-		var err *GatewayError
-		if g.management != nil {
-			var lease *backendLease
-			lease, err = g.management.acquire("", true, false, false)
-			if err == nil {
-				defer lease.release("ignored")
-				var model string
-				model, err = g.pool.discoverRuntime(r.Context(), lease.runtime)
-				g.management.noteModel(lease.name, model)
-				if err == nil {
-					ids = []string{model}
-				}
-			}
-		} else {
-			ids, err = g.pool.models(r.Context())
-		}
+		ids, err := g.pool.models(r.Context())
 		abandonRequestBody(w, r)
 		if err != nil {
 			sendError(w, entry, err)
@@ -324,41 +284,8 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
 		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
 	}
-	var name, model string
 	entry.diagnostic.stage("routing_discovery")
-	var backend *Backend
-	outcome := "ignored"
-	if g.management != nil {
-		var lease *backendLease
-		lease, err = g.management.acquireRequest(r.Header.Get("X-Code-Eval-Token"), body.stream)
-		if err == nil {
-			defer func() {
-				if r.Context().Err() != nil {
-					outcome = "client_cancelled"
-				}
-				lease.release(outcome)
-			}()
-			name = lease.name
-			entry.RouteVersion = lease.version
-			if lease.test {
-				entry.TestTask = g.management.status().TestOccupancy.TaskID
-			}
-			w.Header().Set("X-Aigate-Backend", name)
-			w.Header().Set("X-Aigate-Route-Version", fmt.Sprint(lease.version))
-			entry.profile.liveBackend(name)
-			backend = lease.runtime.backend
-			model, err = g.pool.discoverRuntime(r.Context(), lease.runtime)
-			g.management.noteModel(name, model)
-			if err == nil && lease.test && model != g.management.status().TestOccupancy.Model {
-				err = fault(409, "test_model_changed", "实际模型与测试快照不一致")
-			}
-			if err != nil {
-				outcome = "backend_failure"
-			}
-		}
-	} else {
-		name, backend, model, err = g.pool.choose(r.Context())
-	}
+	name, backend, model, err := g.pool.choose(r.Context())
 	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok && err == nil && meta.model != "" && meta.model != model {
 		err = fault(409, "test_model_changed", "实际模型与测试快照不一致")
 	}
@@ -400,26 +327,16 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 				state.fail("connection_error")
 			}
 		}
-		if err.Status >= 500 || err.Status == 429 {
-			outcome = "backend_failure"
-		}
-		if err.UpstreamStatus >= 400 && err.UpstreamStatus < 500 && err.UpstreamStatus != 429 {
-			outcome = "upstream_rejected"
-		}
 		sendError(w, entry, err)
 		return
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		outcome = "backend_failure"
-		if response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != 429 {
-			outcome = "upstream_rejected"
-		}
 		g.forwardGenerationError(w, r, response, ctx, entry)
 		return
 	}
 	if body.stream {
-		outcome = g.stream(w, r, response, ctx, entry)
+		g.stream(w, r, response, ctx, entry)
 		return
 	}
 	entry.profile.liveStage("reading_response")
@@ -428,7 +345,6 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	if readErr != nil {
 		entry.diagnostic.failure("upstream_body_read", readErr, ctx, r.Context())
 		state.transportError(readErr, ctx, r.Context(), "response_read_error")
-		outcome = "backend_failure"
 		sendError(w, entry, upstreamError(readErr, ctx))
 		return
 	}
@@ -440,7 +356,6 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		result, err = normalizeResponse(data, backend, model, entry.RequestID)
 		if err != nil {
 			state.fail("protocol_error")
-			outcome = "backend_failure"
 			sendError(w, entry, err)
 			return
 		}
@@ -469,11 +384,8 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	} else {
 		sendJSON(w, entry, 200, result)
 	}
-	if entry.Outcome == "completed" {
-		outcome = "success"
-	} else {
+	if entry.Outcome != "completed" {
 		state.writeFailure(ctx, r.Context())
-		outcome = "client_failure"
 	}
 }
 

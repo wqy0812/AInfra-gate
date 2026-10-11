@@ -168,7 +168,7 @@ func TestTemplateProfileRetainsUpstreamUsage(t *testing.T) {
 	g := generationGateway(t, func(r *http.Request) (*http.Response, error) {
 		return generationResponse(200, "application/json", `{"answer":"ok","usage":{"prompt_tokens":17,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5},"private":"not-a-counter"}}`), nil
 	})
-	b := g.config.Backends["api1"]
+	b := g.config.Backend
 	b.Adapter = "template"
 	b.RequestTemplate = json.RawMessage(`{"messages":{"$ref":"request.messages"}}`)
 	b.ResponseContentPath = "answer"

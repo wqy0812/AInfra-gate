@@ -8,43 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-func TestBackendModelConfig(t *testing.T) {
-	backend := `{"adapter":"openai","url":"http://localhost/infer","models_url":"http://localhost/models"}`
-	for _, tc := range []struct {
-		name, fields, backends string
-		valid                  bool
-	}{
-		{"sole default", "", `"a":` + backend, true},
-		{"multiple require target", "", `"a":` + backend + `,"b":` + backend, false},
-		{"file supplies target", `"routing_file":"routing.json",`, `"a":` + backend + `,"b":` + backend, true},
-		{"explicit empty target", `"routing":{"mode":"single"},`, `"a":` + backend, false},
-		{"legacy", `"routing":{"mode":"round_robin"},`, `"a":` + backend, false},
-		{"legacy with file", `"routing_file":"routing.json","routing":{"mode":"round_robin"},`, `"a":` + backend, false},
-		{"alias", `"public_model_name":"统一模型",`, `"a":` + backend, true},
-		{"disabled", `"public_model_name":"",`, `"a":` + backend, true},
-		{"space", `"public_model_name":"  ",`, `"a":` + backend, true},
-		{"trim", `"public_model_name":"alias ",`, `"a":` + backend, true},
-		{"null", `"public_model_name":null,`, `"a":` + backend, true},
-		{"number", `"public_model_name":42,`, `"a":` + backend, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c, err := parseConfig([]byte(`{`+tc.fields+`"backends":{`+tc.backends+`}}`), "config.json")
-			if err == nil {
-				err = c.validate()
-			}
-			if (err == nil) != tc.valid {
-				t.Fatalf("valid=%v: %v", tc.valid, err)
-			}
-		})
-	}
-}
 
 func TestBackendModelABSwitchAndAttribution(t *testing.T) {
 	makeBackend := func(model string) string {
@@ -57,17 +25,18 @@ func TestBackendModelABSwitchAndAttribution(t *testing.T) {
 			io.WriteString(w, strings.ReplaceAll(goodResponse, `"ignored"`, string(encodeJSON(model))))
 		}).URL
 	}
-	c := fixtureConfig(t, makeBackend("real-a"), makeBackend("real-b"))
-	c = withLegacyModelAlias(t, c)
-	c.RoutingFile = filepath.Join(t.TempDir(), "routing.json")
-	if err := publishPolicy(c, Policy{Mode: "single", Backend: "api1"}); err != nil {
-		t.Fatal(err)
-	}
-	_, server, logs := serveTest(t, c)
-	for _, backend := range []string{"api1", "api2", "api1"} {
-		if err := publishPolicy(c, Policy{Mode: "single", Backend: backend}); err != nil {
-			t.Fatal(err)
+	c := controlledFixture(t)
+	logs := &lockedBuffer{}
+	c.audit = logs
+	one, two := makeBackend("real-a"), makeBackend("real-b")
+	server := httptest.NewServer(c)
+	defer server.Close()
+	for i, backend := range []string{"api1", "api2", "api1"} {
+		target := one
+		if backend == "api2" {
+			target = two
 		}
+		activateV2(t, c, fmt.Sprintf("swap%d", i), snapshotV2(backend, target, uint64(i+1)))
 		r, models := request(t, server, "GET", "/v1/models", "", "")
 		actual := map[string]string{"api1": "real-a", "api2": "real-b"}[backend]
 		if r.StatusCode != 200 || !bytes.Contains(models, []byte(`"id":`+string(encodeJSON(actual)))) {
@@ -104,7 +73,7 @@ func TestBackendModelLeavesUnrecognizedResponsesUntouched(t *testing.T) {
 				_, _ = io.WriteString(w, body)
 			})
 			c := fixtureConfig(t, u.URL)
-			c = withLegacyModelAlias(t, c)
+
 			_, s, _ := serveTest(t, c)
 			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
 			if r.StatusCode != 200 || string(data) != body {
@@ -132,7 +101,7 @@ func TestBackendModelDoesNotAddMissingModel(t *testing.T) {
 				_, _ = io.WriteString(w, body)
 			})
 			c := fixtureConfig(t, u.URL)
-			c = withLegacyModelAlias(t, c)
+
 			_, s, _ := serveTest(t, c)
 			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")
 			if r.StatusCode != 200 {
@@ -142,32 +111,6 @@ func TestBackendModelDoesNotAddMissingModel(t *testing.T) {
 				t.Fatalf("response changed: %s", data)
 			}
 		})
-	}
-}
-
-func TestBackendModelManagedSwitch(t *testing.T) {
-	one, two := newProtocolBackend(t), newProtocolBackend(t)
-	c := managedConfig(t, one, two)
-	c = withLegacyModelAlias(t, c)
-	g, server, _ := serveTest(t, c)
-	for _, target := range []string{"api2", "api1"} {
-		op := waitOp(t, g.management, submitOp(t, g.management, "switch", target).ID)
-		if op.Outcome != "completed" {
-			t.Fatalf("switch: %+v", op)
-		}
-		r, data := request(t, server, "POST", "/v1/chat/completions", `{"messages":[{"role":"user"}],"stream":true}`, "")
-		if r.StatusCode != 200 || bytes.Contains(data, []byte(`"model":`)) || !bytes.Contains(data, []byte("[DONE]")) {
-			t.Fatalf("stream: %s", data)
-		}
-	}
-	for _, p := range []*protocolBackend{one, two} {
-		p.mu.Lock()
-		for _, model := range p.models {
-			if model != "local-protocol-model" {
-				t.Error("alias changed warmup or business model")
-			}
-		}
-		p.mu.Unlock()
 	}
 }
 
@@ -182,8 +125,8 @@ func TestBackendModelTemplateAndDiscoveryFailure(t *testing.T) {
 			io.WriteString(w, `{"answer":"hello"}`)
 		})
 		c := fixtureConfig(t, u.URL)
-		c = withLegacyModelAlias(t, c)
-		b := c.Backends["api1"]
+
+		b := c.Backend
 		b.Adapter = "template"
 		b.RequestTemplate = json.RawMessage(`{"engine":{"$ref":"model"}}`)
 		b.ResponseContentPath = "answer"
@@ -196,8 +139,8 @@ func TestBackendModelTemplateAndDiscoveryFailure(t *testing.T) {
 	t.Run("discovery required", func(t *testing.T) {
 		u := upstreamServer(t, "actual", nil)
 		c := fixtureConfig(t, u.URL)
-		c = withLegacyModelAlias(t, c)
-		c.Backends["api1"].PreferredModel = new(string)
+
+		c.Backend.PreferredModel = new(string)
 		_, server, _ := serveTest(t, c)
 		r, data := request(t, server, "GET", "/v1/models", "", "")
 		requireError(t, r, data, 503, "model_discovery_failed")
@@ -221,7 +164,7 @@ func TestBackendModelStreamFramingAndFields(t *testing.T) {
 	input := ": heartbeat\r\n\r\nevent: message\r\nid: 7\r\nretry: 1000\r\ndata: {\"model\":\"real\",\r\ndata: \"choices\":[{\"delta\":{\"content\":\"real\"},\"finish_reason\":\"stop\"}],\"large\":9007199254740993}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"total_tokens\":8}}\r\rdata: [DONE]\n\n"
 	for _, chunk := range []int{1, 2, 17, len(input)} {
 		t.Run(fmt.Sprint(chunk), func(t *testing.T) {
-			c := withLegacyModelAlias(t, fixtureConfig(t, "http://backend.invalid"))
+			c := fixtureConfig(t, "http://backend.invalid")
 			g, err := newGateway(c, io.Discard)
 			if err != nil {
 				t.Fatal(err)
@@ -260,7 +203,7 @@ func TestBackendModelStreamFailures(t *testing.T) {
 				io.WriteString(w, tc.stream)
 			})
 			c := fixtureConfig(t, u.URL)
-			c = withLegacyModelAlias(t, c)
+
 			_, server, _ := serveTest(t, c)
 			r, data := request(t, server, "POST", "/v1/chat/completions", `{"messages":[{"role":"user"}],"stream":true}`, "")
 			if r.StatusCode != 200 {
@@ -294,13 +237,10 @@ func TestBackendModelLiveStreamSwitchAndCancel(t *testing.T) {
 			two := upstreamServer(t, "real-b", func(w http.ResponseWriter, _ *http.Request) {
 				io.WriteString(w, strings.ReplaceAll(goodResponse, `"ignored"`, `"real-b"`))
 			})
-			c := fixtureConfig(t, one.URL, two.URL)
-			c = withLegacyModelAlias(t, c)
-			c.RoutingFile = filepath.Join(t.TempDir(), "routing.json")
-			if err := publishPolicy(c, Policy{Mode: "single", Backend: "api1"}); err != nil {
-				t.Fatal(err)
-			}
-			_, server, _ := serveTest(t, c)
+			c := controlledFixture(t)
+			activateV2(t, c, "bind", snapshotV2("api1", one.URL, 1))
+			server := httptest.NewServer(c)
+			defer server.Close()
 			client := &http.Client{Timeout: 3 * time.Second}
 			resp, err := client.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[{"role":"user"}],"stream":true}`))
 			if err != nil {
@@ -312,9 +252,7 @@ func TestBackendModelLiveStreamSwitchAndCancel(t *testing.T) {
 			if err != nil || !strings.Contains(line, `"model":"real-a"`) {
 				t.Fatalf("first event delayed or wrong: %s %v", line, err)
 			}
-			if err := publishPolicy(c, Policy{Mode: "single", Backend: "api2"}); err != nil {
-				t.Fatal(err)
-			}
+			activateV2(t, c, "swap", snapshotV2("api2", two.URL, 2))
 			r, data := request(t, server, "POST", "/v1/chat/completions", basicBody, "")
 			if r.StatusCode != 200 || !bytes.Contains(data, []byte(`"model":"real-b"`)) {
 				t.Fatal("new route failed")
@@ -344,16 +282,3 @@ func TestBackendModelLiveStreamSwitchAndCancel(t *testing.T) {
 }
 
 // Exercise the actual legacy config parser instead of setting a retired field.
-func withLegacyModelAlias(t *testing.T, c *Config) *Config {
-	t.Helper()
-	var fields rawObject
-	if err := json.Unmarshal(encodeJSON(c), &fields); err != nil {
-		t.Fatal(err)
-	}
-	fields["public_model_name"] = encodeJSON("retired-alias")
-	next, err := parseConfig(encodeJSON(fields), "config.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return next
-}

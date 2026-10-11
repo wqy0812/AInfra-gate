@@ -9,6 +9,36 @@ import (
 	"time"
 )
 
+// WarmupPolicy is the control v2 validation payload, independent of routing
+// and persistence. ControlledGateway owns the probe's lifetime and accounting.
+type WarmupPolicy struct {
+	Rounds         int     `json:"rounds"`
+	StepSeconds    float64 `json:"step_seconds"`
+	TimeoutSeconds float64 `json:"timeout_seconds"`
+	MaxTokens      int     `json:"max_tokens"`
+}
+
+func (p *WarmupPolicy) defaults() {
+	if p.Rounds == 0 {
+		p.Rounds = 2
+	}
+	if p.StepSeconds == 0 {
+		p.StepSeconds = 120
+	}
+	if p.TimeoutSeconds == 0 {
+		p.TimeoutSeconds = 900
+	}
+	if p.MaxTokens == 0 {
+		p.MaxTokens = 1024
+	}
+}
+func (p WarmupPolicy) validate() error {
+	if p.Rounds < 1 || p.Rounds > 20 || p.StepSeconds <= 0 || p.TimeoutSeconds <= 0 || p.MaxTokens < 1 {
+		return fmt.Errorf("invalid validation policy")
+	}
+	return nil
+}
+
 type WarmupStep struct {
 	Round        int             `json:"round"`
 	Name         string          `json:"name"`
@@ -28,41 +58,28 @@ type WarmupReport struct {
 	Steps      []WarmupStep `json:"steps"`
 }
 
-func (m *Management) warmup(parent context.Context, name string, restore bool, progress func(*WarmupReport) error) (*WarmupReport, error) {
-	cfg := m.g.config.Management
-	ctx, cancel := context.WithTimeout(parent, seconds(cfg.WarmupTimeoutSeconds))
+func validateControlledRuntime(parent context.Context, g *Gateway, cfg WarmupPolicy) (*WarmupReport, error) {
+	ctx, cancel := context.WithTimeout(parent, seconds(cfg.TimeoutSeconds))
 	defer cancel()
 	r := &WarmupReport{Fresh: true, StartedAt: time.Now(), Steps: []WarmupStep{}}
 	defer func() { now := time.Now(); r.FinishedAt = &now }()
-	if err := progress(r); err != nil {
-		return r, err
-	}
-	lease, err := m.acquire(name, true, false, restore)
-	if err != nil {
-		return r, err
-	}
 	started := time.Now()
-	model, fetchErr := m.g.pool.fetchModel(ctx, lease.runtime.backend)
-	lease.release("ignored")
+	model, fetchErr := g.pool.fetchModel(ctx, g.pool.runtime.backend)
 	step := WarmupStep{Name: "discovery", Passed: fetchErr == nil, DurationMS: float64(time.Since(started).Microseconds()) / 1000}
 	if fetchErr != nil {
 		step.Error = "目标后端模型发现失败"
 	}
 	r.Model = model
-	m.noteModel(name, model)
 	r.Steps = append(r.Steps, step)
-	if err := progress(r); err != nil {
-		return r, err
-	}
 	if fetchErr != nil {
 		return r, fmt.Errorf("目标后端模型发现失败")
 	}
-	for round := 1; round <= cfg.WarmupRounds; round++ {
+	for round := 1; round <= cfg.Rounds; round++ {
 		marker := "aigate-echo-" + randomID()[:8]
 		tool := map[string]any{"type": "function", "function": map[string]any{"name": "aigate_echo", "description": "Return the given value unchanged.", "parameters": map[string]any{"type": "object", "properties": map[string]any{"value": map[string]any{"type": "string"}}, "required": []string{"value"}, "additionalProperties": false}}}
 		var toolMessages []any
 		for _, kind := range []string{"json", "sse", "tool_call", "tool_result"} {
-			body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "Reply with a short greeting."}}, "max_tokens": cfg.WarmupMaxTokens, "stream": kind == "sse" || kind == "tool_call", "metadata": map[string]any{"mode": "gateway_warmup", "workspace": map[string]any{"purpose": "protocol_validation"}}}
+			body := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "Reply with a short greeting."}}, "max_tokens": cfg.MaxTokens, "stream": kind == "sse" || kind == "tool_call", "metadata": map[string]any{"mode": "gateway_warmup", "workspace": map[string]any{"purpose": "protocol_validation"}}}
 			if body["stream"] == true {
 				body["stream_options"] = map[string]any{"include_usage": true}
 			}
@@ -77,7 +94,7 @@ func (m *Management) warmup(parent context.Context, name string, restore bool, p
 				body["tools"] = []any{tool}
 				body["tool_choice"] = "none"
 			}
-			step, observed, callErr := m.probe(ctx, name, model, restore, body)
+			step, observed, callErr := probeRuntime(ctx, g, cfg.StepSeconds, model, body)
 			step.Round, step.Name = round, kind
 			if callErr == nil && kind == "tool_call" {
 				v := observed.Tools[0]
@@ -96,9 +113,6 @@ func (m *Management) warmup(parent context.Context, name string, restore bool, p
 				step.Error = callErr.Error()
 			}
 			r.Steps = append(r.Steps, step)
-			if err := progress(r); err != nil {
-				return r, err
-			}
 			if callErr != nil {
 				return r, callErr
 			}
@@ -106,33 +120,28 @@ func (m *Management) warmup(parent context.Context, name string, restore bool, p
 	}
 	r.Passed = true
 	// Update only an idle cache: a concurrent normal discovery owns its own result.
-	cache := lease.runtime.cache
+	cache := g.pool.runtime.cache
 	cache.mu.Lock()
 	if cache.inflight == nil {
 		cache.model = model
-		cache.expires = time.Now().Add(seconds(m.g.config.ModelCacheSeconds))
+		cache.expires = time.Now().Add(seconds(g.config.ModelCacheSeconds))
 	}
 	cache.mu.Unlock()
 	return r, nil
 }
 
-func (m *Management) probe(parent context.Context, name, model string, restore bool, payload map[string]any) (WarmupStep, *sseObserver, error) {
+func probeRuntime(parent context.Context, g *Gateway, stepSeconds float64, model string, payload map[string]any) (WarmupStep, *sseObserver, error) {
 	step := WarmupStep{}
 	started := time.Now()
 	observer := newSSEObserver(true)
-	ctx, cancel := context.WithTimeout(parent, seconds(m.g.config.Management.WarmupStepSeconds))
+	ctx, cancel := context.WithTimeout(parent, seconds(stepSeconds))
 	defer cancel()
 	ctx = context.WithValue(ctx, sseObserverContextKey{}, observer)
-	lease, err := m.acquire(name, true, false, restore)
-	if err != nil {
-		return step, observer, err
-	}
-	defer lease.release("ignored")
 	body, err := parseChat(encodeJSON(payload))
 	if err != nil {
 		return step, observer, err
 	}
-	response, err := m.g.generate(ctx, body, lease.runtime.backend, model)
+	response, err := g.generate(ctx, body, g.pool.runtime.backend, model)
 	if err != nil {
 		return step, observer, fmt.Errorf("预热生成失败: %s", err.Message)
 	}
@@ -166,7 +175,7 @@ func (m *Management) probe(parent context.Context, name, model string, restore b
 		if readErr != nil || len(data) > maxSSEEvent {
 			return finish(fmt.Errorf("预热响应读取失败或超过上限"))
 		}
-		normalized, err := normalizeResponse(data, lease.runtime.backend, model, "")
+		normalized, err := normalizeResponse(data, g.pool.runtime.backend, model, "")
 		if err != nil {
 			return finish(fmt.Errorf("%s", err.Message))
 		}

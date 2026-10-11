@@ -5,7 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 )
 
@@ -27,11 +26,7 @@ func (*diagnosticBenchBody) Close() error { return nil }
 // Deliberately excludes network/model latency to expose forwarding/observation
 // cost. This same benchmark can run unmodified on the pre-change revision.
 func BenchmarkGatewayDiagnosticStream(b *testing.B) {
-	raw := encodeJSON(map[string]any{"backends": map[string]any{"fixture": map[string]any{"adapter": "openai", "url": "http://backend.invalid/infer", "models_url": "http://backend.invalid/v1/models"}}})
-	c, err := parseConfig(raw, filepath.Join(b.TempDir(), "config.json"))
-	if err != nil {
-		b.Fatal(err)
-	}
+	c := fixtureConfig(b, "http://backend.invalid")
 	g, err := newGateway(c, io.Discard)
 	if err != nil {
 		b.Fatal(err)
