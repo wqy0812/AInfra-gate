@@ -77,7 +77,7 @@ sum by (backend, model) (
 )
 ```
 
-完整接口、状态机、迁移和验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。历史配置与 CLI 文档保存于 [v1 历史归档](docs/archive/v1/README.md)，不可用于启动 v2。
+完整接口、状态机、迁移和验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。旧版配置、CLI 和设计方案通过 [Git 历史查阅](docs/archive/README.md)，不可用于启动 v2。
 
 ### 流停顿方向
 
