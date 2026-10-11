@@ -16,6 +16,53 @@ func profileAPIFixture() *requestProfiler {
 	return &requestProfiler{c: ProfileConfig{APIKey: "fixture-key"}, started: time.Now(), oldest: now - 120, lastWrite: now - 1,
 		queue: make(chan []byte, 4), work: make(chan string, 1), jobs: map[string]*profileJob{}, active: map[uint64]profileLiveRequest{}}
 }
+
+func TestProfileAnalysisSkipsUnknownEventKinds(t *testing.T) {
+	p := profileAPIFixture()
+	stamp := profileNow() - 10
+	path := filepath.Join(t.TempDir(), "events-v2-test.jsonl")
+	var data []byte
+	for i, kind := range []string{"", "unknown", "start", "end"} {
+		id := "valid"
+		if i < 2 {
+			id = kind
+		}
+		event := profileEvent{Kind: kind, ID: id, Boot: "old", At: stamp, Arrived: stamp, Outcome: "completed", Duration: 1}
+		data = append(data, append(encodeJSON(event), '\n')...)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p.files = []string{path}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.analyzer(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	query := string(encodeJSON(profileQuery{Start: stamp - 1, End: stamp + 1}))
+	w := profileHTTP(p, "POST", "/profile/v1/analyses", query, "fixture-key")
+	var job profileJob
+	if w.Code != 202 || json.Unmarshal(w.Body.Bytes(), &job) != nil {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		w = profileHTTP(p, "GET", "/profile/v1/analyses/"+job.ID, "", "fixture-key")
+		if json.Unmarshal(w.Body.Bytes(), &job) != nil {
+			t.Fatal(w.Body.String())
+		}
+		if job.State == "completed" {
+			break
+		}
+		if job.State == "failed" || time.Now().After(deadline) {
+			t.Fatal(w.Body.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	result := job.Result.(map[string]any)
+	if result["requests"] != float64(1) || result["quality"].(map[string]any)["invalid_records"] != float64(2) {
+		t.Fatal(result)
+	}
+}
 func profileHTTP(p *requestProfiler, method, path, body, key string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer "+key)

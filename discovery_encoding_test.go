@@ -74,6 +74,53 @@ func TestDiscoveryResponseEncoding(t *testing.T) {
 	}
 }
 
+func TestDiscoveryDecodedSizeLimit(t *testing.T) {
+	for _, encoding := range []string{"plain", "transport_gzip", "explicit_gzip"} {
+		for _, extra := range []int{0, 1} {
+			name := encoding + "/at_limit"
+			if extra != 0 {
+				name = encoding + "/over_limit"
+			}
+			t.Run(name, func(t *testing.T) {
+				prefix, suffix := `{"data":[{"id":"bounded-model"}],"padding":"`, `"}`
+				data := []byte(prefix + strings.Repeat("x", maxModelDiscoveryBytes+extra-len(prefix)-len(suffix)) + suffix)
+				if encoding != "plain" {
+					data = gzipSSEFixture(t, string(data))
+				}
+				var generations atomic.Int64
+				u := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodGet {
+						if encoding != "plain" {
+							w.Header().Set("Content-Encoding", "gzip")
+						}
+						_, _ = w.Write(data)
+						return
+					}
+					generations.Add(1)
+					w.Header().Set("Content-Type", "text/event-stream")
+					io.WriteString(w, completionEvent(0, map[string]any{"content": "ok"}, "stop")+"data: [DONE]\n\n")
+				}))
+				defer u.Close()
+				c := controlledFixture(t)
+				snapshot := snapshotV2("r1", u.URL, 1)
+				if encoding == "explicit_gzip" {
+					snapshot.Backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
+				}
+				activateV2(t, c, "bind", snapshot)
+				w := httptest.NewRecorder()
+				c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`)))
+				if extra == 0 {
+					if w.Code != 200 || generations.Load() != 1 || !strings.Contains(w.Body.String(), "[DONE]") {
+						t.Fatal(w.Code, w.Body.String(), generations.Load())
+					}
+				} else if w.Code != 503 || !strings.Contains(w.Body.String(), "model_discovery_failed") || generations.Load() != 0 {
+					t.Fatal(w.Code, w.Body.String(), generations.Load())
+				}
+			})
+		}
+	}
+}
+
 func TestDiscoveryResponseEncodingFailures(t *testing.T) {
 	models := `{"data":[{"id":"discovered-model"}]}`
 	encoded := gzipSSEFixture(t, models)

@@ -265,13 +265,32 @@ func (c *ControlledGateway) statusLocked() map[string]any {
 	return map[string]any{"protocol_version": 2, "gateway_id": c.id, "boot_id": c.boot, "admission": c.admission, "retired": c.retired, "binding_revision": c.revisionLocked(), "last_command_seq": c.sequence, "current": current, "candidate": candidate, "counts": counts, "test_occupancy": c.test, "quiesce_owner": c.quiesceOwner, "business_read_header_timeout_seconds": businessReadHeaderTimeout.Seconds()}
 }
 func runtimeResponse(w http.ResponseWriter, status int, value any) {
+	newRuntimeResponse(status, value).write(w)
+}
+
+// Encode while state is locked, then write the detached bytes after unlocking.
+// Results and test occupancy may otherwise change during network backpressure.
+type runtimeResponseData struct {
+	status int
+	body   []byte
+}
+
+func newRuntimeResponse(status int, value any) runtimeResponseData {
+	return runtimeResponseData{status, append(encodeJSON(value), '\n')}
+}
+
+func newRuntimeError(status int, code string) runtimeResponseData {
+	return newRuntimeResponse(status, map[string]any{"error": map[string]string{"code": code, "message": code}})
+}
+
+func (response runtimeResponseData) write(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	w.WriteHeader(response.status)
+	_, _ = w.Write(response.body)
 }
 func runtimeError(w http.ResponseWriter, status int, code string) {
-	runtimeResponse(w, status, map[string]any{"error": map[string]string{"code": code, "message": code}})
+	newRuntimeError(status, code).write(w)
 }
 func (c *ControlledGateway) ControlHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,21 +308,24 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 		}
 		if r.Method == "GET" && r.URL.Path == "/control/v2/status" {
 			c.mu.Lock()
-			defer c.mu.Unlock()
-			runtimeResponse(w, 200, c.statusLocked())
+			response := newRuntimeResponse(200, c.statusLocked())
+			c.mu.Unlock()
+			response.write(w)
 			return
 		}
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/control/v2/commands/") {
 			n, e := strconv.ParseUint(strings.TrimPrefix(r.URL.Path, "/control/v2/commands/"), 10, 64)
 			c.mu.Lock()
-			defer c.mu.Unlock()
+			var response runtimeResponseData
 			if e != nil {
-				runtimeError(w, 400, "invalid_sequence")
+				response = newRuntimeError(400, "invalid_sequence")
 			} else if v := c.results[n]; v != nil {
-				runtimeResponse(w, 200, v)
+				response = newRuntimeResponse(200, v)
 			} else {
-				runtimeError(w, 404, "result_unavailable")
+				response = newRuntimeError(404, "result_unavailable")
 			}
+			c.mu.Unlock()
+			response.write(w)
 			return
 		}
 		if r.Method != "POST" || r.URL.Path != "/control/v2/commands" {
@@ -316,58 +338,55 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			runtimeError(w, 400, "invalid_request")
 			return
 		}
-		c.cmdMu.Lock()
-		defer c.cmdMu.Unlock()
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if cmd.ProtocolVersion != 2 || cmd.GatewayID != c.id || !validOperationID(cmd.OperationID) || cmd.Sequence == 0 {
-			runtimeError(w, 400, "invalid_command")
-			return
-		}
-		if cmd.ExpectedBootID != c.boot {
-			runtimeError(w, 409, "boot_changed")
-			return
-		}
-		digest := runtimeDigest(cmd)
-		if old := c.results[cmd.Sequence]; old != nil {
-			if old.digest != digest {
-				runtimeError(w, 409, "command_conflict")
-			} else {
-				runtimeResponse(w, 200, old)
-			}
-			return
-		}
-		if cmd.Sequence <= c.sequence {
-			runtimeError(w, 409, "stale_command")
-			return
-		}
-		if cmd.ExpectedRevision != c.revisionLocked() {
-			runtimeError(w, 409, "binding_changed")
-			return
-		}
-		if c.retired {
-			runtimeError(w, 409, "instance_retired")
-			return
-		}
-		c.sequence = cmd.Sequence
-		result := &RuntimeResult{Sequence: cmd.Sequence, OperationID: cmd.OperationID, Status: "completed", digest: digest}
-		c.results[cmd.Sequence] = result
-		if err := c.executeLocked(cmd, result); err != nil {
-			result.Status = "failed"
-			result.Error = err.Error()
-		}
-		if result.Status != "running" {
-			now := time.Now()
-			result.FinishedAt = &now
-		}
-		for n, v := range c.results {
-			if n+256 <= c.sequence && v.Status != "running" {
-				delete(c.results, n)
-			}
-		}
-		c.cleanupLocked()
-		runtimeResponse(w, 200, result)
+		c.controlCommand(cmd).write(w)
 	})
+}
+
+func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseData {
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cmd.ProtocolVersion != 2 || cmd.GatewayID != c.id || !validOperationID(cmd.OperationID) || cmd.Sequence == 0 {
+		return newRuntimeError(400, "invalid_command")
+	}
+	if cmd.ExpectedBootID != c.boot {
+		return newRuntimeError(409, "boot_changed")
+	}
+	digest := runtimeDigest(cmd)
+	if old := c.results[cmd.Sequence]; old != nil {
+		if old.digest != digest {
+			return newRuntimeError(409, "command_conflict")
+		}
+		return newRuntimeResponse(200, old)
+	}
+	if cmd.Sequence <= c.sequence {
+		return newRuntimeError(409, "stale_command")
+	}
+	if cmd.ExpectedRevision != c.revisionLocked() {
+		return newRuntimeError(409, "binding_changed")
+	}
+	if c.retired {
+		return newRuntimeError(409, "instance_retired")
+	}
+	c.sequence = cmd.Sequence
+	result := &RuntimeResult{Sequence: cmd.Sequence, OperationID: cmd.OperationID, Status: "completed", digest: digest}
+	c.results[cmd.Sequence] = result
+	if err := c.executeLocked(cmd, result); err != nil {
+		result.Status = "failed"
+		result.Error = err.Error()
+	}
+	if result.Status != "running" {
+		now := time.Now()
+		result.FinishedAt = &now
+	}
+	for n, v := range c.results {
+		if n+256 <= c.sequence && v.Status != "running" {
+			delete(c.results, n)
+		}
+	}
+	c.cleanupLocked()
+	return newRuntimeResponse(200, result)
 }
 
 func (c *ControlledGateway) ProfileHandler() http.Handler {

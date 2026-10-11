@@ -116,6 +116,10 @@ func (p *requestProfiler) analyze(ctx context.Context, q profileQuery) (any, err
 				invalid++
 				continue
 			}
+			if e.Kind != "start" && e.Kind != "input" && e.Kind != "end" {
+				invalid++
+				continue
+			}
 			if e.At > asof || e.Arrived < q.Start || e.Arrived >= q.End {
 				continue
 			}

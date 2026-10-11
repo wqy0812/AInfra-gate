@@ -95,6 +95,9 @@ func (p *BackendPool) discoverRuntime(ctx context.Context, runtime *backendRunti
 	}
 }
 
+// This bounds the decoded discovery representation, including gzip expansion.
+const maxModelDiscoveryBytes = 4 << 20
+
 func (p *BackendPool) fetchModel(parent context.Context, b *Backend) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, seconds(p.config.DiscoveryTimeoutSeconds))
 	defer cancel()
@@ -114,9 +117,12 @@ func (p *BackendPool) fetchModel(parent context.Context, b *Backend) (string, er
 	if err := decodeUpstreamBody(resp); err != nil {
 		return "", err
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxModelDiscoveryBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(data) > maxModelDiscoveryBytes {
+		return "", fmt.Errorf("model discovery response exceeds 4 MiB")
 	}
 	var value any
 	if err := decodeJSON(data, &value); err != nil {
