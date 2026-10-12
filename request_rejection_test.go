@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bufio"
@@ -24,7 +24,6 @@ func TestRejectedUploadReturnsAndClosesConnection(t *testing.T) {
 		{"expect_continue", "POST", "/v1/chat/completions", "", 503},
 		{"retired", "POST", "/v1/chat/completions", "", 503},
 		{"invalid_token", "POST", "/v1/chat/completions", "wrong", 409},
-		{"unauthorized", "POST", "/v1/chat/completions", "", 401},
 		{"wrong_method", "PUT", "/v1/chat/completions", "", 405},
 		{"not_found", "POST", "/unknown", "", 404},
 		{"health", "GET", "/health", "", 200},
@@ -36,15 +35,13 @@ func TestRejectedUploadReturnsAndClosesConnection(t *testing.T) {
 				c := controlledFixture(t)
 				if state.name != "unconfigured" {
 					upstream := newProtocolBackend(t)
-					activateV2(t, c, "bind", snapshotV2("r1", upstream.server.URL, 1))
+					activateV3(t, c, "bind", switchSnapshot(t, "r1", upstream.server.URL, 1))
 				}
 				switch state.name {
 				case "paused", "expect_continue":
-					commandV2(t, c, "pause", "quiesce", map[string]any{})
+					commandV3(t, c, "pause", "quiesce", map[string]any{})
 				case "retired":
-					commandV2(t, c, "retire", "retire", map[string]any{})
-				case "unauthorized":
-					c.active.g.apiKey = "Bearer expected"
+					commandV3(t, c, "retire", "retire", map[string]any{})
 				}
 				closed := make(chan struct{}, 1)
 				server := httptest.NewUnstartedServer(c)

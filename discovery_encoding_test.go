@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -102,11 +102,12 @@ func TestDiscoveryDecodedSizeLimit(t *testing.T) {
 				}))
 				defer u.Close()
 				c := controlledFixture(t)
-				snapshot := snapshotV2("r1", u.URL, 1)
-				if encoding == "explicit_gzip" {
-					snapshot.Backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
-				}
-				activateV2(t, c, "bind", snapshot)
+				snapshot, _ := proxySnapshot(t, "r1", u.URL, 1, nil, func(backend *Backend) {
+					if encoding == "explicit_gzip" {
+						backend.Headers = map[string]string{"Accept-Encoding": "gzip"}
+					}
+				})
+				activateV3(t, c, "bind", snapshot)
 				w := httptest.NewRecorder()
 				c.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`)))
 				if extra == 0 {

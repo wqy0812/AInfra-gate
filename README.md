@@ -1,48 +1,66 @@
-# aigate：平台控制的 API 网关
+# aigate：独立切流与功能服务
 
-网关提供 OpenAI 兼容 JSON、SSE、模型发现、请求适配与观测。Router 配置、运行配置、绑定、操作日志和测试占用的持久化全部由平台负责。网关进程仅保留内存快照，重启后暂停业务，等待平台恢复。
+当前源码提供两个独立二进制；本次拆分尚未部署，源码、构建产物和在线运行版本需要分别核验。
 
-## 使用场景与范围
+| 服务 | 职责 | 入站认证 | 配置来源 |
+| --- | --- | --- | --- |
+| `aigate-switch` | 请求转发、在线切流、准入、绑定版本、在途计数、测试占用 | 仅控制接口需要 Bearer 密钥与来源 CIDR | code-eval 下发内存绑定快照 |
+| `aigate-proxy` | 模型发现、适配、参数覆盖、SSE、指标、画像、慢请求与异常诊断 | 所有接口无需认证 | 本地 JSON 文件，修改后重启 |
 
-- **目标使用场景为流式请求**（`stream: true`，SSE）。设计、代码审核、性能优化与验收以流式链路及其必要依赖（模型发现、上传、控制、排空和观测）为准；非流式业务不在当前考虑范围内。现有代码和下文中的非流式行为说明仅记录兼容能力。
-- **当前网关与 Router 的业务接口均不使用 API Key 鉴权**，客户端到网关、网关到 Router 的业务调用均无需密钥。此约定仅适用于业务链路；平台控制接口仍要求控制密钥和允许的来源 CIDR，启用的观测接口仍需鉴权。
+每个功能服务固定连接一个 Router，可脱离切流服务和平台独立运行。多个切流入口可共享同一功能服务。指标与观测文件归属 Router，同时包含经过切流和直接访问的请求；切流不迁移这些数据。平台负责入口、目标登记、绑定及操作记录，功能参数的权威来源是功能服务本地文件。
 
-## 控制方式
+## 业务行为与服务边界
 
-业务入口为 `POST /v1/chat/completions` 和 `GET /v1/models`；模型由 Router 发现，模型列表使用发现的实际 ID，OpenAI 响应保留后端返回的模型名。元数据兼容规则和 overrides 随 Router 交换；入口名称、入口凭据、连接池与观测策略留在本网关。
+两者都提供 `POST /v1/chat/completions`、`GET /v1/models`、`GET /health` 和 `GET /openapi.json`。`/health` 只表示进程可响应，不证明 Router 可用。切流服务启动时暂停接流，等待平台恢复绑定；功能服务读取合法配置后独立接流，Router 不可达时按业务错误返回，进程继续运行。
 
-客户端请求的 `model` 可以填写任意字符串，也可以省略或为 null；网关发往 Router 前替换为发现的实际模型名，不要求客户端名称与后端匹配。登记和更换模型时仍填写实际模型 ID。
+切流层只固定并转发每个已受理请求的目标，不改写 JSON、不重复适配或记录画像，不自动重试生成请求。单入口切换只改变该入口后续请求，多个入口可以共享同一功能目标；上传、等待上游和 SSE 直到结束都沿用原快照。
 
-模型发现响应在解压后限制为 4 MiB，超过上限按发现失败处理，返回 HTTP 503 `model_discovery_failed`，不发送生成请求。
+功能服务发现 Router 实际模型，并在发往 Router 前替换请求中的 `model`；客户端模型名可为任意字符串、省略或 null。响应保留后端模型名。发现响应解压后上限为 4 MiB，超过时返回 503 `model_discovery_failed`，不发送生成请求。模板适配、兼容规则与参数覆盖只在功能层执行一次。
 
-`POST /v1/chat/completions` 请求体上传总时限为 5 分钟，大小上限为 30 MB（30,000,000 字节）。上传超时返回 HTTP 408，超限返回 HTTP 413；请求体读取完成后清除读取截止时间，后续生成与 SSE 使用原有生成超时。
+请求上传总时限 5 分钟，大小上限 30 MB（30,000,000 字节）。超时返回 408，超限返回 413；上传后清除读取截止时间。业务读头时限为 30 秒，独立控制与观测监听器为 5 秒。切流的 `--forward-timeout` 默认 62 分钟，覆盖上传、上游等待与向客户端写出；功能服务的生成超时由本地 `settings.timeout_seconds` 决定。提前拒绝不等待上传完正文；HTTP/1.x 关闭连接，HTTP/2 仅关闭请求流。
 
-暂停准入、无效测试令牌等提前拒绝不等待客户端上传完正文。HTTP/1.x 返回响应后关闭该连接；HTTP/2 只关闭该请求的正文流，其他请求可继续复用连接。
+保留 `X-Aigate-Backend`、`X-Aigate-Route-Version`、`X-Aigate-Model` 响应头；功能服务还返回 `X-Aigate-Config-Digest`。切流覆盖客户端提供的内部路由/测试元数据，并移除向功能服务转发的业务 Authorization 与测试令牌。已确认测试占用的模型和配置摘要随请求传给功能服务，在发起生成前检查。直连不需要这些字段；它们是每次请求断言，不是访问凭据或写配置接口。
 
-业务监听器读取 HTTP 请求头的时限为 **30 秒**。控制和观测监听器继续使用各自的 5 秒读头时限。请求头未读完即关闭的连接、生成请求的上游阶段和读写错误可通过[传输诊断](docs/TRANSPORT_DIAGNOSTICS.md)排查；不需要客户端改造。
+## 构建与启动
 
-所有管理动作经过平台 API。网关仅开放鉴权的 `/control/v2/status`、`/control/v2/commands`、`/control/v2/commands/{seq}` 给 Engine。二进制不再支持 `check`、`switch`、`status`、`backends` 等管理 CLI、`--config`、路由文件或 Unix 管理 socket。
-
-两网关交换 Router：验证主动目标 → 双方暂停新请求并确认 → 平台事务交换绑定 → 主动方激活并单独成功 → 被动方直接激活。被动 Router 故障不阻塞、不回退主动方；被动网关控制不可达则继续暂停并重试。已受理请求，包括 SSE 和等待模型发现/连接池的请求，保持原快照直到结束。
-
-普通请求审计仅记录请求 ID、后端、模型、耗时、状态和路由/任务等元数据，不再记录用户消息前缀（`question_prefix`）。
-
-审计增加连接 ID、连接端点/接收时间、经校验的可选客户端请求 ID、生成结果和错误类别；失败或取消时附带有界传输诊断，正常成功请求不输出详细阶段。仅凭客户端 context 取消不能认定是用户主动取消。
-
-## 启动
-
-只需 Go 标准库，没有第三方依赖。构建与测试始终显式使用 vendor 模式。
+仅使用 Go 标准库，根包 `aigate` 供两个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
 
 ```sh
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate .
-export AIGATE_ID=g1
-export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
-./bin/aigate serve --listen 0.0.0.0:10015 --control-listen 0.0.0.0:18083 --allowed-cidrs '<Engine IP>/32' --profile-listen 0.0.0.0:18082 --data-root /var/lib/aigate --shutdown-timeout 62m
+./scripts/build.sh
+# 等价的独立构建：
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-switch ./cmd/aigate-switch
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-proxy ./cmd/aigate-proxy
+./bin/aigate-switch version
+./bin/aigate-proxy version
 ```
 
-`--data-root` 只保存观测数据，不保存业务配置、凭据、路由或管理状态。相同观测策略复用写入器；不同策略使用不同目录，避免旧请求与新配置竞争文件。平台下发观测 API 密钥。控制监听地址、观测监听地址及数据根目录属于部署参数，不接受运行配置覆盖。
+`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch` 和 `bin/aigate-proxy`。版本命令分别标识 `control/v3 (v2 test compatibility)` 与 `runtime/v1`；发布身份仍需记录源码 commit 和二进制摘要。
 
-首次启动的业务接口返回 503；`/health` 仅表示进程存活。进程处于暂停状态时，新业务返回 503 和 `Retry-After: 1`。Router 非 2xx 仍按现有透传规则返回，网关不自动切回。
+功能服务可单独启动，示例连接本机 Router 的 18077 端口：
+
+```sh
+./bin/aigate-proxy --check-config --config examples/proxy.example.json
+./bin/aigate-proxy serve --config examples/proxy.example.json \
+  --listen 127.0.0.1:18084 --profile-listen 127.0.0.1:18082 \
+  --data-root /var/lib/aigate-proxy-r1 --shutdown-timeout 62m
+```
+
+`--check-config` 只解析、规范化并输出脱敏状态，不启动监听器、不访问 Router、不创建目录；输出 `boot_id=""`、`admission=false`。合法本地文件必须包含 `service_id`、`router_id`、`backend`，`settings` 可省略。示例明确设置生成时限为 1860 秒；省略时默认 120 秒。配置文件上限 1 MiB，未知字段或非法值使启动失败。入站业务/观测密钥、画像监听器和存储目录不能放入功能配置；后两者由启动参数管理。参考 [完整示例](examples/proxy.example.json)。
+
+`/runtime/v1/status` 返回 `service`、`service_id`、`router_id`、`boot_id`、`config_digest`、`settings`、`backend`、`counts`、`admission`。状态不暴露上游 header 值、环境变量名、URL 查询参数、观测密钥或目录。摘要覆盖规范化配置及解析后的上游 header，适用于识别本地配置变化。
+
+功能服务业务监听器也提供 `/runtime/v1/status`、`/metrics`、`/profile/v1/*`；`--profile-listen` 默认为 `127.0.0.1:18082`，设为空字符串可关闭独立观测监听器。关闭画像时 `/metrics` 与画像接口返回 503，健康与运行状态仍可查询。画像分析任务是观测查询，不提供配置写入或热更新接口。
+
+切流服务只需要入口 ID、控制密钥和来源 CIDR；密钥由部署环境注入：
+
+```sh
+# 已通过环境注入 AIGATE_CONTROL_KEY；至少 32 字节，不写在命令行。
+./bin/aigate-switch serve --id g1 --listen 127.0.0.1:10015 \
+  --control-listen 127.0.0.1:18083 --allowed-cidrs 127.0.0.0/8,::1/128 \
+  --forward-timeout 62m --shutdown-timeout 62m
+```
+
+`--id` 可由 `AIGATE_ID` 提供。控制端口仅提供鉴权 `/control/v3/*` 和旧固定执行镜像所需的有限 v2 接口；功能服务不提供切流控制。收到退出信号后先停止新业务并优雅收尾，默认上限 62 分钟。systemd 模板和逐实例目录约定见 [packaging](packaging/README.md)。
 
 ## 单元测试覆盖率
 
@@ -54,9 +72,9 @@ export AIGATE_CONTROL_KEY='<至少 32 字节，由部署环境注入>'
 
 OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。观察器已识别并转发 `[DONE]` 后发生读取错误时，仍按读取错误记录，但网关不再追加错误事件；此规则不覆盖观察器因解析上限停止解析而未识别 `[DONE]` 的情况，也不拦截上游在 `[DONE]` 后发送的数据。模板适配器仍执行响应转换。
 
-OpenAI 普通响应和 SSE 正文不改写模型名称，也不补写缺失的 `model` 字段。旧配置及历史运行快照中的 `public_model_name` 在读取时忽略；平台不再接受包含该字段的新运行配置，历史记录无需改写。
+OpenAI 普通响应和 SSE 正文不改写模型名称，也不补写缺失的 `model` 字段。本地配置不接受 `public_model_name`，历史任务和历史响应不改写。
 
-非流式 OpenAI 2xx 响应增加旁路观测，不改变返回状态、正文或接流状态，也不重试、切换 Router。启用 `profile.enabled` 后，由现有观测监听器的鉴权 `/metrics` 提供：
+非流式 OpenAI 2xx 响应增加旁路观测，不改变返回状态、正文或接流状态，也不重试、切换 Router。启用 `profile.enabled` 后，由功能服务无需认证的 `/metrics` 提供：
 
 | 上游响应 | `generation_requests_ended_total` 的 `result` | `upstream_errors_total` 的 `error_class` |
 | --- | --- | --- |
@@ -79,12 +97,12 @@ sum by (backend, model) (
 )
 ```
 
-设计边界与评审检查见 [设计原则](docs/DESIGN_PRINCIPLES.md)。完整接口、状态机、迁移和验收步骤见 [平台控制 v2 操作说明](MANAGEMENT.md)。systemd 模板见 [deploy/control-v2](deploy/control-v2/README.md)。旧版配置、CLI 和设计方案通过 [Git 历史查阅](docs/archive/README.md)，不可用于启动 v2。
+设计边界与评审检查见 [设计原则](docs/DESIGN_PRINCIPLES.md)。完整接口、状态机、迁移和验收步骤见 [拆分服务操作说明](MANAGEMENT.md)。旧版配置、CLI 和设计方案通过 [Git 历史查阅](docs/archive/README.md)。
 
 ### 流停顿方向
 
-新增 `aigate_stream_backend_wait_max_seconds`（当前读取中的流，自上次有效输出后累计 Read 等待）及 `aigate_stream_write_active_max_seconds`（当前一轮 Write + Flush 持续时间）。两者单位秒，按 backend 输出，`request_scope="streaming"`。首次输出前从首次读取响应体计时，写出耗时不计入后端等待；心跳/usage 不重置，完成或观察未知的流退出后端等待统计，最终写出仍计时。没有符合条件的请求输出零；旧指标保持原义。指标只区分供数与输出方向，不直接判定模型故障或客户端不读。
+新增 `aigate_stream_backend_wait_max_seconds`（当前读取中的流，自上次有效输出后累计 Read 等待）及 `aigate_stream_write_active_max_seconds`（当前一轮 Write + Flush 持续时间）。两者单位秒，按 backend 输出，`request_scope="streaming"`。首次输出前从首次读取响应体计时，写出耗时不计入后端等待；心跳/usage 不重置，完成或观察未知的流退出后端等待统计，最终写出仍计时。没有符合条件的请求输出零；旧指标保持原义。指标只区分供数与输出方向，不直接判定模型故障或客户端不读。经切流入口访问时，功能服务的写出对端为切流服务；该指标不能直接解释为最终客户端阻塞。
 
 ### 流异常诊断
 
-启用画像时，记录单次**输出中途读取等待超过 60 秒**或**客户端 Write + Flush 超过 60 秒**的异常；阻塞期间即可查询。仅保存最后一条用户文本的前 10 个和后 10 个字符，在平台独立“异常诊断”页面按关键词和触发时间搜索。默认保留 72 小时 / 256 MiB；原有超过 300 秒的慢请求捕获保持不变。接口、计时口径和存储说明见 [流异常诊断](docs/STREAM_INCIDENTS.md)。
+启用画像时，记录单次**输出中途读取等待超过 60 秒**或**向连接对端 Write + Flush 超过 60 秒**的异常；阻塞期间即可查询。平台“异常诊断”页展示最后一条用户消息中问题正文的前后各 10 个 Unicode 码点，按首尾摘要及触发时间搜索。摘要保留 72 小时 / 256 MiB；完整原始请求、解码后的上游 SSE 和停顿位置另存服务器 `stream-incidents/requests/`，预算 72 小时 / 10 GiB，采集不完整时明确标记。原有超过 300 秒的慢请求捕获保持不变。接口、计时口径和存储说明见 [流异常诊断](docs/STREAM_INCIDENTS.md)。

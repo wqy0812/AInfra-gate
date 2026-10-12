@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bufio"
@@ -27,7 +27,6 @@ func TestBackendModelABSwitchAndAttribution(t *testing.T) {
 	}
 	c := controlledFixture(t)
 	logs := &lockedBuffer{}
-	c.audit = logs
 	one, two := makeBackend("real-a"), makeBackend("real-b")
 	server := httptest.NewServer(c)
 	defer server.Close()
@@ -36,7 +35,8 @@ func TestBackendModelABSwitchAndAttribution(t *testing.T) {
 		if backend == "api2" {
 			target = two
 		}
-		activateV2(t, c, fmt.Sprintf("swap%d", i), snapshotV2(backend, target, uint64(i+1)))
+		snapshot, _ := proxySnapshot(t, backend, target, uint64(i+1), nil, nil, logs)
+		activateV3(t, c, fmt.Sprintf("switch%d", i), snapshot)
 		r, models := request(t, server, "GET", "/v1/models", "", "")
 		actual := map[string]string{"api1": "real-a", "api2": "real-b"}[backend]
 		if r.StatusCode != 200 || !bytes.Contains(models, []byte(`"id":`+string(encodeJSON(actual)))) {
@@ -238,7 +238,7 @@ func TestBackendModelLiveStreamSwitchAndCancel(t *testing.T) {
 				io.WriteString(w, strings.ReplaceAll(goodResponse, `"ignored"`, `"real-b"`))
 			})
 			c := controlledFixture(t)
-			activateV2(t, c, "bind", snapshotV2("api1", one.URL, 1))
+			activateV3(t, c, "bind", switchSnapshot(t, "api1", one.URL, 1))
 			server := httptest.NewServer(c)
 			defer server.Close()
 			client := &http.Client{Timeout: 3 * time.Second}
@@ -252,7 +252,7 @@ func TestBackendModelLiveStreamSwitchAndCancel(t *testing.T) {
 			if err != nil || !strings.Contains(line, `"model":"real-a"`) {
 				t.Fatalf("first event delayed or wrong: %s %v", line, err)
 			}
-			activateV2(t, c, "swap", snapshotV2("api2", two.URL, 2))
+			activateV3(t, c, "switch", switchSnapshot(t, "api2", two.URL, 2))
 			r, data := request(t, server, "POST", "/v1/chat/completions", basicBody, "")
 			if r.StatusCode != 200 || !bytes.Contains(data, []byte(`"model":"real-b"`)) {
 				t.Fatal("new route failed")

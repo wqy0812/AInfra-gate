@@ -1,7 +1,7 @@
-package main
+package aigate
 
-// Stream incident observation retains only the first/last ten user-text runes.
-// Stream I/O remains on the request goroutine; persistence uses a bounded queue.
+// Public summaries contain only the first/last ten question runes. Complete
+// incident evidence is held by a separate bounded, asynchronous capture store.
 import (
 	"context"
 	"crypto/sha256"
@@ -35,6 +35,7 @@ type incidentQuestion struct {
 }
 
 type streamIncident struct {
+	ConnectionPeer   string     `json:"connection_peer,omitempty"`
 	ID               string     `json:"id"`
 	RequestID        string     `json:"request_id"`
 	GatewayID        string     `json:"gateway_id"`
@@ -67,17 +68,22 @@ type streamIncident struct {
 }
 
 type incidentRequest struct {
-	store                      *incidentStore
-	base                       streamIncident
-	lastUseful, lastByte       time.Time
-	readStart                  time.Time
-	reading, terminal, unknown bool
-	readWait                   time.Duration
-	received                   int64
-	writeStart, flushStart     time.Time
-	written                    *int
-	planned                    int
-	stall, write               *streamIncident
+	store                            *incidentStore
+	base                             streamIncident
+	lastUseful, lastByte             time.Time
+	readStart                        time.Time
+	reading, terminal, unknown       bool
+	readWait                         time.Duration
+	received                         int64
+	writeStart, flushStart           time.Time
+	writeReturnedAt, flushReturnedAt time.Time
+	written                          *int
+	planned                          int
+	stall, write                     *streamIncident
+	capture                          *streamCapture
+	responseOffset                   int64
+	lastEvent, lastUsefulEvent       sseEventPosition
+	writePosition                    captureEvent
 }
 
 type incidentStore struct {
@@ -117,6 +123,39 @@ func questionEdges(text string) (head, tail string, length int) {
 		start -= n
 	}
 	return head, strings.Clone(text[start:]), length
+}
+
+// Extract only literal, balanced outer tags. An unfinished trailing group does
+// not hide the last complete group. The adapter's original question is untouched.
+func incidentQuestionText(text string) string {
+	const open, close = "<user_query>", "</user_query>"
+	depth, start, foundStart, foundEnd := 0, 0, -1, -1
+	for offset := 0; offset < len(text); {
+		a, b := strings.Index(text[offset:], open), strings.Index(text[offset:], close)
+		if a < 0 && b < 0 {
+			break
+		}
+		if a >= 0 && (b < 0 || a < b) {
+			offset += a + len(open)
+			if depth == 0 {
+				start = offset
+			}
+			depth++
+		} else {
+			end := offset + b
+			offset = end + len(close)
+			if depth > 0 {
+				depth--
+				if depth == 0 {
+					foundStart, foundEnd = start, end
+				}
+			}
+		}
+	}
+	if foundStart >= 0 {
+		return strings.TrimSpace(text[foundStart:foundEnd])
+	}
+	return text
 }
 
 func newIncidentStore(root, gatewayID, boot string, audit io.Writer) (*incidentStore, error) {
@@ -198,7 +237,7 @@ func (s *incidentStore) enqueue(v streamIncident) { // called under mu
 		s.dropped.Add(1)
 	}
 }
-func (s *incidentStore) begin(base streamIncident) *incidentRequest {
+func (s *incidentStore) begin(base streamIncident, capture ...*streamCapture) *incidentRequest {
 	if s == nil {
 		return nil
 	}
@@ -207,6 +246,9 @@ func (s *incidentStore) begin(base streamIncident) *incidentRequest {
 	base.ThresholdSeconds = 60
 	base.Observation = "known"
 	r := &incidentRequest{store: s, base: base}
+	if len(capture) > 0 {
+		r.capture = capture[0]
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -260,15 +302,23 @@ func (r *incidentRequest) snapshot(v *streamIncident, now time.Time) streamIncid
 			out.LastByteAt = &t
 		}
 	} else {
-		out.DurationSeconds = elapsed(now, r.writeStart)
+		out.DurationSeconds = r.writeWait(now).Seconds()
 		out.PlannedBytes = r.planned
 		out.WrittenBytes = r.written
 		out.Operation = "write"
 		out.WriteSeconds = out.DurationSeconds
 		if !r.flushStart.IsZero() {
 			out.Operation = "flush"
-			out.WriteSeconds = elapsed(r.flushStart, r.writeStart)
-			out.FlushSeconds = elapsed(now, r.flushStart)
+			writeEnd := r.writeReturnedAt
+			if writeEnd.IsZero() {
+				writeEnd = r.flushStart
+			}
+			out.WriteSeconds = elapsed(writeEnd, r.writeStart)
+			flushEnd := r.flushReturnedAt
+			if flushEnd.IsZero() {
+				flushEnd = now
+			}
+			out.FlushSeconds = elapsed(flushEnd, r.flushStart)
 		}
 	}
 	return out
@@ -281,13 +331,30 @@ func (r *incidentRequest) check(now time.Time) {
 		}
 		if wait > incidentThreshold && r.stall == nil {
 			r.stall = r.newRecord("output_stall", r.lastUseful, now)
+			r.captureIncident(r.stall, now, "incident_trigger", "")
 			r.store.enqueue(r.snapshot(r.stall, now))
 		}
 	}
-	if !r.writeStart.IsZero() && now.Sub(r.writeStart) > incidentThreshold && r.write == nil {
+	if !r.writeStart.IsZero() && r.writeWait(now) > incidentThreshold && r.write == nil {
 		r.write = r.newRecord("client_write_stall", r.writeStart, now)
+		r.captureIncident(r.write, now, "incident_trigger", "")
 		r.store.enqueue(r.snapshot(r.write, now))
 	}
+}
+
+func (r *incidentRequest) writeWait(now time.Time) time.Duration {
+	if r.writeReturnedAt.IsZero() {
+		return max(0, now.Sub(r.writeStart))
+	}
+	wait := max(0, r.writeReturnedAt.Sub(r.writeStart))
+	if !r.flushStart.IsZero() {
+		end := r.flushReturnedAt
+		if end.IsZero() {
+			end = now
+		}
+		wait += max(0, end.Sub(r.flushStart))
+	}
+	return wait
 }
 func (r *incidentRequest) endRecord(v **streamIncident, now time.Time, reason string) {
 	if *v == nil {
@@ -298,6 +365,7 @@ func (r *incidentRequest) endRecord(v **streamIncident, now time.Time, reason st
 	out.EndedAt = &t
 	out.State = "ended"
 	out.EndReason = reason
+	r.captureIncident(*v, now, "incident_end", reason)
 	r.store.enqueue(out)
 	*v = nil
 }
@@ -313,10 +381,69 @@ func (r *incidentRequest) readReturned(now time.Time, n int) {
 		if n > 0 {
 			r.lastByte = now
 			r.received += int64(n)
+			r.responseOffset += int64(n)
 		}
 		r.check(now)
 	})
 }
+
+func (r *incidentRequest) captureIncident(v *streamIncident, now time.Time, eventType, reason string) {
+	if r.capture == nil {
+		return
+	}
+	e := captureEvent{Type: eventType, At: now, IncidentID: v.ID, Reason: reason,
+		Phase: v.Kind, Start: r.responseOffset, End: r.responseOffset,
+		LastEventIndex: r.lastEvent.Index, LastEventStart: r.lastEvent.Start, LastEventEnd: r.lastEvent.End,
+		LastEventKnown: r.lastEvent.Known, LastUsefulEventIndex: r.lastUsefulEvent.Index,
+		LastUsefulStart: r.lastUsefulEvent.Start, LastUsefulEnd: r.lastUsefulEvent.End,
+		LastUsefulAt: r.lastUsefulEvent.At, PositionKnown: !r.unknown}
+	e.StartedAt = v.StartedAt
+	if v.Kind == "output_stall" {
+		e.ReadWaitSeconds = r.snapshot(v, now).ReadWaitSeconds
+		if reason == "output_resumed" {
+			e.HasRange = true
+			e.Start = r.lastEvent.Start
+			e.End = r.lastEvent.End
+			e.EventIndex = r.lastEvent.Index
+		}
+	} else {
+		e.WriteStartedAt = r.writeStart
+		e.FlushStartedAt = r.flushStart
+		e.FlushReturned = !r.flushReturnedAt.IsZero()
+		e.Origin = r.writePosition.Origin
+		e.Phase = r.writePosition.Phase
+		e.IOSequence = r.writePosition.IOSequence
+		e.HasRange = r.writePosition.HasRange
+		e.Start = r.writePosition.Start
+		e.End = r.writePosition.End
+		e.PlannedBytes = r.planned
+		e.TotalWritten = r.writePosition.TotalWritten
+		if r.written != nil {
+			e.WrittenKnown = true
+			e.WrittenBytes = *r.written
+		}
+	}
+	if eventType == "incident_trigger" {
+		r.capture.trigger(v.ID, v.Kind, now, e)
+	} else {
+		r.capture.event(e)
+	}
+}
+
+func (r *incidentRequest) eventPosition(p sseEventPosition) {
+	r.mutate(func() {
+		r.lastEvent = p
+		if p.Known && p.Useful {
+			r.endRecord(&r.stall, p.At, "output_resumed")
+			r.lastUsefulEvent = p
+			r.lastUseful = p.At
+			r.readWait = 0
+			r.received = 0
+		}
+	})
+}
+
+func (r *incidentRequest) setWritePosition(e captureEvent) { r.mutate(func() { r.writePosition = e }) }
 
 func (r *incidentRequest) observe(now time.Time, o *sseObserver) {
 	r.mutate(func() {
@@ -341,10 +468,25 @@ func (r *incidentRequest) observe(now time.Time, o *sseObserver) {
 	})
 }
 func (r *incidentRequest) startWrite(now time.Time, n int) {
-	r.mutate(func() { r.writeStart = now; r.flushStart = time.Time{}; r.written = nil; r.planned = n })
+	r.mutate(func() {
+		r.writeStart = now
+		r.flushStart = time.Time{}
+		r.writeReturnedAt = time.Time{}
+		r.flushReturnedAt = time.Time{}
+		r.written = nil
+		r.planned = n
+	})
 }
 func (r *incidentRequest) startFlush(now time.Time, n int) {
-	r.mutate(func() { r.flushStart = now; v := n; r.written = &v; r.check(now) })
+	r.mutate(func() {
+		r.flushStart = now
+		v := n
+		r.written = &v
+		if r.writePosition.Phase == "body_write" {
+			r.writePosition.Phase = "body_flush"
+		}
+		r.check(now)
+	})
 }
 func (r *incidentRequest) endWrite(now time.Time, err error) {
 	r.mutate(func() {
@@ -362,12 +504,19 @@ func (r *incidentRequest) endWrite(now time.Time, err error) {
 		r.endRecord(&r.write, now, reason)
 		r.writeStart = time.Time{}
 		r.flushStart = time.Time{}
+		r.writeReturnedAt = time.Time{}
+		r.flushReturnedAt = time.Time{}
 	})
 }
 
 func (r *incidentRequest) wrote(n int) {
 	r.mutate(func() { v := n; r.written = &v })
 }
+
+func (r *incidentRequest) wroteAt(at time.Time, n int) {
+	r.mutate(func() { v := n; r.written = &v; r.writeReturnedAt = at })
+}
+func (r *incidentRequest) flushedAt(at time.Time) { r.mutate(func() { r.flushReturnedAt = at }) }
 func (r *incidentRequest) finish(now time.Time, reason string) {
 	r.mutate(func() {
 		r.check(now)

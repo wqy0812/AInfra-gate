@@ -1,4 +1,4 @@
-package main
+package aigate
 
 // Request profiling is observational. No profile failure changes a business response.
 import (
@@ -25,6 +25,8 @@ var profileLengthBuckets = []float64{256, 1024, 4096, 8192, 16384, 32768, 65536,
 var profileTimeBuckets = []float64{.01, .05, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600}
 
 type ProfileConfig struct {
+	// noAuth is only set by the standalone proxy bootstrap, never by JSON.
+	noAuth         bool
 	Enabled        bool   `json:"enabled"`
 	Listen         string `json:"listen"`
 	APIKeyEnv      string `json:"api_key_env"`
@@ -69,7 +71,7 @@ func (c ProfileConfig) validate() error {
 	if _, _, e := net.SplitHostPort(c.Listen); e != nil {
 		return fmt.Errorf("profile.listen: %w", e)
 	}
-	if c.APIKey == "" && os.Getenv(c.APIKeyEnv) == "" {
+	if !c.noAuth && c.APIKey == "" && os.Getenv(c.APIKeyEnv) == "" {
 		return fmt.Errorf("profile requires %s", c.APIKeyEnv)
 	}
 	if c.Directory == "" || c.RetentionHours < 1 || c.RetentionHours > 720 || c.MaxDiskBytes < 1<<20 || c.QueueEvents < 1 || c.QueueEvents > 8192 {
@@ -627,7 +629,7 @@ func (p *requestProfiler) handler() http.Handler {
 		if key == "" {
 			key = os.Getenv(p.c.APIKeyEnv)
 		}
-		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+key)) != 1 {
+		if !p.c.noAuth && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+key)) != 1 {
 			http.Error(w, "unauthorized", 401)
 			return
 		}

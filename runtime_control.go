@@ -1,4 +1,4 @@
-package main
+package aigate
 
 // Platform-controlled runtime. Configuration and control state never leave memory.
 import (
@@ -12,23 +12,14 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-type RuntimeSnapshot struct {
-	RouterID             string          `json:"router_id"`
-	RouterVersion        uint64          `json:"router_version"`
-	GatewayConfigVersion uint64          `json:"gateway_config_version"`
-	BindingRevision      uint64          `json:"binding_revision"`
-	Backend              *Backend        `json:"backend"`
-	Settings             json.RawMessage `json:"settings"`
-	APIKey               string          `json:"api_key,omitempty"`
-	GatewayAddresses     []string        `json:"gateway_addresses,omitempty"`
-}
+// RuntimeSnapshot contains only the immutable target binding of a switch.
+type RuntimeSnapshot = SwitchSnapshot
 type RuntimeCommand struct {
 	ProtocolVersion  int             `json:"protocol_version"`
 	OperationID      string          `json:"operation_id"`
@@ -57,15 +48,16 @@ type RuntimeCounts struct {
 	Probes   int    `json:"probes"`
 }
 type runtimeGeneration struct {
+	forward  *switchForwarder
 	snapshot RuntimeSnapshot
 	g        *Gateway
 	counts   RuntimeCounts
 	owner    string
 	refs     int
-	pins     int // an in-progress prepare shares this generation's observers
 	closed   bool
 }
 type runtimeTest struct {
+	ConfigDigest    string `json:"config_digest,omitempty"`
 	TaskID          string `json:"task_id"`
 	Model           string `json:"model"`
 	RouterID        string `json:"router_id"`
@@ -75,10 +67,10 @@ type runtimeTest struct {
 	hash            string
 }
 
-// Lock order is cmdMu, then mu. Business requests take only mu, so no disk I/O
-// runs under mu: commands and retention sweeps serialize on cmdMu instead.
+// Lock order is cmdMu, then mu. Commands serialize independently from business
+// admission; switching never opens or owns observation storage.
 type ControlledGateway struct {
-	incidents          *incidentStore // guarded by cmdMu
+	forwardTimeout     time.Duration
 	cmdMu              sync.Mutex
 	mu                 sync.Mutex
 	id, boot, key      string
@@ -89,7 +81,6 @@ type ControlledGateway struct {
 	generations        []*runtimeGeneration
 	admission, retired bool
 	quiesceOwner       string
-	dataRoot           string
 	sequence           uint64
 	results            map[uint64]*RuntimeResult
 	test               *runtimeTest
@@ -97,10 +88,6 @@ type ControlledGateway struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
-	retentionStop      chan struct{}
-	retentionWake      chan struct{}
-	retentionOnce      sync.Once
-	closingDirs        map[string]chan struct{} // observer directory -> closed once released
 }
 type runtimeRequestKey struct{}
 type runtimeRequest struct {
@@ -109,12 +96,12 @@ type runtimeRequest struct {
 	stream      func()
 }
 
-func newControlledGateway(id, key string, cidrs []string, audit io.Writer) (*ControlledGateway, error) {
+func newRuntimeGateway(id, key string, cidrs []string, audit io.Writer) (*ControlledGateway, error) {
 	if !validOperationID(id) || len(key) < 32 || len(cidrs) == 0 {
 		return nil, fmt.Errorf("gateway ID, control key (32+ bytes) and allowed CIDRs are required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &ControlledGateway{id: id, boot: randomID(), key: key, audit: audit, ctx: ctx, cancel: cancel, dataRoot: "/var/lib/aigate", results: map[uint64]*RuntimeResult{}, released: map[string]bool{}, closingDirs: map[string]chan struct{}{}}
+	c := &ControlledGateway{forwardTimeout: 62 * time.Minute, id: id, boot: randomID(), key: key, audit: audit, ctx: ctx, cancel: cancel, results: map[uint64]*RuntimeResult{}, released: map[string]bool{}}
 	for _, v := range cidrs {
 		p, e := netip.ParsePrefix(v)
 		if e != nil {
@@ -123,11 +110,7 @@ func newControlledGateway(id, key string, cidrs []string, audit io.Writer) (*Con
 		}
 		c.cidrs = append(c.cidrs, p)
 	}
-	c.retentionStop = make(chan struct{})
 	c.connections = newConnectionDiagnostics(audit, c.boot)
-	c.retentionWake = make(chan struct{}, 1)
-	c.wg.Add(1)
-	go c.retainObservations()
 	return c, nil
 }
 func testHash(token string) string {
@@ -143,7 +126,7 @@ func (c *ControlledGateway) revisionLocked() uint64 {
 }
 func (c *ControlledGateway) cleanupLocked() {
 	for _, g := range c.generations {
-		if g != c.active && g != c.candidate && g.refs == 0 && g.pins == 0 && !g.closed {
+		if g != c.active && g != c.candidate && g.refs == 0 && !g.closed {
 			g.closed = true
 			c.closeGenerationLocked(g)
 		}
@@ -161,65 +144,10 @@ func (c *ControlledGateway) cleanupLocked() {
 }
 func (c *ControlledGateway) closeGenerationLocked(g *runtimeGeneration) {
 	g.g.transport.CloseIdleConnections()
-	profileUsed, slowUsed := false, false
-	for _, other := range c.generations {
-		if other != g && !other.closed {
-			profileUsed = profileUsed || other.g.profile == g.g.profile
-			slowUsed = slowUsed || other.g.slow == g.g.slow
-		}
-	}
-	if g.g.profile != nil && !profileUsed {
-		c.closeObserverLocked(g.g.profile.c.Directory, g.g.profile.close)
-	}
-	if g.g.slow != nil && !slowUsed {
-		c.closeObserverLocked(g.g.slow.c.Directory, g.g.slow.close)
-	}
 }
 
-// Closing an observer drains its queue and syncs files. It runs outside c.mu,
-// which the last request of a draining generation holds when it gets here;
-// prepare waits for the directory before reopening it.
-func (c *ControlledGateway) closeObserverLocked(dir string, stop func()) {
-	done := make(chan struct{})
-	c.closingDirs[dir] = done
-	go func() {
-		defer close(done)
-		stop()
-	}()
-}
-
-// closingLocked returns the shutdown still holding dir, if any.
-func (c *ControlledGateway) closingLocked(dir string) chan struct{} {
-	done := c.closingDirs[dir]
-	if done == nil {
-		return nil
-	}
-	select {
-	case <-done:
-		delete(c.closingDirs, dir)
-		return nil
-	default:
-		return done
-	}
-}
-
-// waitClosingObservers waits for the observer shutdowns already started.
-func (c *ControlledGateway) waitClosingObservers() {
-	var closing []chan struct{}
-	c.mu.Lock()
-	for dir := range c.closingDirs {
-		if done := c.closingLocked(dir); done != nil {
-			closing = append(closing, done)
-		}
-	}
-	c.mu.Unlock()
-	for _, done := range closing {
-		<-done
-	}
-}
 func (c *ControlledGateway) Close() {
 	defer c.connections.close()
-	c.retentionOnce.Do(func() { close(c.retentionStop) })
 	c.mu.Lock()
 	c.admission = false
 	c.retired = true
@@ -229,7 +157,6 @@ func (c *ControlledGateway) Close() {
 	// An in-flight command finishes first; later ones see the retired instance.
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
-	c.incidents.close()
 	c.mu.Lock()
 	c.active = nil
 	c.candidate = nil
@@ -240,17 +167,14 @@ func (c *ControlledGateway) Close() {
 		}
 	}
 	c.mu.Unlock()
-	c.waitClosingObservers()
 }
 func (c *ControlledGateway) statusLocked() map[string]any {
 	var current any
 	if c.active != nil {
 		s := c.active.snapshot
-		model := ""
-		if s.Backend.PreferredModel != nil {
-			model = *s.Backend.PreferredModel
-		}
-		current = map[string]any{"router_id": s.RouterID, "router_version": s.RouterVersion, "gateway_config_version": s.GatewayConfigVersion, "binding_revision": s.BindingRevision, "model": model}
+		current = map[string]any{"router_id": s.RouterID, "router_version": s.RouterVersion,
+			"gateway_config_version": s.GatewayConfigVersion, "binding_revision": s.BindingRevision,
+			"model": "", "target_url": s.TargetURL, "config_digest": s.ConfigDigest}
 	}
 	counts := []RuntimeCounts{}
 	for _, g := range c.generations {
@@ -294,6 +218,12 @@ func runtimeError(w http.ResponseWriter, status int, code string) {
 }
 func (c *ControlledGateway) ControlHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		version := 2
+		path := r.URL.Path
+		if strings.HasPrefix(path, "/control/v3/") {
+			version = 3
+			path = strings.Replace(path, "/control/v3/", "/control/v2/", 1)
+		}
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip, e := netip.ParseAddr(host)
 		allowed := false
@@ -306,15 +236,31 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			runtimeError(w, 403, "unauthorized")
 			return
 		}
-		if r.Method == "GET" && r.URL.Path == "/control/v2/status" {
+		if r.Method == "GET" && path == "/control/v2/status" {
 			c.mu.Lock()
-			response := newRuntimeResponse(200, c.statusLocked())
+			status := c.statusLocked()
+			status["protocol_version"] = version
+			status["service"] = "aigate-switch"
+			if version == 2 {
+				// Fixed execution images interpret this list as historical
+				// snapshots still draining on another entry. Current target
+				// business traffic may be shared and must not block them.
+				counts := []RuntimeCounts{}
+				for _, generation := range c.generations {
+					if generation != c.active && generation.refs > 0 {
+						counts = append(counts, generation.counts)
+					}
+				}
+				status["counts"] = counts
+				status["counts_scope"] = "retiring_snapshots"
+			}
+			response := newRuntimeResponse(200, status)
 			c.mu.Unlock()
 			response.write(w)
 			return
 		}
-		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/control/v2/commands/") {
-			n, e := strconv.ParseUint(strings.TrimPrefix(r.URL.Path, "/control/v2/commands/"), 10, 64)
+		if r.Method == "GET" && strings.HasPrefix(path, "/control/v2/commands/") {
+			n, e := strconv.ParseUint(strings.TrimPrefix(path, "/control/v2/commands/"), 10, 64)
 			c.mu.Lock()
 			var response runtimeResponseData
 			if e != nil {
@@ -328,7 +274,7 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			response.write(w)
 			return
 		}
-		if r.Method != "POST" || r.URL.Path != "/control/v2/commands" {
+		if r.Method != "POST" || path != "/control/v2/commands" {
 			runtimeError(w, 404, "not_found")
 			return
 		}
@@ -336,6 +282,14 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 		var cmd RuntimeCommand
 		if e != nil || strictDecode(data, &cmd) != nil {
 			runtimeError(w, 400, "invalid_request")
+			return
+		}
+		if cmd.ProtocolVersion != version {
+			runtimeError(w, 400, "protocol_mismatch")
+			return
+		}
+		if version == 2 && cmd.Action != "test-acquire" && cmd.Action != "test-release" && cmd.Action != "test-status" {
+			runtimeError(w, 400, "legacy_command_removed")
 			return
 		}
 		c.controlCommand(cmd).write(w)
@@ -347,7 +301,7 @@ func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseDa
 	defer c.cmdMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if cmd.ProtocolVersion != 2 || cmd.GatewayID != c.id || !validOperationID(cmd.OperationID) || cmd.Sequence == 0 {
+	if (cmd.ProtocolVersion != 2 && cmd.ProtocolVersion != 3) || cmd.GatewayID != c.id || !validOperationID(cmd.OperationID) || cmd.Sequence == 0 {
 		return newRuntimeError(400, "invalid_command")
 	}
 	if cmd.ExpectedBootID != c.boot {
@@ -389,187 +343,6 @@ func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseDa
 	return newRuntimeResponse(200, result)
 }
 
-func (c *ControlledGateway) ProfileHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.mu.Lock()
-		g := c.active
-		if g == nil || g.g.profile == nil {
-			c.mu.Unlock()
-			runtimeError(w, 503, "profile_unavailable")
-			return
-		}
-		g.refs++
-		c.mu.Unlock()
-		defer func() { c.mu.Lock(); defer c.mu.Unlock(); g.refs--; c.cleanupLocked() }()
-		if r.URL.Path == "/profile/v1/stream-incidents" {
-			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) != 1 {
-				runtimeError(w, 401, "unauthorized")
-				return
-			}
-			if g.g.incidents == nil {
-				runtimeError(w, 503, "incident_storage_unavailable")
-				return
-			}
-			g.g.incidents.serveHTTP(w, r)
-			return
-		}
-		g.g.profile.handler().ServeHTTP(w, r)
-		if r.URL.Path == "/metrics" && r.Method == http.MethodGet && c.connections != nil &&
-			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) == 1 {
-			fmt.Fprintf(w, "aigate_connection_diagnostic_dropped_total %d\naigate_connection_diagnostic_write_errors_total %d\n", c.connections.dropped.Load(), c.connections.writeErrors.Load())
-		}
-		if r.URL.Path == "/metrics" && r.Method == http.MethodGet && g.g.incidents != nil &&
-			subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+g.g.profile.c.APIKey)) == 1 {
-			fmt.Fprintf(w, "aigate_stream_incident_dropped_total %d\naigate_stream_incident_write_errors_total %d\n", g.g.incidents.dropped.Load(), g.g.incidents.failures.Load())
-		}
-	})
-}
-
-// Called with c.cmdMu and c.mu held; c.mu is released while observers open.
-func (c *ControlledGateway) prepareLocked(cmd RuntimeCommand, result *RuntimeResult) error {
-	if c.test != nil {
-		return fmt.Errorf("test_occupied")
-	}
-	if c.candidate != nil && c.candidate.owner != cmd.OperationID {
-		return fmt.Errorf("candidate_owned")
-	}
-	var s RuntimeSnapshot
-	if strictDecode(cmd.Payload, &s) != nil || s.Backend == nil || !validOperationID(s.RouterID) || s.BindingRevision <= c.revisionLocked() || s.RouterVersion == 0 || s.GatewayConfigVersion == 0 {
-		return fmt.Errorf("invalid_snapshot")
-	}
-	if s.Backend.Adapter != "openai" || len(s.Backend.HeadersEnv) > 0 || len(s.Backend.HeaderPrefixes) > 0 {
-		return fmt.Errorf("invalid_backend")
-	}
-	if e := checkRouter(s.Backend, s.GatewayAddresses); e != nil {
-		return fmt.Errorf("gateway_target_forbidden")
-	}
-	var settings map[string]json.RawMessage
-	if decodeJSON(s.Settings, &settings) != nil || settings == nil {
-		return fmt.Errorf("invalid_settings")
-	}
-	// Historical snapshots may contain the retired alias. Ignore it on load.
-	delete(settings, "public_model_name")
-	s.Settings = encodeJSON(settings)
-	allowedSettings := map[string]bool{"timeout_seconds": true, "discovery_timeout_seconds": true, "model_cache_seconds": true, "discovery_retry_seconds": true, "http_pool": true, "profile": true, "slow_requests": true}
-	for key := range settings {
-		if !allowedSettings[key] {
-			return fmt.Errorf("unknown_setting")
-		}
-	}
-	var typedSettings RuntimeSettings
-	if strictDecode(s.Settings, &typedSettings) != nil {
-		return fmt.Errorf("invalid_settings")
-	}
-	if typedSettings.Profile.Directory != "" || typedSettings.Profile.Listen != "" || typedSettings.Profile.APIKeyEnv != "" || typedSettings.SlowRequests.Directory != "" {
-		return fmt.Errorf("bootstrap_setting_forbidden")
-	}
-	runtimeSettings, e := parseRuntimeSettings(s.Settings)
-	if e != nil {
-		return fmt.Errorf("invalid_settings")
-	}
-	// Keep normalized runtime fields and mutable maps separate from the received snapshot.
-	var backend Backend
-	if decodeJSON(encodeJSON(s.Backend), &backend) != nil {
-		return fmt.Errorf("invalid_backend")
-	}
-	cfg := &RuntimeConfig{RuntimeSettings: runtimeSettings, RouterID: s.RouterID, Backend: &backend}
-	if cfg.Profile.Enabled && cfg.Profile.APIKey == "" {
-		return fmt.Errorf("profile_key_required")
-	}
-	cfg.Profile.APIKeyEnv = ""
-	// Observation paths are deployment-scoped. A route swap reuses observers;
-	// actual observation-policy changes get independent generations.
-	profileEnabled, slowEnabled := cfg.Profile.Enabled, cfg.SlowRequests.Enabled
-	cfg.Profile.Directory = ""
-	cfg.SlowRequests.Directory = ""
-	profilePolicy := runtimeDigest(cfg.Profile)[:16]
-	slowPolicy := runtimeDigest(cfg.SlowRequests)[:16]
-	cfg.Profile.Directory = filepath.Join(c.dataRoot, "request-profile", profilePolicy)
-	cfg.SlowRequests.Directory = filepath.Join(c.dataRoot, "slow-requests", slowPolicy)
-	var sharedProfile *requestProfiler
-	var sharedSlow *slowRequestStore
-	var pinned []*runtimeGeneration
-	for _, old := range c.generations {
-		if old.closed {
-			continue
-		}
-		if runtimeDigest(old.g.config.Profile) == runtimeDigest(cfg.Profile) {
-			sharedProfile = old.g.profile
-		}
-		if runtimeDigest(old.g.config.SlowRequests) == runtimeDigest(cfg.SlowRequests) {
-			sharedSlow = old.g.slow
-		}
-	}
-	// A new observer must wait until a closing one releases the same directory.
-	var waits []chan struct{}
-	if sharedProfile != nil {
-		cfg.Profile.Enabled = false
-	} else if profileEnabled {
-		if done := c.closingLocked(cfg.Profile.Directory); done != nil {
-			waits = append(waits, done)
-		}
-	}
-	if sharedSlow != nil {
-		cfg.SlowRequests.Enabled = false
-	} else if slowEnabled {
-		if done := c.closingLocked(cfg.SlowRequests.Directory); done != nil {
-			waits = append(waits, done)
-		}
-	}
-	// Keep shared observers open while c.mu is released below.
-	for _, old := range c.generations {
-		if old.closed {
-			continue
-		}
-		if (sharedProfile != nil && old.g.profile == sharedProfile) || (sharedSlow != nil && old.g.slow == sharedSlow) {
-			old.pins++
-			pinned = append(pinned, old)
-		}
-	}
-	// Opening observers reads and cleans their directories. Release c.mu so
-	// business requests continue; c.cmdMu keeps other commands and retention
-	// sweeps out, and status queries see this command as running.
-	result.Status = "running"
-	c.mu.Unlock()
-	for _, done := range waits {
-		<-done
-	}
-	// No environment mutation: secrets arrive in the authenticated snapshot.
-	g, e := newGateway(cfg, c.audit)
-	if e == nil && profileEnabled && c.incidents == nil {
-		var incidentErr error
-		c.incidents, incidentErr = newIncidentStore(filepath.Join(c.dataRoot, "stream-incidents"), c.id, c.boot, c.audit)
-		if incidentErr != nil {
-			fmt.Fprintln(c.audit, `{"event":"stream_incident_storage_unavailable"}`)
-		}
-	}
-	c.mu.Lock()
-	result.Status = "completed"
-	for _, old := range pinned {
-		old.pins--
-	}
-	if e != nil {
-		return fmt.Errorf("runtime_prepare_failed")
-	}
-	cfg.Profile.Enabled = profileEnabled
-	cfg.SlowRequests.Enabled = slowEnabled
-	if sharedProfile != nil {
-		g.profile = sharedProfile
-	}
-	if sharedSlow != nil {
-		g.slow = sharedSlow
-	}
-	if profileEnabled {
-		g.incidents = c.incidents
-	}
-	if s.APIKey != "" {
-		g.apiKey = "Bearer " + s.APIKey
-	}
-	gen := &runtimeGeneration{snapshot: s, g: g, owner: cmd.OperationID, counts: RuntimeCounts{RouterID: s.RouterID, Revision: s.BindingRevision}}
-	c.candidate = gen
-	c.generations = append(c.generations, gen)
-	return nil
-}
 func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeResult) error {
 	switch cmd.Action {
 	case "quiesce", "resume", "discard", "retire":
@@ -579,7 +352,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 	}
 	switch cmd.Action {
 	case "prepare":
-		return c.prepareLocked(cmd, result)
+		return c.prepareSwitchLocked(cmd)
 	case "validate":
 		g := c.candidate
 		if g == nil || g.owner != cmd.OperationID {
@@ -599,7 +372,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			report, e := validateControlledRuntime(c.ctx, g.g, policy)
+			report, e := validateSwitchTarget(c.ctx, g, policy)
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			g.refs--
@@ -645,10 +418,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		c.candidate = nil
 		c.admission = p.Admission
 		c.quiesceOwner = ""
-		select {
-		case c.retentionWake <- struct{}{}:
-		default:
-		}
+
 	case "resume":
 		if c.active == nil || c.quiesceOwner != cmd.OperationID {
 			return fmt.Errorf("resume_not_owned")
@@ -676,6 +446,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 }
 func (c *ControlledGateway) testCommandLocked(cmd RuntimeCommand, result *RuntimeResult) error {
 	var p struct {
+		ConfigDigest    string `json:"config_digest,omitempty"`
 		TaskID          string `json:"task_id"`
 		Token           string `json:"token"`
 		Model           string `json:"model,omitempty"`
@@ -715,7 +486,13 @@ func (c *ControlledGateway) testCommandLocked(cmd RuntimeCommand, result *Runtim
 	if !c.admission || c.active == nil || c.candidate != nil || p.RouterID != c.active.snapshot.RouterID || p.BindingRevision != c.revisionLocked() || p.Model == "" {
 		return fmt.Errorf("test_target_changed")
 	}
-	c.test = &runtimeTest{TaskID: p.TaskID, Model: p.Model, RouterID: p.RouterID, BindingRevision: p.BindingRevision, hash: hash}
+	if p.ConfigDigest == "" {
+		p.ConfigDigest = c.active.snapshot.ConfigDigest
+	}
+	if p.ConfigDigest != c.active.snapshot.ConfigDigest {
+		return fmt.Errorf("test_config_changed")
+	}
+	c.test = &runtimeTest{TaskID: p.TaskID, Model: p.Model, RouterID: p.RouterID, BindingRevision: p.BindingRevision, hash: hash, ConfigDigest: p.ConfigDigest}
 	return nil
 }
 
@@ -800,7 +577,5 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		c.cleanupLocked()
 	}()
-	w.Header().Set("X-Aigate-Backend", g.snapshot.RouterID)
-	w.Header().Set("X-Aigate-Route-Version", strconv.FormatUint(g.snapshot.BindingRevision, 10))
-	g.g.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), runtimeRequestKey{}, meta)))
+	g.forward.serve(w, r, meta, lease)
 }

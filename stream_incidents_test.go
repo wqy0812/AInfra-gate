@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -439,45 +439,40 @@ func TestIncidentWatchdogDuringBlockedWrite(t *testing.T) {
 	}
 }
 
-func TestIncidentRuntimeAuthAndRouteSwap(t *testing.T) {
+func TestIncidentProxyOwnershipSurvivesEntrySwitch(t *testing.T) {
 	c := controlledFixture(t)
-	snapshot := snapshotV2("r1", "http://127.0.0.1:19099", 1)
-	snapshot.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"incident-key"}}`)
-	activateV2(t, c, "first", snapshot)
-	store := c.incidents
-	if store == nil || c.active.g.incidents != store {
-		t.Fatal("not enabled with profile")
+	s1, first := proxySnapshot(t, "r1", "http://127.0.0.1:19099", 1, json.RawMessage(`{"profile":{"enabled":true}}`), nil)
+	s2, second := proxySnapshot(t, "r2", "http://127.0.0.1:19098", 2, json.RawMessage(`{"profile":{"enabled":true}}`), nil)
+	activateV3(t, c, "first", s1)
+	store := first.g.incidents
+	if store == nil || second.g.incidents == store {
+		t.Fatal("proxy incident stores not independent")
 	}
 	now := time.Now().Add(-time.Minute)
-	if e := store.save(streamIncident{ID: "before-swap", Router: "r1", TriggeredAt: now, State: "ended"}); e != nil {
-		t.Fatal(e)
+	if err := store.save(streamIncident{ID: "before-switch", Router: "r1", TriggeredAt: now, State: "ended"}); err != nil {
+		t.Fatal(err)
 	}
-	snapshot.RouterID = "r2"
-	snapshot.BindingRevision = 2
-	snapshot.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"new-key"}}`)
-	activateV2(t, c, "second", snapshot)
-	if c.incidents != store || c.active.g.incidents != store {
-		t.Fatal("store changed on swap")
-	}
+	activateV3(t, c, "second", s2)
 	query := "/profile/v1/stream-incidents?start=" + fmt.Sprint(now.Add(-time.Second).Unix()) + "&end=" + fmt.Sprint(time.Now().Unix())
-	for _, key := range []string{"", "incident-key", "new-key"} {
+	for _, key := range []string{"", "old-key", "anything"} {
 		req := httptest.NewRequest("GET", query, nil)
-		req.Header.Set("Authorization", "Bearer "+key)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 		w := httptest.NewRecorder()
-		c.ProfileHandler().ServeHTTP(w, req)
-		if key == "new-key" {
-			if w.Code != 200 || !strings.Contains(w.Body.String(), "before-swap") {
-				t.Fatal(w.Code, w.Body.String())
-			}
-		} else if w.Code != 401 {
-			t.Fatal("auth bypass", w.Code)
+		first.ObservationHandler().ServeHTTP(w, req)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "before-switch") {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		w = httptest.NewRecorder()
+		second.ObservationHandler().ServeHTTP(w, req)
+		if w.Code != 200 || strings.Contains(w.Body.String(), "before-switch") {
+			t.Fatal("incident history moved with entry", w.Code, w.Body.String())
 		}
 	}
-	c.incidents.dropped.Add(2)
-	req := httptest.NewRequest("GET", "/metrics", nil)
-	req.Header.Set("Authorization", "Bearer new-key")
+	store.dropped.Add(2)
 	w := httptest.NewRecorder()
-	c.ProfileHandler().ServeHTTP(w, req)
+	first.ObservationHandler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
 	if !strings.Contains(w.Body.String(), "aigate_stream_incident_dropped_total 2") {
 		t.Fatal("missing diagnostics metrics")
 	}

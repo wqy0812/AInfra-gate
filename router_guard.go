@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"fmt"
@@ -26,20 +26,4 @@ func controlBase(s string) (string, error) {
 		host += ":" + port
 	}
 	return strings.ToLower(u.Scheme) + "://" + host + p, nil
-}
-
-func checkRouter(b *Backend, gatewayURLs []string) error {
-	for _, value := range []string{b.URL, b.ModelsURL} {
-		base, err := controlBase(value)
-		if err != nil {
-			return err
-		}
-		for _, gateway := range gatewayURLs {
-			forbidden, _ := controlBase(gateway)
-			if base == forbidden {
-				return fmt.Errorf("网关只能指向 Router，禁止网关串联")
-			}
-		}
-	}
-	return nil
 }

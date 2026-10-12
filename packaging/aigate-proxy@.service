@@ -1,0 +1,27 @@
+[Unit]
+Description=aigate functional proxy for Router %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aigate-proxy
+Group=aigate-proxy
+StateDirectory=aigate-proxy-%i
+StateDirectoryMode=0700
+Environment="AIGATE_PROXY_LISTEN=127.0.0.1:18084"
+Environment="AIGATE_PROFILE_LISTEN=127.0.0.1:18082"
+EnvironmentFile=-/etc/aigate/proxy-%i.env
+ExecStart=/usr/local/bin/aigate-proxy serve --config /etc/aigate/proxy-%i.json --listen ${AIGATE_PROXY_LISTEN} --profile-listen ${AIGATE_PROFILE_LISTEN} --data-root /var/lib/aigate-proxy-%i --shutdown-timeout 62m
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=63min
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

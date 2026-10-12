@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -27,23 +27,23 @@ func TestControlResponseBackpressureDoesNotBlockRuntime(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			c := controlledFixture(t)
 			backend := newProtocolBackend(t)
-			activateV2(t, c, "bind", snapshotV2("r1", backend.server.URL, 1))
-			cmd := RuntimeCommand{ProtocolVersion: 2, OperationID: "probe", GatewayID: c.id, ExpectedBootID: c.boot,
+			activateV3(t, c, "bind", switchSnapshot(t, "r1", backend.server.URL, 1))
+			cmd := RuntimeCommand{ProtocolVersion: 3, OperationID: "probe", GatewayID: c.id, ExpectedBootID: c.boot,
 				Sequence: c.sequence + 1, ExpectedRevision: 1, Action: "test-status",
 				Payload: encodeJSON(map[string]string{"task_id": "task", "token": strings.Repeat("t", 32)})}
 			if kind != "new_command" {
-				if code, result := controlRequestV2(t, c, cmd); code != 200 || result.Status != "completed" {
+				if code, result := controlRequest(t, c, cmd); code != 200 || result.Status != "completed" {
 					t.Fatal(code, result)
 				}
 			}
-			method, path, body := "GET", "/control/v2/status", []byte(nil)
+			method, path, body := "GET", "/control/v3/status", []byte(nil)
 			switch kind {
 			case "result":
-				path = "/control/v2/commands/" + strconv.FormatUint(cmd.Sequence, 10)
+				path = "/control/v3/commands/" + strconv.FormatUint(cmd.Sequence, 10)
 			case "missing_result":
-				path = "/control/v2/commands/999"
+				path = "/control/v3/commands/999"
 			case "new_command", "replay", "conflict":
-				method, path = "POST", "/control/v2/commands"
+				method, path = "POST", "/control/v3/commands"
 				if kind == "conflict" {
 					cmd.OperationID = "conflicting"
 				}
@@ -77,7 +77,7 @@ func TestControlResponseBackpressureDoesNotBlockRuntime(t *testing.T) {
 			}
 			commandDone := make(chan struct{})
 			go func() {
-				commandV2(t, c, "independent", "test-status", map[string]string{"task_id": "task", "token": strings.Repeat("t", 32)})
+				commandV3(t, c, "independent", "test-status", map[string]string{"task_id": "task", "token": strings.Repeat("t", 32)})
 				close(commandDone)
 			}()
 			select {

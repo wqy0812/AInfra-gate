@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -16,116 +16,168 @@ import (
 	"time"
 )
 
-// Exercise the actual v2 executable. Runtime files and legacy CLI cannot bootstrap it.
+// Both actual executables are exercised; neither relies on the other to start.
 func TestBinaryLifecycle(t *testing.T) {
 	if testing.Short() || runtime.GOOS == "windows" {
 		t.Skip("Unix process integration")
 	}
 	dir := t.TempDir()
-	binary := filepath.Join(dir, "aigate")
-	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if out, e := exec.CommandContext(ctx, "go", "build", "-mod=vendor", "-o", binary, ".").CombinedOutput(); e != nil {
-		t.Fatalf("build: %v %s", e, out)
-	}
-	for _, args := range [][]string{{"switch", "single", "a"}, {"status"}, {"check", "--config", "missing.json"}, {"serve", "--config", "missing.json"}} {
-		if e := exec.CommandContext(ctx, binary, args...).Run(); e == nil {
-			t.Fatalf("legacy CLI accepted: %v", args)
+	binaries := map[string]string{}
+	for _, name := range []string{"aigate-switch", "aigate-proxy"} {
+		binaries[name] = filepath.Join(dir, name)
+		if out, err := exec.CommandContext(ctx, "go", "build", "-mod=vendor", "-o", binaries[name], "./cmd/"+name).CombinedOutput(); err != nil {
+			t.Fatalf("build %s: %v %s", name, err, out)
 		}
 	}
 	address := func() string {
-		l, e := net.Listen("tcp", "127.0.0.1:0")
-		if e != nil {
-			t.Fatal(e)
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
 		}
 		a := l.Addr().String()
-		_ = l.Close()
+		l.Close()
 		return a
 	}
-	business, control := address(), address()
-	logs := &lockedBuffer{}
-	command := exec.CommandContext(ctx, binary, "serve", "--id", "g1", "--listen", business, "--control-listen", control, "--profile-listen=", "--data-root", dir, "--shutdown-timeout", "3s")
-	command.Env = append(os.Environ(), "AIGATE_CONTROL_KEY="+strings.Repeat("k", 32))
-	command.Stderr = logs
-	if e := command.Start(); e != nil {
-		t.Fatal(e)
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	waited := false
-	defer func() {
-		if !waited {
-			_ = command.Process.Kill()
-			<-done
+	start := func(binary string, args []string, env []string) (*exec.Cmd, func()) {
+		logs := &lockedBuffer{}
+		command := exec.CommandContext(ctx, binary, args...)
+		command.Env = append(os.Environ(), env...)
+		command.Stderr = logs
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
 		}
-	}()
-	client := &http.Client{Timeout: 3 * time.Second}
+		done := make(chan error, 1)
+		go func() { done <- command.Wait() }()
+		waited := false
+		stop := func() {
+			if waited {
+				return
+			}
+			command.Process.Signal(os.Interrupt)
+			select {
+			case err := <-done:
+				waited = true
+				if err != nil {
+					t.Fatal(err, logs.String())
+				}
+			case <-time.After(10 * time.Second):
+				command.Process.Kill()
+				<-done
+				waited = true
+				t.Fatal("service failed to stop", logs.String())
+			}
+		}
+		t.Cleanup(stop)
+		return command, stop
+	}
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+	ready := func(url string) {
+		until := time.Now().Add(5 * time.Second)
+		for time.Now().Before(until) {
+			r, err := client.Get(url + "/health")
+			if err == nil {
+				r.Body.Close()
+				if r.StatusCode == 200 {
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("not ready", url)
+	}
+	upstream := newProtocolBackend(t)
+	proxyAddr, switchAddr, controlAddr := address(), address(), address()
+	config := filepath.Join(dir, "proxy.json")
+	cfg := ProxyConfig{ServiceID: "p", RouterID: "r1", Backend: &Backend{Adapter: "openai", URL: upstream.server.URL + "/v1/chat/completions", ModelsURL: upstream.server.URL + "/v1/models"}, Settings: json.RawMessage(`{"profile":{"enabled":true}}`)}
+	if err := os.WriteFile(config, encodeJSON(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, stopProxy := start(binaries["aigate-proxy"], []string{"--config", config, "--listen", proxyAddr, "--profile-listen=", "--data-root", filepath.Join(dir, "observations"), "--shutdown-timeout", "8s"}, []string{"AIGATE_CONTROL_KEY=", "AIGATE_PROFILE_KEY="})
+	proxyURL := "http://" + proxyAddr
+	ready(proxyURL)
+	response, err := client.Get(proxyURL + "/runtime/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Digest string `json:"config_digest"`
+	}
+	json.NewDecoder(response.Body).Decode(&state)
+	response.Body.Close()
+	if state.Digest == "" {
+		t.Fatal("missing config digest")
+	}
+	_, stopSwitch := start(binaries["aigate-switch"], []string{"--id", "g1", "--listen", switchAddr, "--control-listen", controlAddr, "--shutdown-timeout", "2s"}, []string{"AIGATE_CONTROL_KEY=" + strings.Repeat("k", 32)})
+	switchURL := "http://" + switchAddr
+	ready(switchURL)
+	statusReq, _ := http.NewRequest("GET", "http://"+controlAddr+"/control/v3/status", nil)
+	statusReq.Header.Set("Authorization", "Bearer "+strings.Repeat("k", 32))
+	response, err = client.Do(statusReq)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var status struct {
 		Boot string `json:"boot_id"`
 	}
-	until := time.Now().Add(5 * time.Second)
-	for time.Now().Before(until) {
-		req, _ := http.NewRequest("GET", "http://"+control+"/control/v2/status", nil)
-		req.Header.Set("Authorization", "Bearer "+strings.Repeat("k", 32))
-		r, e := client.Do(req)
-		if e == nil {
-			_ = json.NewDecoder(r.Body).Decode(&status)
-			r.Body.Close()
-			if status.Boot != "" {
-				break
-			}
+	json.NewDecoder(response.Body).Decode(&status)
+	response.Body.Close()
+	response, err = client.Get(switchURL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != 503 {
+		t.Fatal("unconfigured switch served")
+	}
+	snapshot := SwitchSnapshot{RouterID: "r1", RouterVersion: 1, GatewayConfigVersion: 1, BindingRevision: 1, TargetURL: proxyURL, ConfigDigest: state.Digest}
+	for i, action := range []string{"prepare", "quiesce", "activate"} {
+		payload := any(map[string]any{})
+		if action == "prepare" {
+			payload = snapshot
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if status.Boot == "" {
-		t.Fatalf("not ready: %s", logs.String())
-	}
-	r, e := client.Get("http://" + business + "/v1/models")
-	if e != nil {
-		t.Fatal(e)
-	}
-	r.Body.Close()
-	if r.StatusCode != 503 {
-		t.Fatal("unconfigured process served business")
-	}
-	p := newProtocolBackend(t)
-	send := func(seq uint64, action string, payload any) {
-		cmd := RuntimeCommand{ProtocolVersion: 2, OperationID: "initial", GatewayID: "g1", ExpectedBootID: status.Boot, Sequence: seq, Action: action, Payload: encodeJSON(payload)}
-		req, _ := http.NewRequest("POST", "http://"+control+"/control/v2/commands", bytes.NewReader(encodeJSON(cmd)))
-		req.Header.Set("Authorization", "Bearer "+strings.Repeat("k", 32))
-		res, e := client.Do(req)
-		if e != nil {
-			t.Fatal(e)
+		if action == "activate" {
+			payload = map[string]any{"admission": true}
 		}
-		defer res.Body.Close()
+		command := RuntimeCommand{ProtocolVersion: 3, OperationID: "initial", GatewayID: "g1", ExpectedBootID: status.Boot, Sequence: uint64(i + 1), Action: action, Payload: encodeJSON(payload)}
+		req, _ := http.NewRequest("POST", "http://"+controlAddr+"/control/v3/commands", bytes.NewReader(encodeJSON(command)))
+		req.Header.Set("Authorization", "Bearer "+strings.Repeat("k", 32))
+		response, err = client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
 		var result RuntimeResult
-		_ = json.NewDecoder(res.Body).Decode(&result)
-		if result.Status != "completed" {
-			t.Fatalf("%s: %+v", action, result)
+		if json.Unmarshal(body, &result) != nil || result.Status != "completed" {
+			t.Fatal(action, string(body))
 		}
 	}
-	send(1, "prepare", snapshotV2("r1", p.server.URL, 1))
-	send(2, "quiesce", map[string]any{})
-	send(3, "activate", map[string]any{"admission": true})
-	r, e = client.Post("http://"+business+"/v1/chat/completions", "application/json", strings.NewReader(basicBody))
-	if e != nil {
-		t.Fatal(e)
+	response, err = client.Post(switchURL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`))
+	body := splitRead(t, response, err)
+	if response.StatusCode != 200 || !strings.Contains(body, "[DONE]") {
+		t.Fatal(body)
 	}
-	body, _ := io.ReadAll(r.Body)
-	r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Fatalf("%d %s", r.StatusCode, body)
-	}
-	if e = command.Process.Signal(os.Interrupt); e != nil {
-		t.Fatal(e)
-	}
-	if e = <-done; e != nil {
-		t.Fatal(e, logs.String())
-	}
-	waited = true
-	for _, name := range []string{"config.json", "management-state.json", "routing.json", "control.sock"} {
-		if _, e = os.Stat(filepath.Join(dir, name)); !os.IsNotExist(e) {
-			t.Fatal("runtime configuration persisted", name)
+	for _, name := range []string{"X-Aigate-Backend", "X-Aigate-Route-Version", "X-Aigate-Model"} {
+		if len(response.Header.Values(name)) != 1 {
+			t.Fatalf("duplicated target header %s: %v", name, response.Header.Values(name))
 		}
+	}
+	stopSwitch()
+	response, err = client.Get(proxyURL + "/v1/models")
+	body = splitRead(t, response, err)
+	if response.StatusCode != 200 {
+		t.Fatal("proxy depended on switch", body)
+	}
+	client.CloseIdleConnections()
+	stopProxy()
+	for _, addr := range []string{proxyAddr, switchAddr, controlAddr} {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Fatal("listener leaked", addr, err)
+		}
+		l.Close()
 	}
 }

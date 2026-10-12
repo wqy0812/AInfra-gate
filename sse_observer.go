@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -13,6 +13,18 @@ const maxSSEChoices = 1024
 type sseObserverContextKey struct{}
 
 type observedTool struct{ ID, Name, Arguments string }
+
+// Positions refer to the decoded upstream byte stream, including ignored fields
+// and line endings. A callback consumes each event immediately; no event list is
+// retained when one Read contains many events.
+type sseEventPosition struct {
+	Index  uint64    `json:"index"`
+	Start  int64     `json:"start"`
+	End    int64     `json:"end"`
+	At     time.Time `json:"at"`
+	Useful bool      `json:"useful"`
+	Known  bool      `json:"known"`
+}
 
 // Observes a copy of streamed bytes. It never changes or delays the forward path.
 // Business streams retain no output text; probes collect bounded synthetic output.
@@ -31,6 +43,12 @@ type sseObserver struct {
 	LastUsefulAt                             time.Time
 	started                                  time.Time
 	collected                                int
+	positionOffset, eventStart               int64
+	eventIndex                               uint64
+	observedAt                               time.Time
+	eventUseful                              bool
+	LastEvent, LastUsefulEvent               sseEventPosition
+	onEvent                                  func(sseEventPosition)
 }
 
 func newSSEObserver(collect bool) *sseObserver {
@@ -62,9 +80,11 @@ func (o *sseObserver) expectPayload(payload []byte) {
 
 func (o *sseObserver) Feed(p []byte) {
 	if o.Unknown {
+		o.positionOffset += int64(len(p))
 		return
 	}
-	for _, b := range p {
+	for i, b := range p {
+		o.positionOffset++
 		if o.skipLF {
 			o.skipLF = false
 			if b == '\n' {
@@ -84,6 +104,7 @@ func (o *sseObserver) Feed(p []byte) {
 			o.Content = ""
 			o.Tools = nil
 			o.finishedChoices = nil
+			o.positionOffset += int64(len(p) - i - 1)
 			return
 		}
 	}
@@ -94,9 +115,24 @@ func (o *sseObserver) consumeLine() {
 	o.line = nil
 	if len(line) == 0 {
 		if len(o.data) > 0 {
+			o.eventUseful = false
 			o.event(bytes.TrimSuffix(o.data, []byte{'\n'}))
+			o.eventIndex++
+			at := o.observedAt
+			if at.IsZero() {
+				at = time.Now()
+			}
+			position := sseEventPosition{Index: o.eventIndex, Start: o.eventStart, End: o.positionOffset, At: at, Useful: o.eventUseful, Known: !o.Unknown && !o.Invalid}
+			o.LastEvent = position
+			if position.Useful && position.Known {
+				o.LastUsefulEvent = position
+			}
+			if o.onEvent != nil {
+				o.onEvent(position)
+			}
 			o.data = nil
 		}
+		o.eventStart = o.positionOffset
 		return
 	}
 	if bytes.HasPrefix(line, []byte("data:")) {
@@ -180,8 +216,12 @@ func (o *sseObserver) event(data []byte) {
 		}
 		o.finishedChoices[index] = o.finishedChoices[index] || finished
 		if useful {
+			o.eventUseful = true
 			o.Useful = true
-			o.LastUsefulAt = time.Now()
+			o.LastUsefulAt = o.observedAt
+			if o.LastUsefulAt.IsZero() {
+				o.LastUsefulAt = time.Now()
+			}
 			if o.FirstMS == nil {
 				n := float64(time.Since(o.started).Microseconds()) / 1000
 				o.FirstMS = &n

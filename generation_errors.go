@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"context"
@@ -14,12 +14,14 @@ import (
 // Only public chat generation installs this state. Discovery and probes do not.
 type generationContextKey struct{}
 type generationResult struct {
-	observer   *sseObserver
-	started    bool
-	stream     bool
-	status     int
-	errorClass string
-	result     string
+	observer                       *sseObserver
+	started                        bool
+	stream                         bool
+	status                         int
+	errorClass                     string
+	result                         string
+	responseEncoding, decodeOrigin string
+	responseDecoded                bool
 }
 
 func generationFrom(ctx context.Context) *generationResult {

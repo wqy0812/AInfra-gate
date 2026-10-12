@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"io"
@@ -24,11 +24,11 @@ func TestRuntimeCLIStartsAndShutsDownGracefully(t *testing.T) {
 		listener.Close()
 		return address
 	}
-	business, control, profile, data := freeAddress(), freeAddress(), freeAddress(), t.TempDir()
+	business, control := freeAddress(), freeAddress()
 	done := make(chan error, 1)
 	go func() {
-		done <- run([]string{"serve", "--listen", business, "--control-listen", control,
-			"--profile-listen", profile, "--data-root", data, "--shutdown-timeout", "2s"}, io.Discard, io.Discard)
+		done <- RunSwitch([]string{"serve", "--listen", business, "--control-listen", control,
+			"--shutdown-timeout", "2s"}, io.Discard, io.Discard)
 	}()
 	client := &http.Client{Timeout: time.Second}
 	defer client.CloseIdleConnections()
@@ -62,7 +62,7 @@ func TestRuntimeCLIStartsAndShutsDownGracefully(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("CLI did not stop")
 	}
-	for _, address := range []string{business, control, profile} {
+	for _, address := range []string{business, control} {
 		listener, err := net.Listen("tcp", address)
 		if err != nil {
 			t.Fatal("listener leaked", address, err)

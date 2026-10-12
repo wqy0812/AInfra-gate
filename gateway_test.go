@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bufio"
@@ -500,7 +500,7 @@ func TestSSEFlushSwitchAndPassThrough(t *testing.T) {
 	c := controlledFixture(t)
 	logs := &lockedBuffer{}
 	c.audit = logs
-	activateV2(t, c, "bind", snapshotV2("api1", u1.URL, 1))
+	activateV3(t, c, "bind", switchSnapshot(t, "api1", u1.URL, 1))
 	s := httptest.NewServer(c)
 	defer s.Close()
 	body := `{"stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call1"}]}]}`
@@ -515,7 +515,7 @@ func TestSSEFlushSwitchAndPassThrough(t *testing.T) {
 	if err != nil || line != strings.Split(first, "\n")[0]+"\n" {
 		t.Fatal("first event not immediately forwarded")
 	}
-	activateV2(t, c, "swap", snapshotV2("api2", u2.URL, 2))
+	activateV3(t, c, "switch", switchSnapshot(t, "api2", u2.URL, 2))
 	r, data := request(t, s, "POST", "/v1/chat/completions", body, "")
 	if r.StatusCode != 200 || string(data) != first+tail {
 		t.Fatal("switched stream changed")

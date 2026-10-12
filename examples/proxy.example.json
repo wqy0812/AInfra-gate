@@ -1,0 +1,38 @@
+{
+  "service_id": "proxy-r1",
+  "router_id": "r1",
+  "backend": {
+    "adapter": "openai",
+    "url": "http://127.0.0.1:18077/v1/chat/completions",
+    "models_url": "http://127.0.0.1:18077/v1/models",
+    "models_list_path": "data",
+    "model_id_path": "id",
+    "compatibility": {"metadata_values": "preserve", "drop_fields": []},
+    "overrides": {}
+  },
+  "settings": {
+    "timeout_seconds": 1860,
+    "discovery_timeout_seconds": 10,
+    "model_cache_seconds": 60,
+    "discovery_retry_seconds": 5,
+    "http_pool": {
+      "max_idle_connections": 256,
+      "max_idle_connections_per_host": 128,
+      "max_connections_per_host": 0,
+      "idle_timeout_seconds": 90
+    },
+    "profile": {
+      "enabled": true,
+      "retention_hours": 72,
+      "max_disk_bytes": 10737418240,
+      "queue_events": 2048
+    },
+    "slow_requests": {
+      "enabled": false,
+      "threshold_seconds": 300,
+      "retention_hours": 72,
+      "max_disk_bytes": 10737418240,
+      "max_queue_bytes": 67108864
+    }
+  }
+}

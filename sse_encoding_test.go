@@ -1,14 +1,17 @@
-package main
+package aigate
 
 import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -71,6 +74,13 @@ func TestSSEEncodingStreaming(t *testing.T) {
 			cfg.Backend.Headers = map[string]string{"Accept-Encoding": tc.accept}
 			cfg.Profile.Enabled, cfg.Profile.APIKey, cfg.Profile.Directory = true, "fixture-key", t.TempDir()
 			g, server, logs := serveTest(t, cfg)
+			captureRoot := filepath.Join(t.TempDir(), "requests")
+			captureStore, err := newStreamCaptureStore(captureRoot, "gzip-proxy", "gzip-router", "gzip-boot", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer captureStore.close()
+			g.captures = captureStore
 			client := &http.Client{Timeout: 3 * time.Second}
 			response, err := client.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"stream":true}`))
 			if err != nil {
@@ -82,6 +92,17 @@ func TestSSEEncodingStreaming(t *testing.T) {
 			if err != nil || line != strings.SplitAfter(first, "\n")[0] {
 				t.Fatalf("first SSE event was delayed or encoded: line=%q err=%v", line, err)
 			}
+			captureStore.mu.Lock()
+			var capturing *streamCapture
+			for c := range captureStore.active {
+				capturing = c
+				break
+			}
+			captureStore.mu.Unlock()
+			if capturing == nil {
+				t.Fatal("missing capture handle")
+			}
+			capturing.trigger("gzip-fixture", "output_stall", time.Now())
 			release()
 			rest, err := io.ReadAll(reader)
 			if err != nil || line+string(rest) != first+last || response.Header.Get("Content-Encoding") != "" {
@@ -92,6 +113,25 @@ func TestSSEEncodingStreaming(t *testing.T) {
 				t.Fatalf("decoded stream misclassified: %+v", e)
 			}
 			requireGenerationCount(t, g.profile, true, "completed", "", "", 1)
+			captureStore.close()
+			data, err := os.ReadFile(filepath.Join(captureRoot, "request-"+capturing.id, "meta.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var meta streamCaptureMeta
+			if err = json.Unmarshal(data, &meta); err != nil {
+				t.Fatal(err)
+			}
+			origin := ""
+			if tc.encoding == "gzip" {
+				origin = "proxy"
+				if tc.accept == "" {
+					origin = "transport"
+				}
+			}
+			if meta.Decoded != (tc.encoding == "gzip") || meta.DecodeOrigin != origin || meta.ContentEncoding != tc.encoding || meta.CaptureState != "complete" {
+				t.Fatalf("encoding metadata: %+v", meta)
+			}
 		})
 	}
 }

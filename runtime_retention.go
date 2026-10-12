@@ -1,9 +1,7 @@
-package main
+package aigate
 
-// A policy change stops the old observer, but must not stop retention of its
-// files. Only inactive directories are collected here; live writers retain
-// their own files and count against the same budget. Draining generations may
-// temporarily exceed it until their last request releases the writer.
+// Proxy startup and retention reuse these helpers for inactive policy directories.
+// Active writers retain their own files and count against the same storage budget.
 import (
 	"fmt"
 	"io/fs"
@@ -21,59 +19,6 @@ type observationRecord struct {
 	at    time.Time
 	bytes int64
 	slow  bool
-}
-
-func (c *ControlledGateway) retainObservations() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.retentionStop:
-			return
-		case <-ticker.C:
-		case <-c.retentionWake:
-		}
-		if err := c.cleanupObservations(time.Now()); err != nil {
-			fmt.Fprintln(c.audit, string(encodeJSON(map[string]any{"event": "observation_retention_error", "error": err.Error()})))
-		}
-	}
-}
-
-func (c *ControlledGateway) cleanupObservations(now time.Time) error {
-	// Let observers already closing release their directories first. c.cmdMu
-	// keeps prepare from reopening a directory between the liveness check and
-	// deletion. c.mu covers only the snapshot: the sweep walks the disk and
-	// must not stall business admission or completion. A generation closing
-	// later stays protected, or locked by its writer, until the next sweep.
-	c.waitClosingObservers()
-	c.cmdMu.Lock()
-	defer c.cmdMu.Unlock()
-	c.mu.Lock()
-	if c.active == nil {
-		c.mu.Unlock()
-		return nil
-	} // a draft is not a retention policy
-	protected := map[string]bool{}
-	for _, g := range c.generations {
-		if g.closed {
-			continue
-		}
-		if g.g.profile != nil {
-			protected[g.g.profile.c.Directory] = true
-		}
-		if g.g.slow != nil {
-			protected[g.g.slow.c.Directory] = true
-		}
-	}
-	profile, slow := c.active.g.config.Profile, c.active.g.config.SlowRequests
-	c.mu.Unlock()
-	profileErr := cleanObservationRoot(filepath.Join(c.dataRoot, "request-profile"), false, now, profile.RetentionHours, profile.MaxDiskBytes, protected)
-	slowErr := cleanObservationRoot(filepath.Join(c.dataRoot, "slow-requests"), true, now, slow.RetentionHours, slow.MaxDiskBytes, protected)
-	if profileErr != nil {
-		return profileErr
-	}
-	return slowErr
 }
 
 func observationPolicyDir(name string) bool {

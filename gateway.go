@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"bytes"
@@ -29,7 +29,8 @@ type Gateway struct {
 	profile   *requestProfiler
 	slow      *slowRequestStore
 	now       func() time.Time
-	incidents *incidentStore // owned by ControlledGateway, shared across route snapshots
+	incidents *incidentStore      // owned by ControlledGateway, shared across route snapshots
+	captures  *streamCaptureStore // proxy only; never installed on switch snapshots
 }
 
 func newGateway(c *RuntimeConfig, audit io.Writer) (*Gateway, error) {
@@ -69,13 +70,17 @@ func newGateway(c *RuntimeConfig, audit io.Writer) (*Gateway, error) {
 }
 
 func (g *Gateway) Close() {
+	var group sync.WaitGroup
 	if g.slow != nil {
-		g.slow.close()
+		group.Add(1)
+		go func() { defer group.Done(); g.slow.close() }()
 	}
 	if g.profile != nil {
-		g.profile.close()
+		group.Add(1)
+		go func() { defer group.Done(); g.profile.close() }()
 	}
 	g.transport.CloseIdleConnections()
+	group.Wait()
 }
 
 type auditEntry struct {
@@ -265,7 +270,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	entry.diagnostic.stage("request_body_ready")
 	if body.stream && g.incidents != nil {
-		head, tail, length := questionEdges(body.question)
+		head, tail, length := questionEdges(incidentQuestionText(body.question))
 		r = r.WithContext(context.WithValue(r.Context(), incidentQuestionKey{}, incidentQuestion{head, tail, length}))
 	}
 	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok {
@@ -336,7 +341,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		return
 	}
 	if body.stream {
-		g.stream(w, r, response, ctx, entry)
+		g.stream(w, r, response, ctx, entry, data)
 		return
 	}
 	entry.profile.liveStage("reading_response")
@@ -447,21 +452,49 @@ func (g *Gateway) generate(ctx context.Context, body *chatBody, backend *Backend
 		return nil, fault(502, "invalid_upstream_stream", "下游未返回 SSE 流")
 	}
 	if body.stream {
+		if state != nil {
+			state.responseEncoding = response.Header.Get("Content-Encoding")
+			if response.Uncompressed {
+				state.responseEncoding = "gzip"
+				state.decodeOrigin = "transport"
+				state.responseDecoded = true
+			}
+		}
 		if err := decodeSSEBody(response); err != nil {
 			response.Body.Close()
 			diagnostic.failure("upstream_content_decode", err, ctx, nil)
 			state.fail("protocol_error")
 			return nil, err
 		}
+		if state != nil && response.Uncompressed && state.decodeOrigin == "" {
+			state.decodeOrigin = "proxy"
+			state.responseDecoded = true
+		}
 	}
 	return response, nil
 }
 
-func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry) (outcome string) {
+func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.Response, ctx context.Context, entry *auditEntry, raw ...[]byte) (outcome string) {
 	entry.diagnostic.stage("stream_started")
+	var capture *streamCapture
+	if len(raw) > 0 {
+		capture = g.captures.begin(entry.RequestID, raw[0], entry.started)
+	}
+	state := entry.generation
+	capture.setResponse(response.StatusCode, response.Header.Get("Content-Type"), state.responseEncoding, state.decodeOrigin, state.responseDecoded)
+	var eof bool
+	defer func() {
+		reason := outcome
+		if r.Context().Err() != nil {
+			reason = "client_cancelled"
+		} else if ctx.Err() != nil {
+			reason = "timeout"
+		}
+		capture.finish(time.Now(), reason, eof, state.observer.Done)
+	}()
 	var diagnostic *incidentRequest
 	if g.incidents != nil {
-		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC()}
+		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC(), ConnectionPeer: r.RemoteAddr}
 		if entry.Backend != nil {
 			base.Router = *entry.Backend
 		}
@@ -471,7 +504,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		if question, ok := r.Context().Value(incidentQuestionKey{}).(incidentQuestion); ok {
 			base.QuestionHead, base.QuestionTail, base.QuestionLength = question.head, question.tail, question.length
 		}
-		diagnostic = g.incidents.begin(base)
+		diagnostic = g.incidents.begin(base, capture)
 		defer func() {
 			reason := outcome
 			if r.Context().Err() != nil {
@@ -490,13 +523,21 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	entry.profile.liveWriteStart()
-	diagnostic.startWrite(time.Now(), 0)
+	headerStart := time.Now()
+	diagnostic.setWritePosition(captureEvent{Origin: "upstream", Phase: "headers_flush", IOSequence: 1})
+	diagnostic.startWrite(headerStart, 0)
 	w.WriteHeader(200)
 	entry.Status = 200
-	diagnostic.startFlush(time.Now(), 0)
+	headerFlushStart := time.Now()
+	diagnostic.wroteAt(headerFlushStart, 0)
+	diagnostic.startFlush(headerFlushStart, 0)
 	flushErr := controller.Flush()
+	headerReturned := time.Now()
+	diagnostic.flushedAt(headerReturned)
+	capture.event(captureEvent{Type: "flush_start", Origin: "upstream", Phase: "headers_flush", IOSequence: 1, At: headerFlushStart})
+	capture.event(captureEvent{Type: "flush_return", Origin: "upstream", Phase: "headers_flush", IOSequence: 1, At: headerReturned, FlushReturned: true, Error: captureError(flushErr)})
 	entry.diagnostic.failure("client_headers_flush", flushErr, ctx, r.Context())
-	diagnostic.endWrite(time.Now(), flushErr)
+	diagnostic.endWrite(headerReturned, flushErr)
 	entry.profile.liveIOEnd()
 	if flushErr != nil {
 		entry.generation.writeFailure(ctx, r.Context())
@@ -505,6 +546,13 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	buffer := g.buffers.Get().(*[]byte)
 	defer g.buffers.Put(buffer)
 	observer := entry.generation.observer
+	if capture != nil {
+		observer.onEvent = func(p sseEventPosition) {
+			diagnostic.eventPosition(p)
+			capture.event(captureEvent{Type: "sse_event", Origin: "upstream", At: p.At, HasRange: true, Start: p.Start, End: p.End, EventIndex: p.Index, PositionKnown: p.Known})
+		}
+	}
+	defer func() { observer.onEvent = nil }()
 	var profileObserver *sseObserver
 	if pr, ok := r.Context().Value(profileContextKey{}).(*profileRequest); ok {
 		profileObserver = observer
@@ -529,23 +577,67 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}()
 	}
 	writeFailed := false
-	emit := func(data []byte) error {
+	var received, totalWritten int64
+	var ioSequence uint64 = 1
+	emit := func(data []byte, origin string, start, end int64, alwaysFlush bool) error {
 		entry.profile.liveWriteStart()
 		defer entry.profile.liveIOEnd()
-		diagnostic.startWrite(time.Now(), len(data))
+		ioSequence++
+		position := captureEvent{Origin: origin, Phase: "body_write", IOSequence: ioSequence, HasRange: origin == "upstream", Start: start, End: end, PlannedBytes: len(data), TotalWritten: totalWritten}
+		diagnostic.setWritePosition(position)
+		writeStart := time.Now()
+		diagnostic.startWrite(writeStart, len(data))
 		n, err := w.Write(data)
+		writeReturned := time.Now()
+		diagnostic.wroteAt(writeReturned, n)
+		totalWritten += int64(n)
+		position.Type = "write_start"
+		position.At = writeStart
+		if origin == "gateway" {
+			position.Data = data
+		}
+		capture.event(position)
+		position.Type = "write_return"
+		position.At = writeReturned
+		position.Data = nil
+		position.WrittenKnown = true
+		position.WrittenBytes = n
+		position.TotalWritten = totalWritten
+		position.Error = captureError(err)
+		capture.event(position)
+		diagnostic.setWritePosition(position)
 		entry.diagnostic.bytes(false, n)
-		entry.diagnostic.failure("client_body_write", err, ctx, r.Context())
+		writeStage, flushStage := "client_body_write", "client_body_flush"
+		if origin == "gateway" {
+			writeStage, flushStage = "client_error_write", "client_error_flush"
+		}
+		entry.diagnostic.failure(writeStage, err, ctx, r.Context())
 		diagnostic.wrote(n)
-		if err != nil {
-			diagnostic.endWrite(time.Now(), err)
+		if err != nil && !alwaysFlush {
+			diagnostic.endWrite(writeReturned, err)
 			writeFailed = true
 			return err
 		}
-		diagnostic.startFlush(time.Now(), n)
-		err = controller.Flush()
-		entry.diagnostic.failure("client_body_flush", err, ctx, r.Context())
-		diagnostic.endWrite(time.Now(), err)
+		flushStart := time.Now()
+		diagnostic.startFlush(flushStart, n)
+		flushErr := controller.Flush()
+		flushReturned := time.Now()
+		diagnostic.flushedAt(flushReturned)
+		position.Phase = "body_flush"
+		position.Type = "flush_start"
+		position.At = flushStart
+		position.Error = ""
+		capture.event(position)
+		position.Type = "flush_return"
+		position.At = flushReturned
+		position.FlushReturned = true
+		position.Error = captureError(flushErr)
+		capture.event(position)
+		entry.diagnostic.failure(flushStage, flushErr, ctx, r.Context())
+		if err == nil {
+			err = flushErr
+		}
+		diagnostic.endWrite(flushReturned, err)
 		if err != nil {
 			writeFailed = true
 			return err
@@ -554,21 +646,32 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	}
 	for {
 		entry.profile.liveStreamRead(observer)
-		diagnostic.startRead(time.Now())
+		readStart := time.Now()
+		diagnostic.startRead(readStart)
 		n, readErr := response.Body.Read(*buffer)
+		readReturned := time.Now()
+		if readErr == io.EOF {
+			eof = true
+		}
+		start := received
+		received += int64(n)
+		capture.response(readReturned, start, (*buffer)[:n])
+		capture.event(captureEvent{Type: "read_start", Origin: "upstream", At: readStart, Start: start, End: start, HasRange: true})
+		capture.event(captureEvent{Type: "read_return", Origin: "upstream", At: readReturned, Start: start, End: received, HasRange: true, Error: captureError(readErr)})
 		entry.diagnostic.bytes(true, n)
 		if readErr != nil && readErr != io.EOF {
 			entry.diagnostic.failure("upstream_body_read", readErr, ctx, r.Context())
 		}
-		diagnostic.readReturned(time.Now(), n)
+		diagnostic.readReturned(readReturned, n)
 		entry.profile.liveIOEnd()
 		if n > 0 {
 			data := (*buffer)[:n]
+			observer.observedAt = readReturned
 			observer.Feed(data)
-			diagnostic.observe(time.Now(), observer)
+			diagnostic.observe(readReturned, observer)
 			entry.profile.liveObserve(observer)
 			entry.generation.observeStream(observer, false)
-			err := emit(data)
+			err := emit(data, "upstream", start, received, false)
 			if writeFailed {
 				entry.generation.writeFailure(ctx, r.Context())
 				return "client_failure"
@@ -578,6 +681,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 			}
 		}
 		if readErr == io.EOF && r.Context().Err() == nil {
+			eof = true
 			entry.generation.observeStream(observer, true)
 		}
 		if readErr == nil {
@@ -612,12 +716,30 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 		}
 		// Permit a bounded final error write after the generation deadline expires.
 		_ = controller.SetWriteDeadline(time.Now().Add(time.Second))
-		entry.profile.liveWriteStart()
-		n, finalErr := fmt.Fprintf(w, "\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID))
-		entry.diagnostic.bytes(false, n)
-		entry.diagnostic.failure("client_error_write", finalErr, ctx, r.Context())
-		entry.diagnostic.failure("client_error_flush", controller.Flush(), ctx, r.Context())
-		entry.profile.liveIOEnd()
+		finalData := []byte(fmt.Sprintf("\n\ndata: %s\n\n", errorJSON(fault(502, code, "下游流中断"), entry.RequestID)))
+		_ = emit(finalData, "gateway", 0, 0, true)
 		return "backend_failure"
 	}
+}
+
+func captureError(err error) string {
+	if err == nil {
+		return ""
+	}
+	// Diagnostic files must not copy arbitrary network errors (which may contain
+	// upstream URLs or credentials). Preserve only a stable bounded classification.
+	if errors.Is(err, io.EOF) {
+		return "eof"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+	return "io_error"
 }

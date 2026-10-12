@@ -1,12 +1,12 @@
 # 网关传输诊断
 
-本功能只修改 aigate，不要求修改客户端、测评平台或 Router。业务 HTTP 监听器的 ReadHeaderTimeout 从 10 秒改为 30 秒；上传正文仍为 5 分钟 / 30 MB，生成时限仍按平台运行配置，控制和画像监听器的超时保持原值。控制状态 `/control/v2/status` 的 `business_read_header_timeout_seconds` 可检查编译版本使用的业务读头时限。
+切流和功能服务都在业务监听器记录连接异常，业务 ReadHeaderTimeout 为 30 秒，上传为 5 分钟 / 30 MB。功能层生成时限来自本地配置，切流 `--forward-timeout` 默认 62 分钟并覆盖上传、等待和写出；独立控制与观测监听器读头为 5 秒。切流 `/control/v3/status` 的 `business_read_header_timeout_seconds` 可核对业务读头时限。
 
 30 秒能容纳更长的请求头发送延迟，不能保证消除其他原因的 ReadError。历史事件没有完整连接证据，不能据此将其根因追认为读头超时。
 
 ## 日志位置与关联
 
-输出仍进入网关原有审计输出（部署中为 systemd journal 或 Kubernetes 容器日志），没有新增持久化目录。只在网关正常受理的 `/v1/chat/completions` 审计中增加字段；控制层直接拒绝请求的现有响应路径不额外增加请求审计。本轮也不修改平台“异常诊断”页面或原有 stream-incidents 存储。
+输出仍进入网关原有审计输出（部署中为 systemd journal 或 Kubernetes 容器日志），没有新增持久化目录。功能服务在正常受理的 `/v1/chat/completions` 审计中记录完整有界诊断。切流额外保留 `switch_forward_error` 和 `switch_forward_ended` 等转发错误记录，可通过 `request_id`、`upstream_request_id`、Router 和绑定版本关联功能层审计。
 
 通过 SSH MCP 读取对应主机日志并按下列字段关联：
 
@@ -16,7 +16,7 @@
 - `connection.accepted_at/local/remote/handler_at`：接收连接和进入 handler 的时间、本地及对端 IP:port。
 - 既有 `test_task/backend/route_version`：任务和绑定信息。
 
-仅保存入站请求 ID 的映射，不改变客户端 ID、上游请求头或鉴权方式。请求头尚未读完整时没有可用请求 ID，此时按 connection_id、两端地址和时间关联。
+功能服务把切流生成的 X-Request-ID 记录为经校验的 `client_request_id`，响应返回功能服务自己的 X-Request-ID；切流结束日志同时保留两端 ID。直连仍使用原有入站请求 ID 映射。请求头尚未读完整时没有可用请求 ID，此时按 connection_id、两端地址和时间关联。
 
 ## 请求头之前的连接异常
 
@@ -35,7 +35,7 @@
 
 ## 已进入 handler 的请求
 
-仍然每个生成请求一条结束审计。新增 `generation_result/error_class` 沿用已有观测分类，不改变错误指标语义；失败、拒绝、取消或写出断开时增加 `transport`：
+功能服务每个生成请求一条结束审计。新增 `generation_result/error_class` 沿用已有观测分类，不改变错误指标语义；失败、拒绝、取消或写出断开时增加 `transport`：
 
 - `steps`：自 `started_at` 起的累计毫秒偏移。包含 handler、读取请求体、路由/模型发现、准备上游、连接池等待、DNS/TCP/TLS、取得连接、写出请求、响应首字节、响应头、流开始和结束。相邻阶段之差可辅助判断耗时；并发拨号的阶段可能交错，不能直接相加。
 - 详细 HTTP trace 针对**生成调用**；路由/模型发现只记录阶段边界，不为后台探测增加逐请求传输日志。
@@ -53,7 +53,7 @@ context 状态在网关自身的正常清理 cancel 之前采集，避免把每�
 
 入口异常使用单个进程级异步写入器，队列 256 条、单条上限 16 KiB；满队列丢弃诊断，不阻塞请求。已有请求结束审计仍使用原来的审计写入方式，不在本轮更换其持久化策略。日志总保留量由现有 journal/容器日志轮转配置控制。
 
-已鉴权的画像 `/metrics` 增加两个进程级累计计数：
+功能服务无需认证的 `/metrics` 包含两个进程级累计计数：
 
 - `aigate_connection_diagnostic_dropped_total`
 - `aigate_connection_diagnostic_write_errors_total`
@@ -64,7 +64,7 @@ context 状态在网关自身的正常清理 cancel 之前采集，避免把每�
 
 1. 用测评记录已有的请求 ID 找 `client_request_id`。若已进入网关，查看连接时间、最后阶段、错误方向及 errno。
 2. 找不到请求审计时，在对应时间和源地址范围查 `connection_diagnostic`。只有同时出现未进入 handler、实际 read timeout 和读截止时间，才可确认网关读头超时。
-3. 上游错误看实际 Router 连接端点和原始错误链；客户端写出错误看 client_body_write/flush。两者不要合并为同一种 ReadError。
+3. 功能服务上游错误看实际 Router 连接端点和原始错误链，写出错误看 client_body_write/flush 和实际对端。经切流入口访问时，此对端是切流服务；继续关联切流日志才能判断后续链路，不能直接认定最终客户端阻塞。
 4. 两种日志都没有证据时，检查诊断丢弃/写入计数；仍需客户端或网络侧证据，不能用日志缺失判定根因。
 
 ## 验证
@@ -72,7 +72,7 @@ context 状态在网关自身的正常清理 cancel 之前采集，避免把每�
 在本地真实 TCP 连接上验证读头超时（包括 keep-alive 下一次请求）、10.2 秒后补完请求头仍返回 200、上游 reset、EOF、客户端取消、客户端写入/Flush 错误；同时验证 SSE 转发内容不变、正常请求无详细日志、错误链不含测试凭据、队列背压有界。补充超大请求头/正文的 431/413 响应正常 EOF、已缓冲畸形请求和不支持的 Expect 被拒绝时只记录一条诊断、正常管线请求不误报的回归测试。依赖保持仅 Go 标准库。
 
 ```sh
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor -race -count=1 ./...
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go vet -mod=vendor ./...
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor .
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor -race -count=1 . ./cmd/...
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go vet -mod=vendor . ./cmd/...
+./scripts/build.sh
 ```

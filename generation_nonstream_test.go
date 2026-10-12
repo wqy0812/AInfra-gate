@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"encoding/json"
@@ -55,7 +55,7 @@ func TestNonstreamObservationPreservesResponse(t *testing.T) {
 	}
 }
 
-func TestV2NonstreamObservationAndArbitraryRequestModel(t *testing.T) {
+func TestSwitchNonstreamObservationAndArbitraryRequestModel(t *testing.T) {
 	const upstreamBody = `{"error":{"message":"private-response-marker"},"model":"real"}`
 	u := upstreamServer(t, "real", func(w http.ResponseWriter, r *http.Request) {
 		var body rawObject
@@ -66,16 +66,15 @@ func TestV2NonstreamObservationAndArbitraryRequestModel(t *testing.T) {
 		io.WriteString(w, upstreamBody)
 	})
 	c := controlledFixture(t)
-	s := snapshotV2("api1", u.URL, 1)
-	s.Settings = encodeJSON(map[string]any{"public_model_name": "public", "profile": map[string]any{"enabled": true, "api_key": "fixture-key"}})
-	activateV2(t, c, "bind", s)
+	s, proxy := proxySnapshot(t, "api1", u.URL, 1, json.RawMessage(`{"profile":{"enabled":true}}`), nil)
+	activateV3(t, c, "bind", s)
 	server := httptest.NewServer(c)
 	defer server.Close()
 	r, body := request(t, server, "POST", "/v1/chat/completions", `{"model":"任意未注册模型","messages":[{"role":"user","content":"hello"}]}`, "")
 	if r.StatusCode != 200 || string(body) != upstreamBody {
-		t.Fatal("v2 observation changed upstream status/body")
+		t.Fatal("two-hop observation changed upstream status/body")
 	}
-	g := c.active.g
+	g := proxy.g
 	requireGenerationCount(t, g.profile, false, "error", "response_error", "200", 1)
 	profileDrain(t, g.profile)
 	files, err := filepath.Glob(filepath.Join(g.config.Profile.Directory, "events-v2-*.jsonl"))

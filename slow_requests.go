@@ -1,4 +1,4 @@
-package main
+package aigate
 
 // Slow request capture is observational: original input is retained only for
 // validated streaming requests, and storage failures never change a response.

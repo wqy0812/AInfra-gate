@@ -1,4 +1,4 @@
-package main
+package aigate
 
 import (
 	"context"
@@ -30,8 +30,8 @@ func TestSingleBackendCacheAndModels(t *testing.T) {
 		t.Cleanup(servers[i].Close)
 	}
 	c := controlledFixture(t)
-	activateV2(t, c, "bind", snapshotV2("api1", servers[0].URL, 1))
-	commandV2(t, c, "candidate", "prepare", snapshotV2("api2", servers[1].URL, 2))
+	activateV3(t, c, "bind", switchSnapshot(t, "api1", servers[0].URL, 1))
+	commandV3(t, c, "candidate", "prepare", switchSnapshot(t, "api2", servers[1].URL, 2))
 	s := httptest.NewServer(c)
 	defer s.Close()
 	for _, expected := range []string{"model1", "model1", "model1", "model1", "model1"} {
@@ -71,8 +71,8 @@ func TestDiscoveryFailureAndNoGenerationRetry(t *testing.T) {
 			defer u1.Close()
 			u2 := upstreamServer(t, "model2", func(w http.ResponseWriter, r *http.Request) { posts[1].Add(1); _, _ = io.WriteString(w, goodResponse) })
 			c := controlledFixture(t)
-			activateV2(t, c, "bind", snapshotV2("api1", u1.URL, 1))
-			commandV2(t, c, "candidate", "prepare", snapshotV2("api2", u2.URL, 2))
+			activateV3(t, c, "bind", switchSnapshot(t, "api1", u1.URL, 1))
+			commandV3(t, c, "candidate", "prepare", switchSnapshot(t, "api2", u2.URL, 2))
 			s := httptest.NewServer(c)
 			defer s.Close()
 			r, data := request(t, s, "POST", "/v1/chat/completions", basicBody, "")

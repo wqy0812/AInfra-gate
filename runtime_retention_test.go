@@ -1,7 +1,8 @@
-package main
+package aigate
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,39 +25,47 @@ func retentionFile(t *testing.T, dir, name string, size int, at time.Time) strin
 	return path
 }
 
-func TestRuntimeRetentionAfterRotationAndRestart(t *testing.T) {
-	c := controlledFixture(t)
-	p := newProtocolBackend(t)
-	s := snapshotV2("r1", p.server.URL, 1)
-	s.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"old","retention_hours":72}}`)
-	activateV2(t, c, "initial", s)
-	old := c.active.g.profile
-	now := time.Now()
-	path := retentionFile(t, old.c.Directory, "events-v2-1000000000000-review.jsonl", 100, now)
-	s.BindingRevision = 2
-	s.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"new","retention_hours":1}}`)
-	activateV2(t, c, "rotate", s)
-	c.waitClosingObservers() // drained observers close asynchronously, outside c.mu
-	if !old.closed {
-		t.Fatal("old writer still running")
+func retentionProxy(t *testing.T, root, settings string) *ProxyGateway {
+	t.Helper()
+	p, err := newProxyGateway(ProxyConfig{ServiceID: "retention-proxy", RouterID: "r1",
+		Backend:  &Backend{Adapter: "openai", URL: "http://127.0.0.1:1/v1/chat/completions", ModelsURL: "http://127.0.0.1:1/v1/models"},
+		Settings: json.RawMessage(settings)}, root, io.Discard)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Age the files only after their writer closes, then simulate an Engine-
-	// controlled gateway restart. No in-memory list of old directories survives.
+	t.Cleanup(p.Close)
+	return p
+}
+
+func awaitRetention(t *testing.T, path string) {
+	t.Helper()
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("expired observation retained", path)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestProxyRetentionAfterPolicyChangeAndRestart(t *testing.T) {
+	root := t.TempDir()
+	old := retentionProxy(t, root, `{"profile":{"enabled":true,"retention_hours":72}}`)
+	now := time.Now()
+	path := retentionFile(t, old.g.profile.c.Directory, "events-v2-1000000000000-review.jsonl", 100, now)
+	old.Close()
+	if !old.g.profile.closed {
+		t.Fatal("old proxy writer still running")
+	}
 	if err := os.Chtimes(path, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	c.Close()
-	restarted := controlledFixture(t)
-	restarted.dataRoot = c.dataRoot
-	activateV2(t, restarted, "restore", s)
-	if err := restarted.cleanupObservations(now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("old expired segment was retained", err)
-	}
-	if restarted.active.g.profile.closed {
-		t.Fatal("active writer was closed")
+	restarted := retentionProxy(t, root, `{"profile":{"enabled":true,"retention_hours":1}}`)
+	awaitRetention(t, path)
+	if restarted.g.profile.closed {
+		t.Fatal("active proxy writer closed")
 	}
 }
 
@@ -80,62 +89,39 @@ func TestObservationBudgetIncludesLiveAndAllAbandonedPolicies(t *testing.T) {
 	}
 }
 
-func TestRetentionProtectsDrainingGenerationUntilRelease(t *testing.T) {
-	c := controlledFixture(t)
-	p := newProtocolBackend(t)
-	s := snapshotV2("r1", p.server.URL, 1)
-	s.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"old"}}`)
-	activateV2(t, c, "initial", s)
-	c.mu.Lock()
-	old := c.active
-	old.refs++
-	c.mu.Unlock()
-	s.BindingRevision = 2
-	s.Settings = json.RawMessage(`{"profile":{"enabled":true,"api_key":"new","retention_hours":1}}`)
-	activateV2(t, c, "rotate", s)
-	// Using a future cleanup clock avoids the live writer's own timer pruning
-	// this file, while making it expired for the cross-generation collector.
+func TestRetentionProtectsLiveProxyWriterUntilClose(t *testing.T) {
+	root := t.TempDir()
+	p := retentionProxy(t, root, `{"profile":{"enabled":true}}`)
 	now := time.Now()
-	path := retentionFile(t, old.g.profile.c.Directory, "events-v2-draining.jsonl", 100, now)
-	if err := c.cleanupObservations(now.Add(2 * time.Hour)); err != nil {
-		t.Fatal(err)
+	path := retentionFile(t, p.g.profile.c.Directory, "events-v2-live-proxy.jsonl", 100, now)
+	clean := func() {
+		if err := cleanObservationRoot(filepath.Join(root, "request-profile"), false, now.Add(2*time.Hour), 1, 1<<20, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
+	clean()
 	if _, err := os.Stat(path); err != nil {
-		t.Fatal("draining writer data removed", err)
+		t.Fatal("live proxy writer data removed", err)
 	}
-	c.mu.Lock()
-	old.refs--
-	c.cleanupLocked()
-	c.mu.Unlock()
-	if err := c.cleanupObservations(now.Add(2 * time.Hour)); err != nil {
-		t.Fatal(err)
-	}
+	p.Close()
+	clean()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("closed generation escaped retention")
+		t.Fatal("closed proxy policy escaped retention")
 	}
 }
 
-func TestSlowRetentionAcrossPoliciesAndAfterCaptureDisabled(t *testing.T) {
-	c := controlledFixture(t)
-	p := newProtocolBackend(t)
-	s := snapshotV2("r1", p.server.URL, 1)
-	s.Settings = json.RawMessage(`{"slow_requests":{"enabled":true,"retention_hours":72}}`)
-	activateV2(t, c, "initial", s)
-	store := c.active.g.slow
+func TestSlowRetentionAfterProxyRestartWithCaptureDisabled(t *testing.T) {
+	root := t.TempDir()
+	p := retentionProxy(t, root, `{"slow_requests":{"enabled":true,"retention_hours":72}}`)
+	store := p.g.slow
 	now := time.Now()
 	job := slowTestJob(1, now.Add(-2*time.Hour), "body")
 	if err := store.writeRecord(job); err != nil {
 		t.Fatal(err)
 	}
-	s.BindingRevision = 2
-	s.Settings = json.RawMessage(`{"slow_requests":{"enabled":false,"retention_hours":1}}`)
-	activateV2(t, c, "disable", s)
-	if err := c.cleanupObservations(now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); !os.IsNotExist(err) {
-		t.Fatal("disabled capture leaked old records")
-	}
+	p.Close()
+	retentionProxy(t, root, `{"slow_requests":{"enabled":false,"retention_hours":1}}`)
+	awaitRetention(t, filepath.Join(store.c.Directory, "request-"+job.meta.RequestID))
 }
 
 func TestRetentionDoesNotFollowSymlinksOrDeleteForeignFiles(t *testing.T) {
