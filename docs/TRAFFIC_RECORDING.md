@@ -1,0 +1,78 @@
+# 流量录制与回放
+
+本文描述当前源码行为，尚未部署；线上版本另行核验。录制与回放只由 code eval 平台控制，主机上没有录制或回放的命令行入口。设计依据见平台文档《aigate switch 流量录制与回放设计》。
+
+## 录制（aigate-switch）
+
+`aigate-switch serve --record-root <目录>` 启用录制能力，`--record-max-bytes` 为总容量（默认 50 GiB）；不传 `--record-root` 时录制关闭，`/control/v3/status` 的 `recording` 为 `null`。启用后切流服务只写 `<record-root>/<gateway_id>/`，该目录必须为 0700 并由进程独占加锁。请求线程只做内存拷贝和入队，文件创建、写入、封段、容量淘汰全部由一个 worker 完成；准入锁内不做磁盘 I/O，录制故障不影响转发和响应字节。
+
+采样发生在准入判断之前，因此入口拒收（503、409、404 方法错误、413、508）也会写记录。带 `X-Code-Eval-Token` 的平台测试请求和签名有效的回放请求不录制。正文从实际转发给 proxy 的字节旁路拷贝；`Authorization` 与平台内部 header 永不记录。
+
+### 控制命令
+
+录制命令走切流控制端口，沿用 `/control/v3/commands` 的认证、幂等序号、boot 与绑定版本校验，不改变准入、绑定和测试占用。
+
+| 动作 | payload | 行为 |
+| --- | --- | --- |
+| `record-start` | `recording_id`、`start_at`、`end_at`（必填，UTC 整点或半点）、可选 `schedule_id`、`sample_one_in`（默认 1）、`response`（`summary`/`full`，默认 `summary`）、`max_bytes`（默认且不超过部署容量） | 回执先为 `running`，建好会话目录后为 `completed`。`start_at` 已过而 `end_at` 未到时立即开始，用于重启后补发剩余时段；`end_at` 已过返回 `window_ended` |
+| `record-stop` | `recording_id` | 任何时刻可发。录制中的会话不再采样，在途请求录完后封尾；`scheduled` 会话直接取消。结束原因 `stopped` |
+| `record-status` | `recording_id` | 回执的 `recording` 字段为会话摘要：状态、计数、各段覆盖范围与是否保留 |
+| `record-pin` / `record-unpin` | `recording_id`、`segment` | 在已封尾的段写入或删除 `pinned` 标记；淘汰跳过保留段 |
+
+一个切流服务同时只有一个录制中或待开始的会话；待开始的会话可排在一个录制中的会话之后，前提是其 `start_at` 不早于后者的 `end_at`，以便平台提前下发相邻窗口。冲突返回 `recording_active`，ID 已存在返回 `recording_exists`，保留段占满容量返回 `capacity_reserved`，未启用录制返回 `recording_disabled`。
+
+会话结束原因：`completed`（窗口到期）、`stopped`、`retired`、`process_exit`、`max_bytes`、`capacity`、`disk_failed`、`end_unknown`（上一 boot 中断）。会话状态只在内存中，重启后没有活动会话，启动时把上一 boot 未结束的会话和未封尾的段标为 `end_unknown`，由平台决定是否补发剩余时段。
+
+### 目录与文件
+
+```
+<record-root>/<gateway_id>/<recording_id>/
+  session.json              参数、定时规则 ID、boot、状态、起止、结束原因、计数、段列表
+  20261012T1800/            半小时段，按请求到达时刻（UTC）归入
+    segment.json            段终点已过且在途请求全部结束后封尾：实际覆盖起止、partial、计数、router/revision 列表
+    index.jsonl             每条记录封尾时追加一行：序号、相对段起点的到达秒数、状态、结果、正文状态、目录
+    pinned                  可选，保留标记
+    r-<request_id>/
+      request.json          客户端发来的原始正文字节
+      response.tail         响应最后 8 KiB（response=full 时为 response.sse 全量）
+      timeline.jsonl        到达、上传完成、响应头、每次 Write/Flush、结束
+      meta.json             入口、快照、header 白名单、长度与 SHA-256、采集状态
+```
+
+文件 0600、目录 0700，`meta.json`、`segment.json`、`session.json` 原子发布。跨段边界的长请求归入到达时刻所在段，该段等它结束后封尾。中途终止和重启补发会产生只覆盖部分时间的段，`segment.json` 标 `partial` 并记录实际覆盖起止。
+
+### 上限与降级
+
+| 项 | 默认 |
+| --- | --- |
+| 待写内存预算 | 64 MiB |
+| 队列 / 活动记录 | 1024 / 1024 |
+| 单条时间线事件 | 8192，超出标 `timeline_truncated` |
+| 总容量 | `--record-max-bytes`，从最旧的已封尾、未保留段整段淘汰；当前段不删，只剩当前段仍超限则结束会话（`capacity`） |
+| 收尾 | 进程退出时最多 5 秒写完队列，未完成部分标 `end_unknown` |
+
+内存不足时只停止该请求的正文或全量响应采集，记为 `truncated`；元数据都无法入队时计入 `dropped`；磁盘写失败结束所有会话（`disk_failed`）。回放和建模必须读取丢弃与截断计数，不能把有缺口的会话当作完整流量。
+
+## 回放标记
+
+`AIGATE_REPLAY_MARK_KEY`（至少 32 字节）配置在 switch、proxy 和回放服务。回放请求携带 `X-Aigate-Replay: <run_id>/<seq>/<HMAC-SHA256>`。签名有效时，switch 不录制该请求，proxy 在审计日志、画像事件、慢请求和流异常记录里标 `traffic=replay`，画像指标增加 `traffic="replay"` 标签以便监控排除；转发不变。签名无效或未配置密钥时按普通业务处理，不拒绝请求。
+
+## 回放（aigate-replay）
+
+`aigate-replay serve` 常驻录制主机，与 switch 使用同一系统账号以读取录制文件。它是回放的唯一入口，调用方只有平台 engine：
+
+- 控制监听默认 `127.0.0.1:18085`，要求 `Authorization: Bearer <AIGATE_REPLAY_CONTROL_KEY>`（至少 32 字节，独立于切流密钥）和实际 TCP 来源 `--allowed-cidrs`。
+- `--targets` 指向本地 JSON 文件 `{"targets": {"candidate-a": "http://127.0.0.1:18084"}}`，控制请求只能按名字选择目标，不能传任意地址。开始前读取目标 `/runtime/v1/status`，只接受 `service=aigate-proxy`，从而拒绝把回放打到切流业务入口；目标的 Router 与配置摘要写入报告。
+- `--record-root` 为切流录制根目录（只读），`--data-root` 保存每次 run 的 `request.json`、`state.json`、`plan.json`、`plan.jsonl`、`results.jsonl`、`report.json`，最多保留 200 个 run。重启时把进行中的 run 标为 `end_unknown`。
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /control/replay/v1/status` | 服务、boot、目标名、当前 run |
+| `GET /control/replay/v1/recordings?gateway_id=` | 列出录制会话及各段元数据（覆盖范围、partial、计数、是否保留），不含正文 |
+| `POST /control/replay/v1/runs` | 按 `run_id` 幂等；同时只跑一个 run，否则 `run_active` |
+| `GET /control/replay/v1/runs/{id}` | 状态、进度、报告摘要 |
+| `POST /control/replay/v1/runs/{id}/stop` | 停止发送，已发请求收尾后出报告，状态 `stopped` |
+
+请求字段见 `openapi.json` 的 `ReplayRunRequest`：`segments` 只能选已封尾的段（`warmup_segments` 先发送、不计入结果）；默认只回放 `/v1/chat/completions` 的 2xx、正文完整、采集完整的请求，排除入口拒收；`timed` 按录制到达时刻原速发送，目标变慢不降低到达率，触及 `max_inflight` 只记录发送延误；`concurrency` 按计划顺序固定并发。不提供倍速、多份叠加或阶梯加压。正文改写只有 `set_model`、`set_max_tokens`、`force_stream` 和 `fix_output`（把 `max_tokens`、`min_tokens` 设为录制时的 completion tokens 并加 `ignore_eos`）；改写后报告的 `original_bytes=false`。不改写时发送录制时的原始字节，发送前核对 SHA-256。
+
+报告分段和汇总各一份：发送数、结果与状态码分布、成功率、超时率、TTFT（首个有效生成输出，不含角色块、心跳和 usage）、E2E、发送延误的 P50/P95/P99/最大值、最大在途、prompt/completion/cached tokens、cached 占比、输出 token/s、期望与实际到达率，以及 `fix_output` 偏差超过 1% 的请求数。同一批段的录制基线（到达率、E2E、首字节、usage）并列给出；录制侧时间包含客户端到 switch 一跳，首字节来自第一次响应写出，回放直连 proxy 不含 switch 一跳。`timed` 下发送延误 P99 超过 1 秒或未发完全部计划时报告标为无效。

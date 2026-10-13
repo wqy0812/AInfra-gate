@@ -45,6 +45,7 @@ type ProxyGateway struct {
 	done                               chan struct{}
 	once                               sync.Once
 	closeDone                          chan struct{}
+	markKey                            []byte // replay mark verification key; empty disables labelling
 }
 
 func readProxyConfig(path string) (ProxyConfig, error) {
@@ -323,6 +324,10 @@ func (p *ProxyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := false
 	meta := &runtimeRequest{task: diagnosticClientID(r.Header.Get(headerTask)), model: r.Header.Get(headerExpectedModel)}
 	meta.revision, _ = strconv.ParseUint(r.Header.Get(headerRoute), 10, 64)
+	// A verified replay mark only labels observations; forwarding is unchanged.
+	if verifyReplayMark(p.markKey, r.Header.Get(headerReplay)) {
+		meta.traffic = "replay"
+	}
 	meta.stream = func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()

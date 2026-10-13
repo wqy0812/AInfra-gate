@@ -95,6 +95,7 @@ type profileEvent struct {
 	Arrived          float64         `json:"arrived"`
 	TestTask         string          `json:"test_task,omitempty"`
 	RouteVersion     uint64          `json:"route_version,omitempty"`
+	Traffic          string          `json:"traffic,omitempty"`
 	Backend          string          `json:"backend,omitempty"`
 	Model            string          `json:"model,omitempty"`
 	Stream           bool            `json:"stream,omitempty"`
@@ -315,6 +316,10 @@ func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, b
 	r.e.Model = model
 	p.mu.Lock()
 	r.tags = p.tags(backend, model)
+	if r.e.Traffic != "" {
+		// Replay series stay separable so monitoring can exclude them.
+		r.tags = profileExtra(r.tags, "traffic", r.e.Traffic)
+	}
 	p.add("requests_routed_total", r.tags, 1)
 	p.hist("request_bytes", r.tags, float64(len(payload)), profileLengthBuckets)
 	p.mu.Unlock()

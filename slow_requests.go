@@ -68,6 +68,7 @@ type slowRequestMeta struct {
 	DurationSeconds  float64   `json:"duration_seconds"`
 	Backend          *string   `json:"backend"`
 	Model            *string   `json:"model"`
+	Traffic          string    `json:"traffic,omitempty"`
 	Status           int       `json:"status"`
 	Outcome          string    `json:"outcome"`
 	ClientCancelled  bool      `json:"client_cancelled"`
@@ -138,7 +139,7 @@ func (s *slowRequestStore) capture(entry *auditEntry, started, ended time.Time, 
 	if entry.slowInput == nil || ended.Sub(started) <= seconds(s.c.ThresholdSeconds) {
 		return
 	}
-	m := slowRequestMeta{Schema: slowRequestSchema, RequestID: entry.RequestID, StartedAt: started.UTC(), EndedAt: ended.UTC(), DurationSeconds: ended.Sub(started).Seconds(), Backend: entry.Backend, Model: entry.Model, Status: entry.Status, Outcome: entry.Outcome, ClientCancelled: cancelled, InputBytes: int64(len(entry.slowInput))}
+	m := slowRequestMeta{Schema: slowRequestSchema, RequestID: entry.RequestID, StartedAt: started.UTC(), EndedAt: ended.UTC(), DurationSeconds: ended.Sub(started).Seconds(), Backend: entry.Backend, Model: entry.Model, Traffic: entry.Traffic, Status: entry.Status, Outcome: entry.Outcome, ClientCancelled: cancelled, InputBytes: int64(len(entry.slowInput))}
 	if r := entry.profile; r != nil && r.outcome != "" {
 		m.Outcome = r.outcome
 	}

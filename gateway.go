@@ -91,6 +91,7 @@ type auditEntry struct {
 	RequestID        string             `json:"request_id"`
 	TestTask         string             `json:"test_task,omitempty"`
 	RouteVersion     uint64             `json:"route_version,omitempty"`
+	Traffic          string             `json:"traffic,omitempty"`
 	Status           int                `json:"status"`
 	Outcome          string             `json:"outcome"`
 	Backend          *string            `json:"backend"`
@@ -274,7 +275,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		r = r.WithContext(context.WithValue(r.Context(), incidentQuestionKey{}, incidentQuestion{head, tail, length}))
 	}
 	if meta, ok := r.Context().Value(runtimeRequestKey{}).(*runtimeRequest); ok {
-		entry.RouteVersion, entry.TestTask = meta.revision, meta.task
+		entry.RouteVersion, entry.TestTask, entry.Traffic = meta.revision, meta.task, meta.traffic
 		if body.stream {
 			meta.stream()
 		}
@@ -285,6 +286,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	if g.profile != nil {
 		pr := g.profile.beginRequest(entry.RequestID, body.stream, arrived)
+		pr.e.Traffic = entry.Traffic
 		entry.profile = pr
 		r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
 		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()
@@ -494,7 +496,7 @@ func (g *Gateway) stream(w http.ResponseWriter, r *http.Request, response *http.
 	}()
 	var diagnostic *incidentRequest
 	if g.incidents != nil {
-		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC(), ConnectionPeer: r.RemoteAddr}
+		base := streamIncident{RequestID: entry.RequestID, BindingRevision: entry.RouteVersion, RequestStartedAt: entry.started.UTC(), ConnectionPeer: r.RemoteAddr, Traffic: entry.Traffic}
 		if entry.Backend != nil {
 			base.Router = *entry.Backend
 		}

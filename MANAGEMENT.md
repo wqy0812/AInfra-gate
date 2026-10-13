@@ -6,7 +6,7 @@
 
 `aigate-switch` 保存内存绑定快照、准入、命令回执和测试占用；平台持久化入口、功能目标、绑定与操作记录。`aigate-proxy` 固定连接一个 Router，从本地文件读取功能参数并独立运行，保存该 Router 的画像与诊断。多个入口可共享一个功能目标，功能服务也可直接访问。
 
-仅切流控制端口要求 `Authorization: Bearer <AIGATE_CONTROL_KEY>` 和实际 TCP 来源 CIDR，不信任转发 IP 头。业务、模型、健康、功能状态、指标和画像接口无需认证。功能服务不提供配置写入、发布或热更新，配置变更须重启后读回平台；读回是观测，不自动替换切流绑定快照。
+仅切流控制端口要求 `Authorization: Bearer <AIGATE_CONTROL_KEY>` 和实际 TCP 来源 CIDR，不信任转发 IP 头；回放控制服务使用独立的 `AIGATE_REPLAY_CONTROL_KEY` 和同样的来源校验。业务、模型、健康、功能状态、指标和画像接口无需认证。功能服务不提供配置写入、发布或热更新，配置变更须重启后读回平台；读回是观测，不自动替换切流绑定快照。
 
 ## 切流控制 v3 与旧执行镜像
 
@@ -18,6 +18,8 @@
 | `GET /control/v2/status` | 固定旧执行镜像兼容状态，`counts_scope=retiring_snapshots`，counts 只包含仍在排空的非当前快照 |
 | `GET /control/v2/commands/{seq}` | 查询同一命令回执集合 |
 | `POST /control/v2/commands` | 只接受 `test-acquire`、`test-release`、`test-status`；其他动作返回 `legacy_command_removed` |
+
+v3 另有 `record-start`、`record-stop`、`record-status`、`record-pin`、`record-unpin` 录制动作，`/control/v3/status` 增加 `recording` 字段（未启用录制时为 `null`）。录制动作不改变准入、绑定和测试占用，字段与目录格式见 [流量录制与回放](docs/TRAFFIC_RECORDING.md)。
 
 v3 的 `counts` 用于平台汇总排空；v2 兼容视图不能当作总负载。共享目标的普通业务流量不阻止旧执行镜像申请测试占用。所有接口使用同一 boot、单调命令序号及结果集合，v2 和 v3 不能各自从 1 开始编号。
 
@@ -59,7 +61,7 @@ Router 维护关闭所有当前指向它的受管入口，并阻止新增绑定�
 
 按改动范围进入维护，安全收尾已接收请求、判题和网关占用，然后替换受影响组件。无需为软件升级维持零停机或等待整项评测结束；超时保持维护，由操作者决定后续，不能强制清除未知占用。启动后先验收功能服务直连与状态，再验收切流绑定和平台接入，最后恢复原准入。失败修复当前版本，不回退、不清空历史数据或自动重放中断任务。
 
-每个 Router 使用独立功能服务数据根目录，例 `/var/lib/aigate-proxy-r1`。其中 `request-profile/<策略摘要>` 与 `slow-requests/<策略摘要>` 按当前本地策略清理，启动时和之后每分钟检查；关闭采集仍清理该数据根目录内的历史策略。正在写入及被其他进程锁定的目录受保护，占用计入总额；不沿符号链接清理外来内容。异常摘要目录为 `stream-incidents`，默认 72 小时 / 256 MiB；完整文件位于其 `requests/` 子树，独立限制为 72 小时 / 10 GiB，包含 pending 和正在写入文件，细节见 [流异常诊断](docs/STREAM_INCIDENTS.md)。切流服务不创建观测目录。
+每个 Router 使用独立功能服务数据根目录，例 `/var/lib/aigate-proxy-r1`。其中 `request-profile/<策略摘要>` 与 `slow-requests/<策略摘要>` 按当前本地策略清理，启动时和之后每分钟检查；关闭采集仍清理该数据根目录内的历史策略。正在写入及被其他进程锁定的目录受保护，占用计入总额；不沿符号链接清理外来内容。异常摘要目录为 `stream-incidents`，默认 72 小时 / 256 MiB；完整文件位于其 `requests/` 子树，独立限制为 72 小时 / 10 GiB，包含 pending 和正在写入文件，细节见 [流异常诊断](docs/STREAM_INCIDENTS.md)。切流服务不创建观测目录；配置 `--record-root` 时只写 `<record-root>/<入口ID>/` 录制目录，容量由 `--record-max-bytes` 限制。
 
 拆分前的入口历史保留原归属，不按新 Router 重命名、重标或搬入新服务数据根目录，记录拆分生效时间。平台数据库、主密钥、固定执行和判题镜像、VM 历史、发送缓冲和处理水位均保留。模板见 [packaging](packaging/README.md)；远程操作遵守工作区 SSH MCP 约束，新建服务器目录必须在报告中列明。
 
@@ -95,6 +97,7 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor -race . ./cmd/...
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go vet -mod=vendor . ./cmd/...
 ./scripts/build.sh
 ./bin/aigate-proxy --check-config --config examples/proxy.example.json
+./bin/aigate-replay version
 ```
 
 `. ./cmd/...` 覆盖全部受 Git 管理的生产包和命令；忽略的 `deploy/` 内包含独立历史证据夹具，不作为生产包参与编译。Go 网络夹具使用本机临时监听器，覆盖独立功能服务、真实两层 HTTP、上传/取消/SSE、切流快照、共享目标、v2 测试兼容、配置变化与脱敏。平台验收覆盖三个入口、单入口切换、共享目标、共享维护与恢复、固定旧执行镜像路径及迁移保护；页面为桌面 Chrome 1280×720 和 iPhone 竖屏触控。以上本地验证不等于线上部署或真实流量验收。
