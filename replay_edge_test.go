@@ -83,23 +83,8 @@ func TestReplayKeepsRunLimitWhileServing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(runs, "old-000")); !os.IsNotExist(err) {
 		t.Fatal("oldest run kept", err)
 	}
-	if _, err := os.Stat(filepath.Join(runs, "fresh", "report.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(runs, "fresh", "state.json")); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestReplayArrivalRateUsesSendTimes(t *testing.T) {
-	results := []replayResult{
-		{SentSeconds: 0, E2ESeconds: 1, Outcome: "completed", Status: 200},
-		{SentSeconds: 10, E2ESeconds: 1, Outcome: "completed", Status: 200},
-		{SentSeconds: 20, E2ESeconds: 100, Outcome: "completed", Status: 200},
-	}
-	s := buildReplayStats("", 3, 30, results)
-	if s.ActualArrivalRate == nil || *s.ActualArrivalRate != 0.15 || s.DurationSeconds != 120 {
-		t.Fatalf("rate %v duration %v", s.ActualArrivalRate, s.DurationSeconds)
-	}
-	if single := buildReplayStats("", 1, 30, results[:1]); single.ActualArrivalRate != nil {
-		t.Fatal("one send has no arrival rate")
 	}
 }
 
@@ -145,7 +130,7 @@ func TestReplayAssertsTheCheckedTargetOnEveryRequest(t *testing.T) {
 	req := normalizedReplayRequest(t, "changed", "rec-t", summary.Segments[0].Segment, "r1")
 	f.svc.start(req)
 	view := f.wait(t, "changed")
-	if view.Report == nil || view.Report.Overall.Completed != 0 || view.Report.Overall.Statuses["409"] != 3 || rec.router.posts.Load() != before {
+	if view.Progress.Completed != 0 || view.Progress.Failed != 3 || view.LastError != "http_409" || rec.router.posts.Load() != before {
 		t.Fatalf("%s", encodeJSON(view))
 	}
 	// A target name that is not the proxy's Router would lock the wrong Router on the platform.

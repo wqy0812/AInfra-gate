@@ -122,19 +122,9 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 		t.Fatal(code, out)
 	}
 	view := f.wait(t, "run-1")
-	if view.State != "completed" || view.Report == nil {
-		t.Fatalf("view %+v", view)
-	}
-	report := view.Report
-	if report.Overall.Planned != 5 || report.Overall.Completed != 5 || report.Excluded["status"] != 1 || !report.Valid || !report.Original ||
-		report.Target.RouterID != "r1" || report.Target.ConfigDigest != rec.p.digest || report.Overall.TTFT.Count != 5 || report.Baseline.Requests != 5 {
-		t.Fatalf("report %s", encodeJSON(report))
-	}
-	if p99 := report.Overall.SendDelay.P99; p99 == nil || *p99 > 0.5 {
-		t.Fatalf("send delay %+v", report.Overall.SendDelay)
-	}
-	if report.Overall.CachedRatio == nil || report.Overall.CompletionTokens == nil || *report.Overall.CompletionTokens != *report.Baseline.CompletionTokens {
-		t.Fatalf("usage %s", encodeJSON(report.Overall))
+	if view.State != "completed" || view.Progress.Planned != 5 || view.Progress.Completed != 5 ||
+		view.Target.RouterID != "r1" || view.Target.ConfigDigest != rec.p.digest || view.MaxSendDelay > 0.5 {
+		t.Fatalf("view %s", encodeJSON(view))
 	}
 	// The target received exactly the recorded requests, with replay marks.
 	replayed := routerBodies(rec.router, before)
@@ -147,7 +137,7 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 	if marked {
 		t.Fatal("proxy forwarded the replay mark upstream")
 	}
-	for _, name := range []string{"request.json", "state.json", "plan.json", "plan.jsonl", "results.jsonl", "report.json"} {
+	for _, name := range []string{"request.json", "state.json", "plan.json", "plan.jsonl"} {
 		if info, err := os.Stat(filepath.Join(f.svc.runDir("run-1"), name)); err != nil || info.Mode().Perm() != 0600 {
 			t.Fatal(name, err)
 		}
@@ -165,9 +155,8 @@ func TestReplayConcurrencyWithEqualWorkRewrite(t *testing.T) {
 		t.Fatal(code, out)
 	}
 	view := f.wait(t, "run-c")
-	report := view.Report
-	if view.State != "completed" || report.Original || len(report.Rewritten) != 2 || report.Overall.Completed != 4 || report.Overall.FixOutputDeviations != 0 {
-		t.Fatalf("report %s", encodeJSON(view))
+	if view.State != "completed" || view.Progress.Completed != 4 || view.Progress.Failed != 0 {
+		t.Fatalf("view %s", encodeJSON(view))
 	}
 	rec.router.mu.Lock()
 	defer rec.router.mu.Unlock()
@@ -245,7 +234,7 @@ func TestReplayControlValidationAndLifecycle(t *testing.T) {
 	if code, out := f.call(t, "POST", "/control/replay/v1/runs/long/stop", nil); code != 200 {
 		t.Fatal(code, out)
 	}
-	if view := f.wait(t, "long"); view.State != "stopped" || view.Report == nil || view.Report.Overall.Sent >= 3 {
+	if view := f.wait(t, "long"); view.State != "stopped" || view.Progress.Sent >= 3 {
 		t.Fatalf("stop %s", encodeJSON(view))
 	}
 	if code, _ := f.call(t, "GET", "/control/replay/v1/runs/nope", nil); code != 404 {
@@ -271,21 +260,5 @@ func TestReplayRecoveryMarksInterruptedRuns(t *testing.T) {
 	}
 	if _, err := newReplayService(strings.Repeat("r", 32), []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, t.TempDir(), data, map[string]string{"t": "http://127.0.0.1:1"}, testMarkKey, io.Discard); err == nil {
 		t.Fatal("data root shared")
-	}
-}
-
-func TestReplayResponseParserTTFT(t *testing.T) {
-	p := &replayResponseParser{sent: time.Now(), stream: true}
-	stream := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n: keepalive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
-	if err := p.read(strings.NewReader(stream)); err != nil {
-		t.Fatal(err)
-	}
-	if p.ttft == nil || !p.done || p.finish != "length" || p.usage["completion_tokens"] != 1 {
-		t.Fatalf("%+v", p)
-	}
-	p = &replayResponseParser{sent: time.Now(), stream: true}
-	p.read(strings.NewReader("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"))
-	if p.ttft != nil || p.done {
-		t.Fatal("role chunk counted as output")
 	}
 }

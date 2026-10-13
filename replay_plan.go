@@ -1,8 +1,8 @@
 package aigate
 
 // Replay planning reads sealed recording segments and fixes the request
-// sequence before anything is sent. Only metadata, response tails and the
-// first timeline write are read here; request bodies are read at send time.
+// sequence before anything is sent. Response tails are read only for fix_output;
+// request bodies are read at send time.
 import (
 	"bufio"
 	"bytes"
@@ -20,7 +20,6 @@ import (
 const (
 	replayMaxSegments    = 96
 	replayMaxPlanItems   = 200_000
-	replayTimelineProbe  = 64 << 10
 	replayHeaderCopyable = "Content-Type,Content-Encoding,Accept,User-Agent"
 )
 
@@ -40,7 +39,6 @@ type replayFilter struct {
 type replayRequest struct {
 	RunID                 string             `json:"run_id"`
 	Recording             replayRecordingRef `json:"recording"`
-	WarmupSegments        []string           `json:"warmup_segments,omitempty"`
 	Filter                replayFilter       `json:"filter"`
 	Target                string             `json:"target"`
 	Mode                  string             `json:"mode"`
@@ -58,11 +56,10 @@ func (r *replayRequest) normalize() error {
 		return fmt.Errorf("invalid_identity")
 	}
 	seen := map[string]bool{}
-	all := append(append([]string{}, r.WarmupSegments...), r.Recording.Segments...)
-	if len(r.Recording.Segments) == 0 || len(all) > replayMaxSegments {
+	if len(r.Recording.Segments) == 0 || len(r.Recording.Segments) > replayMaxSegments {
 		return fmt.Errorf("invalid_segments")
 	}
-	for _, name := range all {
+	for _, name := range r.Recording.Segments {
 		if _, ok := parseRecordingSegment(name); !ok || seen[name] {
 			return fmt.Errorf("invalid_segments")
 		}
@@ -128,27 +125,20 @@ func (r replayRequest) rewritten() []string {
 }
 
 type replayPlanItem struct {
-	Sequence        int               `json:"sequence"`
-	Segment         string            `json:"segment"`
-	Warmup          bool              `json:"warmup,omitempty"`
-	OffsetSeconds   float64           `json:"offset_seconds"`
-	Directory       string            `json:"directory"`
-	RequestID       string            `json:"request_id"`
-	Path            string            `json:"path"`
-	Headers         map[string]string `json:"headers"`
-	RequestSHA256   string            `json:"request_sha256"`
-	RequestBytes    int64             `json:"request_bytes"`
-	Stream          bool              `json:"stream"`
-	TargetTokens    uint64            `json:"target_tokens,omitempty"`
-	RecordedStatus  int               `json:"recorded_status"`
-	RecordedSeconds float64           `json:"recorded_seconds"`
-	RecordedFirst   *float64          `json:"recorded_first_write_seconds,omitempty"`
-	RecordedUsage   map[string]uint64 `json:"recorded_usage,omitempty"`
+	Sequence      int               `json:"sequence"`
+	Segment       string            `json:"segment"`
+	OffsetSeconds float64           `json:"offset_seconds"`
+	Directory     string            `json:"directory"`
+	RequestID     string            `json:"request_id"`
+	Path          string            `json:"path"`
+	Headers       map[string]string `json:"headers"`
+	RequestSHA256 string            `json:"request_sha256"`
+	RequestBytes  int64             `json:"request_bytes"`
+	TargetTokens  uint64            `json:"target_tokens,omitempty"`
 }
 
 type replayPlanSegment struct {
 	Segment       string    `json:"segment"`
-	Warmup        bool      `json:"warmup,omitempty"`
 	CoverageStart time.Time `json:"coverage_start"`
 	CoverageEnd   time.Time `json:"coverage_end"`
 	Partial       bool      `json:"partial"`
@@ -235,24 +225,6 @@ func replayTailUsage(tail []byte) map[string]uint64 {
 	}
 }
 
-func replayFirstWrite(path string) *float64 {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(io.LimitReader(f, replayTimelineProbe))
-	scanner.Buffer(make([]byte, 4096), 64<<10)
-	for scanner.Scan() {
-		var line recordingTimelineLine
-		if json.Unmarshal(scanner.Bytes(), &line) == nil && line.Type == "write" {
-			v := line.Seconds
-			return &v
-		}
-	}
-	return nil
-}
-
 func copyableHeaders(headers map[string]string) map[string]string {
 	out := map[string]string{}
 	for _, k := range strings.Split(replayHeaderCopyable, ",") {
@@ -273,39 +245,28 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 	plan := &replayPlan{Schema: 1, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
 		Excluded: map[string]int{}, Rewritten: req.rewritten(), Segments: []replayPlanSegment{}}
 	plan.OriginalBytes = len(plan.Rewritten) == 0
-	type chosen struct {
-		status replaySegmentStatus
-		warmup bool
-	}
-	var segments []chosen
-	for _, group := range []struct {
-		names  []string
-		warmup bool
-	}{{req.WarmupSegments, true}, {req.Recording.Segments, false}} {
-		var ordered []chosen
-		for _, name := range group.names {
-			status, err := readRecordingSegment(root, req.Recording.GatewayID, req.Recording.RecordingID, name)
-			if err != nil {
-				return nil, err
-			}
-			if status.State != "sealed" {
-				return nil, fmt.Errorf("segment_not_sealed")
-			}
-			ordered = append(ordered, chosen{status, group.warmup})
+	segments := []replaySegmentStatus{}
+	for _, name := range req.Recording.Segments {
+		status, err := readRecordingSegment(root, req.Recording.GatewayID, req.Recording.RecordingID, name)
+		if err != nil {
+			return nil, err
 		}
-		sort.Slice(ordered, func(i, j int) bool { return ordered[i].status.Start.Before(ordered[j].status.Start) })
-		segments = append(segments, ordered...)
+		if status.State != "sealed" {
+			return nil, fmt.Errorf("segment_not_sealed")
+		}
+		segments = append(segments, status)
 	}
+	sort.Slice(segments, func(i, j int) bool { return segments[i].Start.Before(segments[j].Start) })
 	base := 0.0
 	for _, seg := range segments {
-		coverage := seg.status.CoverageEnd.Sub(seg.status.CoverageStart).Seconds()
+		coverage := seg.CoverageEnd.Sub(seg.CoverageStart).Seconds()
 		if coverage < 0 {
 			coverage = 0
 		}
-		entry := replayPlanSegment{Segment: seg.status.Segment, Warmup: seg.warmup, CoverageStart: seg.status.CoverageStart, CoverageEnd: seg.status.CoverageEnd,
-			Partial: seg.status.Partial, BaseSeconds: base, Recorded: seg.status.Recorded, Dropped: seg.status.Dropped, Truncated: seg.status.Truncated}
-		dir := filepath.Join(root, req.Recording.GatewayID, req.Recording.RecordingID, seg.status.Segment)
-		items, err := planSegment(dir, seg.status, seg.warmup, base, req, plan)
+		entry := replayPlanSegment{Segment: seg.Segment, CoverageStart: seg.CoverageStart, CoverageEnd: seg.CoverageEnd,
+			Partial: seg.Partial, BaseSeconds: base, Recorded: seg.Recorded, Dropped: seg.Dropped, Truncated: seg.Truncated}
+		dir := filepath.Join(root, req.Recording.GatewayID, req.Recording.RecordingID, seg.Segment)
+		items, err := planSegment(dir, seg, base, req, plan)
 		if err != nil {
 			return nil, err
 		}
@@ -328,7 +289,7 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 	return plan, nil
 }
 
-func planSegment(dir string, seg replaySegmentStatus, warmup bool, base float64, req replayRequest, plan *replayPlan) ([]replayPlanItem, error) {
+func planSegment(dir string, seg replaySegmentStatus, base float64, req replayRequest, plan *replayPlan) ([]replayPlanItem, error) {
 	f, err := os.Open(filepath.Join(dir, "index.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -371,20 +332,30 @@ func planSegment(dir string, seg replaySegmentStatus, warmup bool, base float64,
 			plan.Excluded["meta_unreadable"]++
 			continue
 		}
-		item := replayPlanItem{Segment: seg.Segment, Warmup: warmup, OffsetSeconds: base + line.OffsetSeconds - shift, Directory: recordDir, RequestID: meta.RequestID,
-			Path: meta.Path, Headers: copyableHeaders(meta.Headers), RequestSHA256: meta.RequestSHA256, RequestBytes: meta.RequestBytes,
-			Stream: strings.HasPrefix(strings.ToLower(meta.ResponseHeaders["Content-Type"]), "text/event-stream"), RecordedStatus: meta.Status,
-			RecordedSeconds: meta.DurationSeconds, RecordedFirst: replayFirstWrite(filepath.Join(recordDir, "timeline.jsonl"))}
+		item := replayPlanItem{Segment: seg.Segment, OffsetSeconds: base + line.OffsetSeconds - shift, Directory: recordDir, RequestID: meta.RequestID,
+			Path: meta.Path, Headers: copyableHeaders(meta.Headers), RequestSHA256: meta.RequestSHA256, RequestBytes: meta.RequestBytes}
 		if item.OffsetSeconds < base {
 			item.OffsetSeconds = base
 		}
-		if tail, err := os.ReadFile(filepath.Join(recordDir, meta.ResponseFile)); err == nil && len(tail) <= 64<<20 {
-			item.RecordedUsage = replayTailUsage(tail)
-		}
 		if req.FixOutput {
-			if n, ok := item.RecordedUsage["completion_tokens"]; ok && n > 0 {
-				item.TargetTokens = n
-			} else {
+			// The recorder keeps usage in the response tail. Read only its last
+			// 8 KiB even for full recordings; planning must not load whole replies.
+			f, err := os.Open(filepath.Join(recordDir, meta.ResponseFile))
+			if err != nil {
+				return nil, fmt.Errorf("fix_output_usage_unknown")
+			}
+			info, err := f.Stat()
+			var tail []byte
+			if err == nil {
+				offset := max(int64(0), info.Size()-recordingTailBytes)
+				tail, err = io.ReadAll(io.NewSectionReader(f, offset, recordingTailBytes))
+			}
+			f.Close()
+			if err != nil {
+				return nil, fmt.Errorf("fix_output_usage_unknown")
+			}
+			item.TargetTokens = replayTailUsage(tail)["completion_tokens"]
+			if item.TargetTokens == 0 {
 				return nil, fmt.Errorf("fix_output_usage_unknown")
 			}
 		}

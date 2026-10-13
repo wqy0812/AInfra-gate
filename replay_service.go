@@ -64,6 +64,7 @@ type replayService struct {
 	boot       string
 	audit      *log.Logger
 	client     *http.Client
+	bodyMemory *replayByteBudget
 	directory  *os.File
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -97,7 +98,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 4096, IdleConnTimeout: 90 * time.Second, DisableCompression: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
-		audit: log.New(audit, "", 0), directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
+		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
 		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err = s.recover(); err != nil {
 		s.Close()
@@ -239,14 +240,6 @@ func (s *replayService) loadRunLocked(id string) (replayRunView, bool) {
 	data, err := recordingReadSmall(filepath.Join(s.runDir(id), "state.json"))
 	if err != nil || json.Unmarshal(data, &view) != nil {
 		return view, false
-	}
-	if view.Report == nil {
-		if data, err := os.ReadFile(filepath.Join(s.runDir(id), "report.json")); err == nil {
-			var report replayReport
-			if json.Unmarshal(data, &report) == nil {
-				view.Report = &report
-			}
-		}
 	}
 	return view, true
 }
@@ -487,7 +480,7 @@ func RunReplay(args []string, out, stderr io.Writer) error {
 	listen := f.String("listen", "127.0.0.1:18085", "authenticated platform control listener")
 	allowed := f.String("allowed-cidrs", "127.0.0.0/8,::1/128", "control source CIDRs")
 	recordRoot := f.String("record-root", "", "switch recording directory (read only)")
-	dataRoot := f.String("data-root", "/var/lib/aigate-replay", "run plans, results and reports")
+	dataRoot := f.String("data-root", "/var/lib/aigate-replay", "run plans, state and progress")
 	targetsPath := f.String("targets", "", "local JSON file naming the allowed replay targets")
 	shutdown := f.Duration("shutdown-timeout", 30*time.Second, "graceful shutdown deadline")
 	if err := f.Parse(args[1:]); err != nil {

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestReplayInvalidatesDroppedMeasuredSource(t *testing.T) {
+func TestReplaySendsAvailableRecordsDespiteSourceDrops(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-drop", 1)
 	name := summary.Segments[0].Segment
@@ -28,8 +28,37 @@ func TestReplayInvalidatesDroppedMeasuredSource(t *testing.T) {
 	req := normalizedReplayRequest(t, "dropped", "rec-drop", name, "r1")
 	f.svc.start(req)
 	view := f.wait(t, req.RunID)
-	if view.Report == nil || view.Report.Valid || !strings.Contains(fmt.Sprint(view.Report.Invalid), "source_requests_dropped") || view.Report.Overall.Sent != 1 {
+	if view.State != "completed" || view.Progress.Sent != 1 {
 		t.Fatalf("%s", encodeJSON(view))
+	}
+}
+
+func TestReplayStopCancelsBodyBudgetWaitBeforeDispatch(t *testing.T) {
+	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
+	summary := recordSample(t, rec, "rec-budget", 1)
+	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
+	if !f.svc.bodyMemory.acquire(context.Background(), replayBodyBudget) {
+		t.Fatal("budget unavailable")
+	}
+	defer f.svc.bodyMemory.release(replayBodyBudget)
+	before := rec.router.posts.Load()
+	req := normalizedReplayRequest(t, "budget", "rec-budget", summary.Segments[0].Segment, "r1")
+	f.svc.start(req)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		view, _ := f.svc.loadRun(req.RunID)
+		if view.State == "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never started", view)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	f.svc.stop(req.RunID)
+	view := f.wait(t, req.RunID)
+	if view.State != "stopped" || view.Progress.Sent != 0 || rec.router.posts.Load() != before {
+		t.Fatalf("sent after stop while waiting for body memory: %+v", view)
 	}
 }
 
@@ -51,7 +80,7 @@ func TestReplayFixOutputRejectsUnknownUsageBeforeSending(t *testing.T) {
 	req.FixOutput = true
 	f.svc.start(req)
 	view := f.wait(t, req.RunID)
-	if view.State != "failed" || view.Error != "fix_output_usage_unknown" || view.Report != nil || rec.router.posts.Load() != before {
+	if view.State != "failed" || view.Error != "fix_output_usage_unknown" || rec.router.posts.Load() != before {
 		t.Fatalf("%s", encodeJSON(view))
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -76,14 +77,15 @@ func TestRecordingPerformance(t *testing.T) {
 		}
 		wg.Wait()
 		elapsed := time.Since(start).Seconds()
-		stats := percentiles(first)
+		sort.Float64s(first)
+		percentile := func(p float64) float64 { return first[int(p*float64(len(first)-1))] * 1000 }
 		recorded := uint64(0)
 		if enabled {
 			recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "perf"})
 			recorded = waitRecordingEnded(t, f.c, "perf").Recorded
 		}
 		fmt.Printf("recording=%v requests=%d req/s=%.1f bytes/s=%.0f first_content_p50_ms=%.2f p95_ms=%.2f p99_ms=%.2f recorded=%d\n",
-			enabled, len(first), float64(len(first))/elapsed, float64(bytes)/elapsed, *stats.P50*1000, *stats.P95*1000, *stats.P99*1000, recorded)
+			enabled, len(first), float64(len(first))/elapsed, float64(bytes)/elapsed, percentile(0.5), percentile(0.95), percentile(0.99), recorded)
 		f.switch_.Close()
 	}
 }
