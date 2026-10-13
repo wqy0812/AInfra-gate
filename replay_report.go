@@ -253,10 +253,12 @@ func buildReplayReport(req replayRequest, plan *replayPlan, target replayTargetS
 	}
 	var coverage float64
 	planned := 0
+	dropped := false
 	for _, seg := range plan.Segments {
 		if seg.Warmup {
 			continue
 		}
+		dropped = dropped || seg.Dropped > 0
 		c := seg.CoverageEnd.Sub(seg.CoverageStart).Seconds()
 		coverage += c
 		planned += seg.Planned
@@ -265,6 +267,9 @@ func buildReplayReport(req replayRequest, plan *replayPlan, target replayTargetS
 	}
 	report.Overall = buildReplayStats("", planned, coverage, measured)
 	report.Baseline = buildReplayBaseline("", coverage, measuredItems)
+	if dropped {
+		report.Invalid = append(report.Invalid, "source_requests_dropped")
+	}
 	if req.Mode == "timed" && report.Overall.SendDelay.P99 != nil && *report.Overall.SendDelay.P99 > 1 {
 		report.Invalid = append(report.Invalid, "sender_delay_p99_over_1s")
 	}

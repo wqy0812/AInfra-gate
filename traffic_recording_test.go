@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -669,5 +670,75 @@ func TestProxyLabelsOnlyVerifiedReplayTraffic(t *testing.T) {
 	}
 	if labelled["start"] != 1 || labelled["input"] != 1 || labelled["end"] != 1 {
 		t.Fatalf("replay events %v", labelled)
+	}
+}
+
+func TestRecordingExcludesInvalidValidAndExpiredTestMarkers(t *testing.T) {
+	f := newRecordingFixture(t, recordingDefaultMaxBytes)
+	now := time.Now()
+	startRecording(t, f.c, "rec-markers", halfHour(now), halfHour(now).Add(time.Hour), nil)
+	body := `{"model":"token-model","messages":[{"role":"user","content":"test"}]}`
+	if status, _ := postChat(t, f.switch_.URL, body, map[string]string{"X-Code-Eval-Token": "invalid"}); status != 409 {
+		t.Fatal(status)
+	}
+	token := strings.Repeat("t", 32)
+	payload := map[string]any{"task_id": "task", "token": token, "model": "token-model", "router_id": "r1", "binding_revision": 1}
+	commandV3(t, f.c, "test", "test-acquire", payload)
+	if status, _ := postChat(t, f.switch_.URL, body, map[string]string{"X-Code-Eval-Token": token}); status != 200 {
+		t.Fatal(status)
+	}
+	commandV3(t, f.c, "test", "test-release", payload)
+	if status, _ := postChat(t, f.switch_.URL, body, map[string]string{"X-Code-Eval-Token": token}); status != 409 {
+		t.Fatal(status)
+	}
+	if status, _ := postChat(t, f.switch_.URL, body, nil); status != 200 {
+		t.Fatal(status)
+	}
+	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "rec-markers"})
+	if summary := waitRecordingEnded(t, f.c, "rec-markers"); summary.Recorded != 1 {
+		t.Fatalf("%+v", summary)
+	}
+}
+
+func TestRecordingCancellationBeforeResponseHeaders(t *testing.T) {
+	f := newRecordingFixture(t, recordingDefaultMaxBytes)
+	entered := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		close(entered)
+		<-r.Context().Done()
+	}))
+	defer target.Close()
+	// The live switch forwarding path, with a target that has not sent headers.
+	f.c.mu.Lock()
+	f.c.active.forward.target, _ = url.Parse(target.URL)
+	f.c.mu.Unlock()
+	now := time.Now()
+	startRecording(t, f.c, "rec-cancel-early", halfHour(now), halfHour(now).Add(time.Hour), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "POST", f.switch_.URL+"/v1/chat/completions", strings.NewReader(`{"messages":[]}`))
+	done := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(req)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("target did not receive request")
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("client request was not cancelled")
+	}
+	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "rec-cancel-early"})
+	summary := waitRecordingEnded(t, f.c, "rec-cancel-early")
+	rows := readIndex(t, filepath.Join(f.root, "g1", "rec-cancel-early", summary.Segments[0].Segment, "index.jsonl"))
+	if len(rows) != 1 || rows[0].Outcome != "client_cancelled" {
+		t.Fatalf("%+v", rows)
 	}
 }

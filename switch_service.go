@@ -253,8 +253,12 @@ func (f *switchForwarder) serve(w http.ResponseWriter, r *http.Request, meta *ru
 					code, status = "invalid_request", 400
 				}
 			}
+			outcome := code
+			if errors.Is(inbound.Context().Err(), context.Canceled) {
+				outcome = "client_cancelled"
+			}
 			abandonRequestBody(w, inbound)
-			meta.record.setOutcome(code)
+			meta.record.setOutcome(outcome)
 			f.audit.Print(string(encodeJSON(map[string]any{"event": "switch_forward_error", "request_id": id, "router_id": f.router, "binding_revision": f.revision, "error_class": code})))
 			runtimeError(w, status, code)
 		},

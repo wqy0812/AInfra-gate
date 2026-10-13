@@ -93,16 +93,17 @@ type replayRun struct {
 }
 
 type replayRunView struct {
-	RunID     string            `json:"run_id"`
-	State     string            `json:"state"`
-	Error     string            `json:"error,omitempty"`
-	CreatedAt time.Time         `json:"created_at"`
-	StartedAt *time.Time        `json:"started_at,omitempty"`
-	EndedAt   *time.Time        `json:"ended_at,omitempty"`
-	Request   replayRequest     `json:"request"`
-	Target    replayTargetState `json:"target"`
-	Progress  replayProgress    `json:"progress"`
-	Report    *replayReport     `json:"report,omitempty"`
+	RunID          string            `json:"run_id"`
+	State          string            `json:"state"`
+	Error          string            `json:"error,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	StartedAt      *time.Time        `json:"started_at,omitempty"`
+	EndedAt        *time.Time        `json:"ended_at,omitempty"`
+	Request        *replayRequest    `json:"request,omitempty"`
+	Target         replayTargetState `json:"target"`
+	Progress       replayProgress    `json:"progress"`
+	Report         *replayReport     `json:"report,omitempty"`
+	StartCancelled bool              `json:"start_cancelled,omitempty"`
 }
 
 func (r *replayRun) viewLocked() replayRunView {
@@ -112,7 +113,7 @@ func (r *replayRun) viewLocked() replayRunView {
 		progress.Elapsed = time.Since(r.begin).Seconds()
 	}
 	return replayRunView{RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
-		Request: r.req, Target: r.target, Progress: progress, Report: r.report}
+		Request: &r.req, Target: r.target, Progress: progress, Report: r.report}
 }
 
 func (r *replayRun) view() replayRunView {
@@ -131,10 +132,16 @@ func (r *replayRun) persist() {
 }
 
 func (r *replayRun) finish(state, errText string) {
-	// Release the single-run slot before the end becomes visible, so a caller
-	// that observes the end can start the next run immediately.
-	r.svc.release(r)
+	// Publish the terminal state and release the slot under the service lock.
+	// start/stop use the same service -> run lock order.
+	r.svc.mu.Lock()
+	defer r.svc.mu.Unlock()
 	r.mu.Lock()
+	// stop() acknowledges under this same lock. A successful stop cannot be
+	// overwritten by an already chosen completed transition.
+	if state == "completed" && r.stopped.Load() {
+		state = "stopped"
+	}
 	now := time.Now().UTC()
 	r.state, r.errText, r.ended = state, errText, &now
 	r.progress.Sent, r.progress.Completed, r.progress.Failed, r.progress.Inflight = r.sent.Load(), r.completed.Load(), r.failed.Load(), 0
@@ -143,6 +150,9 @@ func (r *replayRun) finish(state, errText string) {
 	}
 	r.mu.Unlock()
 	r.persist()
+	if r.svc.active == r {
+		r.svc.active = nil
+	}
 	close(r.done)
 }
 
@@ -179,7 +189,10 @@ func (r *replayRun) execute(ctx context.Context) {
 	now := time.Now()
 	started := now.UTC()
 	r.mu.Lock()
-	r.target, r.state, r.started, r.begin = target, "running", &started, now
+	r.target, r.started, r.begin = target, &started, now
+	if !r.stopped.Load() {
+		r.state = "running"
+	}
 	r.mu.Unlock()
 	r.persist()
 	if r.req.Mode == "timed" {
@@ -322,6 +335,11 @@ func (r *replayRun) send(item replayPlanItem, due time.Time) {
 	}
 	for k, v := range item.Headers {
 		request.Header.Set(k, v)
+	}
+	// An absent User-Agent must stay absent on the wire; net/http otherwise
+	// synthesizes Go-http-client/1.1.
+	if request.Header.Get("User-Agent") == "" {
+		request.Header.Set("User-Agent", "")
 	}
 	// The proxy answers 409 if it was reconfigured or replaced after the check.
 	request.Header.Set(headerRouter, r.target.RouterID)

@@ -989,7 +989,9 @@ func (r *trafficRecorder) samplingLocked(now time.Time) *recordingSession {
 // begin samples a business request before admission so that entry rejections
 // are recorded too. A verified replay mark is never sampled.
 func (r *trafficRecorder) begin(req *http.Request, id string, arrived time.Time) *trafficRecord {
-	// Platform evaluation traffic (test leases) and verified replays are not business traffic.
+	// Exclude every test-marked request, including invalid/expired leases, so
+	// late evaluation requests cannot become business replay input. The marker
+	// is not authentication; admission independently validates the lease.
 	if r == nil || req.Header.Get("X-Code-Eval-Token") != "" || verifyReplayMark(r.markKey, req.Header.Get(headerReplay)) {
 		return nil
 	}

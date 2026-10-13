@@ -136,8 +136,8 @@ func (s *replayService) recover() error {
 }
 
 // pruneRuns removes the oldest run directories until at most keep remain.
-// Callers hold s.mu with no active run, or run before the service starts, so
-// every directory belongs to an ended run.
+// Callers hold s.mu or run before the service starts. Never remove the active
+// run when recording a stop that arrived before its start.
 func (s *replayService) pruneRuns(keep int) error {
 	root := filepath.Join(s.dataRoot, "runs")
 	entries, err := os.ReadDir(root)
@@ -151,6 +151,10 @@ func (s *replayService) pruneRuns(keep int) error {
 	var all []kept
 	for _, entry := range entries {
 		if !entry.IsDir() || !validOperationID(entry.Name()) {
+			continue
+		}
+		if s.active != nil && entry.Name() == s.active.req.RunID {
+			keep--
 			continue
 		}
 		var view replayRunView
@@ -183,14 +187,6 @@ func (s *replayService) Close() {
 	s.wg.Wait()
 	unlockState(s.directory)
 	s.directory.Close()
-}
-
-func (s *replayService) release(r *replayRun) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.active == r {
-		s.active = nil
-	}
 }
 
 func (s *replayService) checkTarget(ctx context.Context, name string) (replayTargetState, error) {
@@ -230,8 +226,12 @@ func (s *replayService) runDir(id string) string { return filepath.Join(s.dataRo
 
 func (s *replayService) loadRun(id string) (replayRunView, bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadRunLocked(id)
+}
+
+func (s *replayService) loadRunLocked(id string) (replayRunView, bool) {
 	r := s.runs[id]
-	s.mu.Unlock()
 	if r != nil {
 		return r.view(), true
 	}
@@ -256,22 +256,20 @@ func replayJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	digest := runtimeDigest(req)
-	if view, ok := s.loadRun(req.RunID); ok {
+	if view, ok := s.loadRunLocked(req.RunID); ok {
+		// A durable stop-before-start record is a barrier for every delayed
+		// delivery of this ID, regardless of its request body.
+		if view.StartCancelled {
+			return view, 200, ""
+		}
 		// Idempotent by run_id: the same request returns the existing run.
 		if runtimeDigest(view.Request) != digest {
 			return view, 409, "run_conflict"
 		}
 		return view, 200, ""
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// An identical request may have created the run since loadRun looked.
-	if r := s.runs[req.RunID]; r != nil {
-		if r.digest != digest {
-			return r.view(), 409, "run_conflict"
-		}
-		return r.view(), 200, ""
 	}
 	if s.ctx.Err() != nil {
 		return replayRunView{}, 409, "service_stopping"
@@ -312,13 +310,28 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 
 func (s *replayService) stop(id string) (replayRunView, int, string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	r := s.runs[id]
-	s.mu.Unlock()
 	if r == nil {
-		if view, ok := s.loadRun(id); ok {
+		if view, ok := s.loadRunLocked(id); ok {
 			return view, 200, ""
 		}
-		return replayRunView{}, 404, "run_not_found"
+		// 404 cannot prove a concurrent POST /runs will never arrive. Persist
+		// the stop under the start lock before acknowledging it to the platform.
+		if err := s.pruneRuns(replayRunsKept - 1); err != nil {
+			return replayRunView{}, 500, "storage_failed"
+		}
+		dir := s.runDir(id)
+		if err := os.Mkdir(dir, 0700); err != nil {
+			return replayRunView{}, 500, "storage_failed"
+		}
+		now := time.Now().UTC()
+		view := replayRunView{RunID: id, State: "stopped", CreatedAt: now, EndedAt: &now, StartCancelled: true}
+		if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
+			_ = os.RemoveAll(dir)
+			return replayRunView{}, 500, "storage_failed"
+		}
+		return view, 200, ""
 	}
 	r.mu.Lock()
 	if r.ended == nil && r.state != "stopping" {

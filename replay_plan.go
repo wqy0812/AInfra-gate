@@ -169,7 +169,6 @@ type replayPlan struct {
 	Excluded        map[string]int      `json:"excluded"`
 	Rewritten       []string            `json:"rewritten"`
 	OriginalBytes   bool                `json:"original_bytes"`
-	FixOutputMissed int                 `json:"fix_output_unknown"`
 	DurationSeconds float64             `json:"duration_seconds"`
 	items           []replayPlanItem
 }
@@ -386,7 +385,7 @@ func planSegment(dir string, seg replaySegmentStatus, warmup bool, base float64,
 			if n, ok := item.RecordedUsage["completion_tokens"]; ok && n > 0 {
 				item.TargetTokens = n
 			} else {
-				plan.FixOutputMissed++
+				return nil, fmt.Errorf("fix_output_usage_unknown")
 			}
 		}
 		items = append(items, item)

@@ -6,7 +6,7 @@
 
 `aigate-switch serve --record-root <目录>` 启用录制能力，`--record-max-bytes` 为总容量（默认 50 GiB）；不传 `--record-root` 时录制关闭，`/control/v3/status` 的 `recording` 为 `null`。启用后切流服务只写 `<record-root>/<gateway_id>/`，该目录必须为 0700 并由进程独占加锁。请求线程只做内存拷贝和入队，文件创建、写入、封段、容量淘汰全部由一个 worker 完成；准入锁内不做磁盘 I/O，录制故障不影响转发和响应字节。
 
-采样发生在准入判断之前，因此入口拒收（503、409、404 方法错误、413、508）也会写记录。带 `X-Code-Eval-Token` 的平台测试请求和签名有效的回放请求不录制。正文从实际转发给 proxy 的字节旁路拷贝；`Authorization` 与平台内部 header 永不记录。
+业务请求的采样发生在准入判断之前，因此入口拒收（503、409、405 方法错误、413、508）也会写记录。所有带非空 `X-Code-Eval-Token` 的请求均不录制，包括无效、过期和迟到的测试标记，避免评测输入混入业务回放。这个 header 本身不证明调用方身份；准入逻辑独立校验当前测试占用，无效或过期标记返回 409。签名有效的回放请求也不录制。正文从实际转发给 proxy 的字节旁路拷贝；`Authorization` 与平台内部 header 永不记录。
 
 ### 控制命令
 
@@ -71,8 +71,8 @@
 | `GET /control/replay/v1/recordings?gateway_id=` | 列出录制会话及各段元数据（覆盖范围、partial、计数、是否保留），不含正文 |
 | `POST /control/replay/v1/runs` | 按 `run_id` 幂等；同时只跑一个 run，否则 `run_active` |
 | `GET /control/replay/v1/runs/{id}` | 状态、进度、报告摘要 |
-| `POST /control/replay/v1/runs/{id}/stop` | 停止发送，已发请求收尾后出报告，状态 `stopped` |
+| `POST /control/replay/v1/runs/{id}/stop` | 停止发送，已发请求收尾后出报告，状态 `stopped`；尚未开始的 ID 先持久化 `start_cancelled=true`，阻止迟到的启动请求（同 run 保留期限） |
 
-请求字段见 `openapi.json` 的 `ReplayRunRequest`：`segments` 只能选已封尾的段（`warmup_segments` 先发送、不计入结果）；默认只回放 `/v1/chat/completions` 的 2xx、正文完整、采集完整的请求，排除入口拒收；`timed` 按录制到达时刻原速发送，目标变慢不降低到达率，触及 `max_inflight` 只记录发送延误；`concurrency` 按计划顺序固定并发。不提供倍速、多份叠加或阶梯加压。正文改写只有 `set_model`、`set_max_tokens`、`force_stream` 和 `fix_output`（把 `max_tokens`、`min_tokens` 设为录制时的 completion tokens 并加 `ignore_eos`）；改写后报告的 `original_bytes=false`。不改写时发送录制时的原始字节，发送前核对 SHA-256。
+请求字段见 `openapi.json` 的 `ReplayRunRequest`：`segments` 只能选已封尾的段（`warmup_segments` 先发送、不计入结果）；默认只回放 `/v1/chat/completions` 的 2xx、正文完整、采集完整的请求，排除入口拒收；`timed` 按录制到达时刻原速发送，目标变慢不降低到达率，触及 `max_inflight` 只记录发送延误；`concurrency` 按计划顺序固定并发。不提供倍速、多份叠加或阶梯加压。正文改写只有 `set_model`、`set_max_tokens`、`force_stream` 和 `fix_output`（把 `max_tokens`、`min_tokens` 设为录制时的 completion tokens 并加 `ignore_eos`）；任一选中请求（包括预热）缺少有效的正整数 completion tokens 时，`fix_output` 在计划阶段失败为 `fix_output_usage_unknown`，不会发送部分改写的负载。改写后报告的 `original_bytes=false`。不改写时发送录制时的原始字节，发送前核对 SHA-256。
 
-报告分段和汇总各一份：发送数、结果与状态码分布、成功率、超时率、TTFT（首个有效生成输出，不含角色块、心跳和 usage）、E2E、发送延误的 P50/P95/P99/最大值、最大在途、prompt/completion/cached tokens、cached 占比、输出 token/s、期望与实际到达率，以及 `fix_output` 偏差超过 1% 的请求数。同一批段的录制基线（到达率、E2E、首字节、usage）并列给出；录制侧时间包含客户端到 switch 一跳，首字节来自第一次响应写出，回放直连 proxy 不含 switch 一跳。`timed` 下发送延误 P99 超过 1 秒或未发完全部计划时报告标为无效。
+报告分段和汇总各一份：发送数、结果与状态码分布、成功率、超时率、TTFT（首个有效生成输出，不含角色块、心跳和 usage）、E2E、发送延误的 P50/P95/P99/最大值、最大在途、prompt/completion/cached tokens、cached 占比、输出 token/s、期望与实际到达率，以及 `fix_output` 偏差超过 1% 的请求数。同一批段的录制基线（到达率、E2E、首字节、usage）并列给出；录制侧时间包含客户端到 switch 一跳，首字节来自第一次响应写出，回放直连 proxy 不含 switch 一跳。`timed` 下发送延误 P99 超过 1 秒、未发完全部计划，或测量段存在录制丢弃时报告标为无效；录制丢弃的原因为 `source_requests_dropped`。

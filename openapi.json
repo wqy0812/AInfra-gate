@@ -945,6 +945,9 @@
           },
           "404": {
             "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "parameters": [
@@ -957,7 +960,8 @@
               "pattern": "^[A-Za-z0-9_-]{1,128}$"
             }
           }
-        ]
+        ],
+        "description": "A valid unknown run ID is durably stopped before acknowledging. Delayed starts return stopped with start_cancelled=true and send no requests, including after restart, within the 200-run retention window."
       }
     }
   },
@@ -1914,6 +1918,10 @@
             "type": "object",
             "additionalProperties": true,
             "description": "Per-segment and overall TTFT/E2E/send-delay percentiles, outcomes, usage, output token/s, cached ratio, arrival rates, validity and the recorded baseline. Never contains request or response bodies."
+          },
+          "start_cancelled": {
+            "type": "boolean",
+            "description": "The stop arrived before start. The request is omitted and no traffic was sent."
           }
         }
       }
