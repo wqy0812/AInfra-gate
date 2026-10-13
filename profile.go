@@ -284,6 +284,13 @@ func (p *requestProfiler) emit(e profileEvent) {
 		p.dropped.Add(1)
 	}
 }
+func profileTrafficTags(traffic string) string {
+	if traffic == "" {
+		return ""
+	}
+	return profileExtra("", "traffic", traffic)
+}
+
 func (p *requestProfiler) begin(id string, arrived ...time.Time) *profileRequest {
 	return p.beginRequest(id, true, "", arrived...)
 }
@@ -301,12 +308,12 @@ func (p *requestProfiler) beginRequest(id string, stream bool, traffic string, a
 	if p.liveBackends == nil {
 		p.liveBackends = map[string]bool{"unrouted": true}
 	}
-	p.active[r.e.Seq] = profileLiveRequest{start: r.start, backend: "unrouted", stage: "routing_discovery", nonstream: !stream}
+	p.active[r.e.Seq] = profileLiveRequest{start: r.start, backend: "unrouted", stage: "routing_discovery", nonstream: !stream, traffic: traffic}
 	if !stream {
-		p.add("nonstream_requests_total", "", 1)
+		p.add("nonstream_requests_total", profileTrafficTags(traffic), 1)
 	}
-	p.add("requests_started_total", "", 1)
-	p.add("requests_inflight", "", 1)
+	p.add("requests_started_total", profileTrafficTags(traffic), 1)
+	p.add("requests_inflight", profileTrafficTags(traffic), 1)
 	p.mu.Unlock()
 	p.emit(r.e)
 	return r
@@ -380,8 +387,11 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	delete(p.active, r.e.Seq)
 	if r.tags == "" {
 		r.tags = p.tags("unrouted", "unknown")
+		if r.e.Traffic != "" {
+			r.tags = profileExtra(r.tags, "traffic", r.e.Traffic)
+		}
 	}
-	p.add("requests_inflight", "", -1)
+	p.add("requests_inflight", profileTrafficTags(r.e.Traffic), -1)
 	p.add("requests_ended_total", profileExtra(r.tags, "outcome", e.Outcome), 1)
 	p.generationEnd(entry.generation, r.tags)
 	p.hist("request_duration_seconds", r.tags, e.Duration, profileTimeBuckets)
@@ -753,7 +763,11 @@ func (p *requestProfiler) restoreCounters() {
 	p.types = saved.Types
 	p.groups = saved.Groups
 	p.counterStarted = saved.Started
-	p.values["aigate_requests_inflight"] = 0
+	for key := range p.values {
+		if key == "aigate_requests_inflight" || strings.HasPrefix(key, "aigate_requests_inflight{") {
+			p.values[key] = 0
+		}
+	}
 	// Consume the checkpoint: an unclean exit must not silently reuse an older graceful snapshot.
 	if os.Remove(path) != nil {
 		p.writes.Add(1)

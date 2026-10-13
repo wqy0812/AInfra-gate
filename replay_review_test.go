@@ -62,6 +62,78 @@ func TestReplayStopCancelsBodyBudgetWaitBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestReplayStateWriteFailuresDoNotPublishSuccess(t *testing.T) {
+	for _, phase := range []string{"planning", "running", "completed"} {
+		t.Run(phase, func(t *testing.T) {
+			rec := newRecordingFixture(t, recordingDefaultMaxBytes)
+			summary := recordSample(t, rec, "rec-state", 1)
+			f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
+			f.svc.writeJSON = func(dir, name string, v any) (int64, error) {
+				if view, ok := v.(replayRunView); ok && view.State == phase {
+					return 0, fmt.Errorf("disk full")
+				}
+				return recordingAtomicJSON(dir, name, v)
+			}
+			before := rec.router.posts.Load()
+			req := normalizedReplayRequest(t, "state", "rec-state", summary.Segments[0].Segment, "r1")
+			_, code, detail := f.svc.start(req)
+			if phase == "planning" {
+				if code != 500 || detail != "storage_failed" || f.svc.active != nil {
+					t.Fatal(code, detail)
+				}
+				if _, err := os.Stat(f.svc.runDir(req.RunID)); !os.IsNotExist(err) {
+					t.Fatal("failed start left a conflicting directory", err)
+				}
+			} else {
+				view := f.wait(t, req.RunID)
+				if view.State != "failed" || view.Error != "storage_failed" {
+					t.Fatalf("%+v", view)
+				}
+			}
+			if phase != "completed" && rec.router.posts.Load() != before {
+				t.Fatal("sent without durable start state")
+			}
+		})
+	}
+}
+
+func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
+	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
+	summary := recordSample(t, rec, "rec-evict", 1)
+	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
+	// Keep the replay active without sending while the recorder tries to evict.
+	f.svc.bodyMemory.acquire(context.Background(), replayBodyBudget)
+	defer f.svc.bodyMemory.release(replayBodyBudget)
+	req := normalizedReplayRequest(t, "evict", "rec-evict", summary.Segments[0].Segment, "r1")
+	f.svc.start(req)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		view, _ := f.svc.loadRun(req.RunID)
+		if view.State == "running" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(view)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	recorder := rec.c.recorder
+	recorder.mu.Lock()
+	recorder.maxBytes = 1
+	recorder.mu.Unlock()
+	recorder.flush()
+	path := filepath.Join(rec.root, "g1", "rec-evict", summary.Segments[0].Segment)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("active input evicted", err)
+	}
+	f.svc.stop(req.RunID)
+	f.wait(t, req.RunID)
+	recorder.flush()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("finished replay still prevented eviction", err)
+	}
+}
+
 func TestReplayFixOutputRejectsUnknownUsageBeforeSending(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-usage", 1)

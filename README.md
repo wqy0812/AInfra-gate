@@ -24,18 +24,20 @@
 
 ## 构建与启动
 
-仅使用 Go 标准库，根包 `aigate` 供两个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
+仅使用 Go 标准库，根包 `aigate` 供三个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
 
 ```sh
 ./scripts/build.sh
 # 等价的独立构建：
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-switch ./cmd/aigate-switch
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-proxy ./cmd/aigate-proxy
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-replay ./cmd/aigate-replay
 ./bin/aigate-switch version
 ./bin/aigate-proxy version
+./bin/aigate-replay version
 ```
 
-`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch` 和 `bin/aigate-proxy`。版本命令分别标识 `control/v3 (v2 test compatibility)` 与 `runtime/v1`；发布身份仍需记录源码 commit 和二进制摘要。
+`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch`、`bin/aigate-proxy` 和 `bin/aigate-replay`。版本命令分别标识 `control/v3 (v2 test compatibility)` 、`runtime/v1` 与 `replay/v1`；发布身份仍需记录源码 commit 和二进制摘要。
 
 功能服务可单独启动，示例连接本机 Router 的 18077 端口：
 

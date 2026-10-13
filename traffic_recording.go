@@ -1549,7 +1549,19 @@ func (r *trafficRecorder) evict() {
 		if !over {
 			return
 		}
-		if err := os.RemoveAll(filepath.Join(r.sessionDir(v.recording), v.name)); err != nil {
+		path := filepath.Join(r.sessionDir(v.recording), v.name)
+		directory, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		if err := lockState(directory); err != nil {
+			directory.Close()
+			continue
+		}
+		err = os.RemoveAll(path)
+		unlockState(directory)
+		directory.Close()
+		if err != nil {
 			r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_evict_failed", "segment": v.key, "error": err.Error()})))
 			continue
 		}

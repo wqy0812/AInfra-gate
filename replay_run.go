@@ -36,13 +36,14 @@ type replayTargetState struct {
 
 // replayRun is one run. Its state is persisted in the run directory.
 type replayRun struct {
-	svc     *replayService
-	req     replayRequest
-	digest  string
-	dir     string
-	cancel  context.CancelFunc
-	stopped atomic.Bool
-	done    chan struct{}
+	svc          *replayService
+	req          replayRequest
+	digest       string
+	dir          string
+	cancel       context.CancelFunc
+	stopped      atomic.Bool
+	done         chan struct{}
+	segmentFiles []*os.File
 
 	mu       sync.Mutex
 	state    string
@@ -91,13 +92,15 @@ func (r *replayRun) view() replayRunView {
 	return r.viewLocked()
 }
 
-func (r *replayRun) persist() {
+func (r *replayRun) persist() error {
 	r.mu.Lock()
 	view := r.viewLocked()
 	r.mu.Unlock()
-	if _, err := recordingAtomicJSON(r.dir, "state.json", view); err != nil {
+	if _, err := r.svc.writeJSON(r.dir, "state.json", view); err != nil {
 		r.svc.audit.Print(string(encodeJSON(map[string]any{"event": "replay_state_write_failed", "run_id": r.req.RunID, "error": err.Error()})))
+		return err
 	}
+	return nil
 }
 
 func (r *replayRun) finish(state, errText string) {
@@ -118,7 +121,16 @@ func (r *replayRun) finish(state, errText string) {
 		r.progress.Elapsed = time.Since(r.begin).Seconds()
 	}
 	r.mu.Unlock()
-	r.persist()
+	if err := r.persist(); err != nil {
+		r.mu.Lock()
+		r.state, r.errText = "failed", "storage_failed"
+		r.mu.Unlock()
+	}
+	for _, f := range r.segmentFiles {
+		unlockState(f)
+		f.Close()
+	}
+	r.segmentFiles = nil
 	if r.svc.active == r {
 		r.svc.active = nil
 	}
@@ -127,6 +139,21 @@ func (r *replayRun) finish(state, errText string) {
 
 // execute plans, checks the target, sends and persists progress.
 func (r *replayRun) execute(ctx context.Context) {
+	// One descriptor per selected segment (at most 96), using the same
+	// nonblocking directory lock as capacity eviction. No source files change.
+	for _, name := range r.req.Recording.Segments {
+		f, err := os.Open(filepath.Join(r.svc.recordRoot, r.req.Recording.GatewayID, r.req.Recording.RecordingID, name))
+		if err != nil {
+			r.finish("failed", "segment_not_found")
+			return
+		}
+		if err := lockState(f); err != nil {
+			f.Close()
+			r.finish("failed", "segment_busy")
+			return
+		}
+		r.segmentFiles = append(r.segmentFiles, f)
+	}
 	plan, err := buildReplayPlan(r.svc.recordRoot, r.req)
 	if err != nil {
 		r.finish("failed", err.Error())
@@ -157,7 +184,10 @@ func (r *replayRun) execute(ctx context.Context) {
 		r.state = "running"
 	}
 	r.mu.Unlock()
-	r.persist()
+	if err := r.persist(); err != nil {
+		r.finish("failed", "storage_failed")
+		return
+	}
 	if r.req.Mode == "timed" {
 		r.sendTimed(ctx, plan)
 	} else {

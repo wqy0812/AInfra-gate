@@ -2,7 +2,7 @@
 
 这里是当前源码的待部署模板，不表示生产已替换。`aigate-switch@入口ID` 和 `aigate-proxy@RouterID` 不相互依赖；多个切流入口可转发到一个功能服务。默认仅监听回环地址，跨主机部署时在各实例环境文件中明确填写监听地址。
 
-先用 `scripts/build.sh` 从选定 commit 构建并记录二进制摘要，再将两个二进制安装到 `/usr/local/bin/`，按影响范围安装模板。`version` 输出用于识别服务角色与协议，不能代替源码 commit 和构建摘要。模板使用固定系统账号 `aigate-switch`、`aigate-proxy`。部署时先创建缺少的同名系统组与无登录账号，再安装服务；账号创建命令按目标主机既有账号管理方式执行。功能服务可能从导出的配置读取上游 header，因此不能将配置文件设为公开可读。
+先用 `scripts/build.sh` 从选定 commit 构建并记录二进制摘要，再将 `aigate-switch`、`aigate-proxy`、`aigate-replay` 三个二进制安装到 `/usr/local/bin/`，按影响范围安装模板。`version` 输出用于识别服务角色与协议，不能代替源码 commit 和构建摘要。模板使用固定系统账号 `aigate-switch`、`aigate-proxy`。部署时先创建缺少的同名系统组与无登录账号，再安装服务；账号创建命令按目标主机既有账号管理方式执行。功能服务可能从导出的配置读取上游 header，因此不能将配置文件设为公开可读。
 
 | 实例 | 所需文件 | 创建的持久目录 |
 | --- | --- | --- |

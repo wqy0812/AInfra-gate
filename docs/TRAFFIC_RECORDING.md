@@ -75,6 +75,8 @@
 
 请求字段见 `openapi.json` 的 `ReplayRunRequest`：`segments` 只能选已封尾的段，不再区分预热和测量段；默认只回放 `/v1/chat/completions` 的 2xx、正文完整、采集完整的请求，排除入口拒收；`timed` 按录制到达时刻原速发送，目标变慢不降低到达率，触及 `max_inflight` 只记录发送延误；`concurrency` 按计划顺序固定并发。不提供倍速、多份叠加或阶梯加压。正文改写只有 `set_model`、`set_max_tokens`、`force_stream` 和 `fix_output`（把 `max_tokens`、`min_tokens` 设为录制时的 completion tokens 并加 `ignore_eos`）；任一选中请求缺少有效的正整数 completion tokens 时，`fix_output` 在计划阶段失败为 `fix_output_usage_unknown`，不会发送部分改写的负载。改写后计划的 `original_bytes=false`。不改写时发送录制时的原始字节，发送前核对 SHA-256。
 
+运行期间通过每段的文件锁阻止容量淘汰；进程退出自动释放锁，不改变手动保留标记。首次状态写盘失败时不启动负载；运行或结束状态写盘失败时明确返回 storage_failed，重启后按实际可恢复状态处理。
+
 回放只维护计划数、发送数、完成数、失败数、在途数、运行时长、起止时刻、最近错误及最大发送延误。不解析响应 usage、TTFT 或输出文本，不生成分位数报告、录制基线对照和整次有效性判定；性能分析交给监控。停止确认和发送前的领取动作共用锁，已领取的请求继续收尾，其他请求不再发送。
 
 各发送器共享 512 MiB 的正文预算，按源正文大小的 6 倍加 1 MiB 预留读取、改写和 JSON 临时空间；等待预算可以被停止打断。正文不超过录制器 64 MiB 内存上限，读取前验证长度，发送前核对哈希；响应直接流式排空，不在内存里累计。计划只在启用等输出时读取响应最后 8 KiB 的 usage。

@@ -65,6 +65,7 @@ type replayService struct {
 	audit      *log.Logger
 	client     *http.Client
 	bodyMemory *replayByteBudget
+	writeJSON  func(string, string, any) (int64, error)
 	directory  *os.File
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -98,7 +99,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 4096, IdleConnTimeout: 90 * time.Second, DisableCompression: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
-		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
+		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
 		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err = s.recover(); err != nil {
 		s.Close()
@@ -282,7 +283,11 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 		_ = os.RemoveAll(dir)
 		return replayRunView{}, 500, "storage_failed"
 	}
-	r.persist()
+	if err := r.persist(); err != nil {
+		cancel()
+		_ = os.RemoveAll(dir)
+		return replayRunView{}, 500, "storage_failed"
+	}
 	s.active = r
 	s.runs[req.RunID] = r
 	if len(s.runs) > 32 {
