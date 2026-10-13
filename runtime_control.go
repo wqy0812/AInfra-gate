@@ -31,12 +31,13 @@ type RuntimeCommand struct {
 	Payload          json.RawMessage `json:"payload"`
 }
 type RuntimeResult struct {
-	Sequence    uint64        `json:"command_seq"`
-	OperationID string        `json:"operation_id"`
-	Status      string        `json:"status"`
-	Error       string        `json:"error,omitempty"`
-	Report      *WarmupReport `json:"report,omitempty"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
+	Sequence    uint64            `json:"command_seq"`
+	OperationID string            `json:"operation_id"`
+	Status      string            `json:"status"`
+	Error       string            `json:"error,omitempty"`
+	Report      *WarmupReport     `json:"report,omitempty"`
+	Recording   *recordingSummary `json:"recording,omitempty"`
+	FinishedAt  *time.Time        `json:"finished_at,omitempty"`
 	digest      string
 }
 type RuntimeCounts struct {
@@ -88,12 +89,16 @@ type ControlledGateway struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	wg                 sync.WaitGroup
+	recorder           *trafficRecorder // nil unless --record-root is configured
 }
 type runtimeRequestKey struct{}
 type runtimeRequest struct {
 	revision    uint64
 	task, model string
 	stream      func()
+	id          string
+	record      *trafficRecord
+	traffic     string // "replay" for verified replay requests on a proxy
 }
 
 func newRuntimeGateway(id, key string, cidrs []string, audit io.Writer) (*ControlledGateway, error) {
@@ -154,6 +159,8 @@ func (c *ControlledGateway) Close() {
 	c.cancel()
 	c.mu.Unlock()
 	c.wg.Wait()
+	// Recording completion callbacks take c.mu, so close it before locking.
+	c.recorder.close("process_exit")
 	// An in-flight command finishes first; later ones see the retired instance.
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
@@ -186,7 +193,7 @@ func (c *ControlledGateway) statusLocked() map[string]any {
 	if c.candidate != nil {
 		candidate = map[string]any{"operation_id": c.candidate.owner, "binding_revision": c.candidate.snapshot.BindingRevision, "router_id": c.candidate.snapshot.RouterID}
 	}
-	return map[string]any{"protocol_version": 2, "gateway_id": c.id, "boot_id": c.boot, "admission": c.admission, "retired": c.retired, "binding_revision": c.revisionLocked(), "last_command_seq": c.sequence, "current": current, "candidate": candidate, "counts": counts, "test_occupancy": c.test, "quiesce_owner": c.quiesceOwner, "business_read_header_timeout_seconds": businessReadHeaderTimeout.Seconds()}
+	return map[string]any{"protocol_version": 2, "gateway_id": c.id, "boot_id": c.boot, "admission": c.admission, "retired": c.retired, "binding_revision": c.revisionLocked(), "last_command_seq": c.sequence, "current": current, "candidate": candidate, "counts": counts, "test_occupancy": c.test, "quiesce_owner": c.quiesceOwner, "business_read_header_timeout_seconds": businessReadHeaderTimeout.Seconds(), "recording": c.recorder.status(time.Now())}
 }
 func runtimeResponse(w http.ResponseWriter, status int, value any) {
 	newRuntimeResponse(status, value).write(w)
@@ -216,6 +223,33 @@ func (response runtimeResponseData) write(w http.ResponseWriter) {
 func runtimeError(w http.ResponseWriter, status int, code string) {
 	newRuntimeError(status, code).write(w)
 }
+
+// controlAuthorized checks the actual TCP peer against the allowed CIDRs and
+// the bearer key. Forwarded-address headers are never trusted.
+func controlAuthorized(r *http.Request, cidrs []netip.Prefix, key string) bool {
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	ip, err := netip.ParseAddr(host)
+	allowed := false
+	if err == nil {
+		for _, p := range cidrs {
+			allowed = allowed || p.Contains(ip.Unmap())
+		}
+	}
+	return allowed && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+key)) == 1
+}
+
+func parseControlCIDRs(values []string) ([]netip.Prefix, error) {
+	out := []netip.Prefix{}
+	for _, v := range values {
+		p, err := netip.ParsePrefix(strings.TrimSpace(v))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
 func (c *ControlledGateway) ControlHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		version := 2
@@ -224,15 +258,7 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			version = 3
 			path = strings.Replace(path, "/control/v3/", "/control/v2/", 1)
 		}
-		host, _, _ := net.SplitHostPort(r.RemoteAddr)
-		ip, e := netip.ParseAddr(host)
-		allowed := false
-		if e == nil {
-			for _, p := range c.cidrs {
-				allowed = allowed || p.Contains(ip.Unmap())
-			}
-		}
-		if !allowed || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+c.key)) != 1 {
+		if !controlAuthorized(r, c.cidrs, c.key) {
 			runtimeError(w, 403, "unauthorized")
 			return
 		}
@@ -437,8 +463,11 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		c.admission = false
 		c.retired = true
 		c.cancel()
+		c.recorder.endAll("retired")
 	case "test-acquire", "test-release", "test-status":
 		return c.testCommandLocked(cmd, result)
+	case "record-start", "record-stop", "record-status", "record-pin", "record-unpin":
+		return c.recordCommandLocked(cmd, result)
 	default:
 		return fmt.Errorf("unsupported_command")
 	}
@@ -512,6 +541,13 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		runtimeError(w, 404, "not_found")
 		return
 	}
+	id := randomID()
+	// Sampling happens before admission so entry rejections are recorded too.
+	record := c.recorder.begin(r, id, time.Now())
+	if record != nil {
+		w = &recordingWriter{ResponseWriter: w, record: record}
+		defer func() { record.finish(r.Context().Err()) }()
+	}
 	c.mu.Lock()
 	g := c.active
 	if g == nil || !c.admission || c.retired {
@@ -542,7 +578,8 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.counts.Business++
 	}
 	stream := false
-	meta := &runtimeRequest{revision: g.snapshot.BindingRevision}
+	meta := &runtimeRequest{revision: g.snapshot.BindingRevision, id: id, record: record}
+	record.route(recordingRouter{RouterID: g.snapshot.RouterID, BindingRevision: g.snapshot.BindingRevision, ConfigDigest: g.snapshot.ConfigDigest})
 	if lease != nil {
 		meta.task = lease.TaskID
 		meta.model = lease.Model
@@ -578,4 +615,78 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		c.cleanupLocked()
 	}()
 	g.forward.serve(w, r, meta, lease)
+}
+
+func (c *ControlledGateway) enableRecording(root string, maxBytes int64, markKey []byte) error {
+	r, err := newTrafficRecorder(root, c.id, c.boot, maxBytes, markKey, c.audit)
+	if err != nil {
+		return err
+	}
+	c.recorder = r
+	return nil
+}
+
+// recordCommandLocked handles record-* actions. They never change admission,
+// bindings or test occupancy; disk work completes asynchronously.
+func (c *ControlledGateway) recordCommandLocked(cmd RuntimeCommand, result *RuntimeResult) error {
+	if c.recorder == nil {
+		return fmt.Errorf("recording_disabled")
+	}
+	now := time.Now()
+	complete := func(err error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		at := time.Now()
+		result.FinishedAt = &at
+		if err != nil {
+			result.Status, result.Error = "failed", err.Error()
+		} else {
+			result.Status = "completed"
+		}
+	}
+	switch cmd.Action {
+	case "record-start":
+		var p recordingParams
+		if strictDecode(cmd.Payload, &p) != nil {
+			return fmt.Errorf("invalid_payload")
+		}
+		if err := p.normalize(c.recorder.maxBytes, now); err != nil {
+			return err
+		}
+		if err := c.recorder.startLocked(p, now, complete); err != nil {
+			return err
+		}
+		result.Status = "running"
+		return nil
+	case "record-pin", "record-unpin":
+		var p struct {
+			RecordingID string `json:"recording_id"`
+			Segment     string `json:"segment"`
+		}
+		if strictDecode(cmd.Payload, &p) != nil {
+			return fmt.Errorf("invalid_payload")
+		}
+		if err := c.recorder.pinLocked(p.RecordingID, p.Segment, cmd.Action == "record-pin", complete); err != nil {
+			return err
+		}
+		result.Status = "running"
+		return nil
+	}
+	var p struct {
+		RecordingID string `json:"recording_id"`
+	}
+	if strictDecode(cmd.Payload, &p) != nil || !validOperationID(p.RecordingID) {
+		return fmt.Errorf("invalid_payload")
+	}
+	if cmd.Action == "record-stop" {
+		if err := c.recorder.stopLocked(p.RecordingID, now); err != nil {
+			return err
+		}
+	}
+	summary, err := c.recorder.statusOf(p.RecordingID, now)
+	if err != nil {
+		return err
+	}
+	result.Recording = summary
+	return nil
 }

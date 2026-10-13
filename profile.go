@@ -95,6 +95,7 @@ type profileEvent struct {
 	Arrived          float64         `json:"arrived"`
 	TestTask         string          `json:"test_task,omitempty"`
 	RouteVersion     uint64          `json:"route_version,omitempty"`
+	Traffic          string          `json:"traffic,omitempty"`
 	Backend          string          `json:"backend,omitempty"`
 	Model            string          `json:"model,omitempty"`
 	Stream           bool            `json:"stream,omitempty"`
@@ -283,11 +284,18 @@ func (p *requestProfiler) emit(e profileEvent) {
 		p.dropped.Add(1)
 	}
 }
-func (p *requestProfiler) begin(id string, arrived ...time.Time) *profileRequest {
-	return p.beginRequest(id, true, arrived...)
+func profileTrafficTags(traffic string) string {
+	if traffic == "" {
+		return ""
+	}
+	return profileExtra("", "traffic", traffic)
 }
-func (p *requestProfiler) beginRequest(id string, stream bool, arrived ...time.Time) *profileRequest {
-	r := &profileRequest{profiler: p, start: time.Now(), e: profileEvent{Kind: "start", Stream: stream, ID: id, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
+
+func (p *requestProfiler) begin(id string, arrived ...time.Time) *profileRequest {
+	return p.beginRequest(id, true, "", arrived...)
+}
+func (p *requestProfiler) beginRequest(id string, stream bool, traffic string, arrived ...time.Time) *profileRequest {
+	r := &profileRequest{profiler: p, start: time.Now(), e: profileEvent{Kind: "start", Stream: stream, ID: id, Traffic: traffic, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
 	if len(arrived) > 0 {
 		r.start = arrived[0]
 		r.e.At = float64(r.start.UnixNano()) / 1e9
@@ -300,12 +308,12 @@ func (p *requestProfiler) beginRequest(id string, stream bool, arrived ...time.T
 	if p.liveBackends == nil {
 		p.liveBackends = map[string]bool{"unrouted": true}
 	}
-	p.active[r.e.Seq] = profileLiveRequest{start: r.start, backend: "unrouted", stage: "routing_discovery", nonstream: !stream}
+	p.active[r.e.Seq] = profileLiveRequest{start: r.start, backend: "unrouted", stage: "routing_discovery", nonstream: !stream, traffic: traffic}
 	if !stream {
-		p.add("nonstream_requests_total", "", 1)
+		p.add("nonstream_requests_total", profileTrafficTags(traffic), 1)
 	}
-	p.add("requests_started_total", "", 1)
-	p.add("requests_inflight", "", 1)
+	p.add("requests_started_total", profileTrafficTags(traffic), 1)
+	p.add("requests_inflight", profileTrafficTags(traffic), 1)
 	p.mu.Unlock()
 	p.emit(r.e)
 	return r
@@ -315,6 +323,10 @@ func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, b
 	r.e.Model = model
 	p.mu.Lock()
 	r.tags = p.tags(backend, model)
+	if r.e.Traffic != "" {
+		// Replay series stay separable so monitoring can exclude them.
+		r.tags = profileExtra(r.tags, "traffic", r.e.Traffic)
+	}
 	p.add("requests_routed_total", r.tags, 1)
 	p.hist("request_bytes", r.tags, float64(len(payload)), profileLengthBuckets)
 	p.mu.Unlock()
@@ -375,8 +387,11 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	delete(p.active, r.e.Seq)
 	if r.tags == "" {
 		r.tags = p.tags("unrouted", "unknown")
+		if r.e.Traffic != "" {
+			r.tags = profileExtra(r.tags, "traffic", r.e.Traffic)
+		}
 	}
-	p.add("requests_inflight", "", -1)
+	p.add("requests_inflight", profileTrafficTags(r.e.Traffic), -1)
 	p.add("requests_ended_total", profileExtra(r.tags, "outcome", e.Outcome), 1)
 	p.generationEnd(entry.generation, r.tags)
 	p.hist("request_duration_seconds", r.tags, e.Duration, profileTimeBuckets)
@@ -748,7 +763,11 @@ func (p *requestProfiler) restoreCounters() {
 	p.types = saved.Types
 	p.groups = saved.Groups
 	p.counterStarted = saved.Started
-	p.values["aigate_requests_inflight"] = 0
+	for key := range p.values {
+		if key == "aigate_requests_inflight" || strings.HasPrefix(key, "aigate_requests_inflight{") {
+			p.values[key] = 0
+		}
+	}
 	// Consume the checkpoint: an unclean exit must not silently reuse an older graceful snapshot.
 	if os.Remove(path) != nil {
 		p.writes.Add(1)

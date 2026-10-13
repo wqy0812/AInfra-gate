@@ -91,6 +91,7 @@ type switchForwarder struct {
 // inner proxy receives exactly the original bytes, with no JSON transformation.
 type switchUpload struct {
 	io.ReadCloser
+	record     *trafficRecord
 	controller *http.ResponseController
 	mu         sync.Mutex
 	err        error
@@ -106,10 +107,13 @@ func (b *switchUpload) Read(p []byte) (int, error) {
 	}
 	done := err == io.EOF || b.remaining == 0
 	b.complete = done
+	var failure error
 	if err != nil && err != io.EOF {
 		b.err = err
+		failure = err
 	}
 	b.mu.Unlock()
+	b.record.bodyChunk(p[:n], done, failure)
 	if done {
 		_ = b.controller.SetReadDeadline(time.Time{})
 	}
@@ -139,11 +143,22 @@ func (f *switchForwarder) serve(w http.ResponseWriter, r *http.Request, meta *ru
 		runtimeError(w, 508, "proxy_loop")
 		return
 	}
-	id := randomID()
+	id := meta.id
+	if id == "" {
+		id = randomID()
+	}
 	upstreamRequestID := ""
 	responseStatus := 0
 	defer func() {
 		failure := recover()
+		switch {
+		case r.Context().Err() != nil:
+			meta.record.setOutcome("client_cancelled")
+		case failure != nil:
+			meta.record.setOutcome("stream_aborted")
+		case ctx.Err() != nil:
+			meta.record.setOutcome("forward_timeout")
+		}
 		if failure != nil || ctx.Err() != nil || responseStatus >= 400 {
 			class := "upstream_response_error"
 			if failure != nil {
@@ -168,7 +183,7 @@ func (f *switchForwarder) serve(w http.ResponseWriter, r *http.Request, meta *ru
 		}
 		controller := http.NewResponseController(w)
 		_ = controller.SetReadDeadline(time.Now().Add(requestBodyTimeout))
-		upload = &switchUpload{ReadCloser: http.MaxBytesReader(w, r.Body, maxRequestBodyBytes), controller: controller, remaining: r.ContentLength}
+		upload = &switchUpload{ReadCloser: http.MaxBytesReader(w, r.Body, maxRequestBodyBytes), record: meta.record, controller: controller, remaining: r.ContentLength}
 		request.Body = upload
 		request.GetBody = nil
 	} else {
@@ -213,6 +228,7 @@ func (f *switchForwarder) serve(w http.ResponseWriter, r *http.Request, meta *ru
 			}
 			responseStatus = response.StatusCode
 			upstreamRequestID = diagnosticClientID(response.Header.Get("X-Request-ID"))
+			meta.record.upstream(upstreamRequestID)
 			response.Header.Set("X-Aigate-Backend", f.router)
 			response.Header.Set(headerRoute, strconv.FormatUint(f.revision, 10))
 			if strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
@@ -237,11 +253,17 @@ func (f *switchForwarder) serve(w http.ResponseWriter, r *http.Request, meta *ru
 					code, status = "invalid_request", 400
 				}
 			}
+			outcome := code
+			if errors.Is(inbound.Context().Err(), context.Canceled) {
+				outcome = "client_cancelled"
+			}
 			abandonRequestBody(w, inbound)
+			meta.record.setOutcome(outcome)
 			f.audit.Print(string(encodeJSON(map[string]any{"event": "switch_forward_error", "request_id": id, "router_id": f.router, "binding_revision": f.revision, "error_class": code})))
 			runtimeError(w, status, code)
 		},
 	}
+	meta.record.forwarding()
 	proxy.ServeHTTP(w, request)
 }
 
