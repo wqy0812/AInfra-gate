@@ -744,6 +744,94 @@
           }
         }
       }
+    },
+    "/profile/v1/stream-incidents/requests/{request_id}": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18084",
+          "description": "aigate-proxy business listener; fixed Router adapter"
+        },
+        {
+          "url": "http://127.0.0.1:18082",
+          "description": "aigate-proxy optional observation listener"
+        }
+      ],
+      "get": {
+        "security": [],
+        "summary": "Read retained incident request/response evidence",
+        "description": "Metadata fixes a file snapshot. Content reads return Base64 bytes up to 256 KiB; offset and total_bytes count bytes. Only retained incident evidence is exposed; Cache-Control: no-store. No inference or timeline download.",
+        "parameters": [
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            }
+          },
+          {
+            "name": "part",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "request",
+                "response"
+              ]
+            },
+            "description": "Omit for metadata and snapshot"
+          },
+          {
+            "name": "snapshot",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "description": "Required for content; opaque value from metadata"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Required for content; zero-based byte offset"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144
+            },
+            "description": "Required for content"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metadata: request_id, meta, files (request/response available and bytes), snapshot. Content: request_id, part, offset, next_offset, total_bytes, data (Base64)."
+          },
+          "400": {
+            "description": "Invalid identifier or content parameters"
+          },
+          "404": {
+            "description": "capture_not_retained: no retained files; recent captures may not be published yet"
+          },
+          "409": {
+            "description": "Snapshot file replaced or shortened; refresh metadata"
+          },
+          "429": {
+            "description": "Two concurrent reads already active"
+          },
+          "503": {
+            "description": "Capture unavailable, unsafe, corrupt or read failed"
+          }
+        }
+      }
     }
   },
   "components": {

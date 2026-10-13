@@ -55,7 +55,7 @@ Write 未返回时写入量未知，Flush 未返回时完成状态未知；成�
 
 请求线程不执行文件操作、哈希、扫描或等待存储确认，不增加上游 reader，不重放请求。HTTP 排空后全部观测收尾共享最多 5 秒；超时退出不等待阻塞磁盘，目录锁由实际 worker 完成或进程退出释放。重启保留有异常标记或可关联持久摘要的目录，未封尾记为 `end_unknown`；残缺 JSONL 尾行不当作完整事件。尚未落盘的字节和标记无法保证恢复。
 
-完整文件仅供服务器排查，不新增下载/全文查询接口。原有两个 Prometheus 丢弃/写入失败计数包含完整采集故障。历史摘要不回填为完整文件。
+平台可按需读取完整请求及已保存响应；时间线仍仅供服务器排查。原有两个 Prometheus 丢弃/写入失败计数包含完整采集故障。历史摘要不回填为完整文件。
 
 ## 查询 API
 
@@ -83,3 +83,13 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go vet -mod=vendor . ./cmd/...
 ```
 
 平台 API 测试位于 `backend/tests/python/test_request_profile_api.py`；浏览器 fixture 为 `frontend/tests/react_monitoring.cjs`，覆盖 Chrome 1280×720、iPhone 竖屏窄屏、连接对端字段及旧记录兼容。这些检查不能证明线上数据已产生或 Router 内部故障原因。
+
+## 全文只读 API
+
+`GET /profile/v1/stream-incidents/requests/{request_id}` 返回 `request_id`、原始 `meta`、`files.request` / `files.response`（`available`、`bytes`）和不透明 `snapshot`。只读取已关联异常并保留的目录，ID 必须是 32 位小写十六进制。功能服务业务及观测监听器均可使用，沿用观测接口的网络访问边界，不要求新凭据。
+
+同一地址带 `part=request|response&snapshot=...&offset=0&limit=262144` 读取内容。返回 `part`、`offset`、`next_offset`、`total_bytes` 和 Base64 `data`；所有偏移和长度均以字节计，每块最多 256 KiB。请求边界取元数据已保存字节，录制中响应边界取已同步字节，其他状态取已保存字节（包括重启恢复后校验的文件）；一次查看固定这些边界，不包含后续追加内容。客户端需增量解码 UTF-8，读取到边界后主动刷新元数据才能查看新增输出。文件缺失与空文件通过 `available` 区分。
+
+两个并发读取槽位独立于采集线程，读取不持有业务锁，响应禁止缓存。拒绝路径穿越、符号链接和非普通文件。参数错误返回 400；未留存/已清理/尚未发布返回 404 `capture_not_retained`；快照文件被替换或缩短返回 409；繁忙返回 429；存储不可用或损坏返回 503。旧版本未知路由的 404 与 `capture_not_retained` 区分，供平台提示服务升级。
+
+此 API 不触发新采集、重放或回填；`complete` 仍只表示采集完整，不证明模型成功。录制、截断和异常终止状态以及首个缺口直接沿用元数据。测试使用临时目录的合成文件：`GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go test -mod=vendor -race -run 'TestEvidence|TestStreamCapture' .`。

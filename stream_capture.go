@@ -204,6 +204,7 @@ type captureStored struct {
 }
 
 type streamCaptureStore struct {
+	querySlots                      chan struct{}
 	mu                              sync.Mutex
 	root, serviceID, routerID, boot string
 	audit                           *log.Logger
@@ -251,7 +252,7 @@ func newStreamCaptureStore(root, serviceID, routerID, boot string, audit *log.Lo
 		directory.Close()
 		return nil, err
 	}
-	s := &streamCaptureStore{root: root, serviceID: serviceID, routerID: routerID, boot: boot, audit: audit, directory: directory,
+	s := &streamCaptureStore{querySlots: make(chan struct{}, 2), root: root, serviceID: serviceID, routerID: routerID, boot: boot, audit: audit, directory: directory,
 		active: make(map[*streamCapture]bool), queue: make(chan captureJob, streamCaptureQueue), wake: make(chan struct{}, 1), done: make(chan struct{}),
 		maxMemory: streamCaptureMemory, maxHandles: streamCaptureHandles, maxQueue: streamCaptureQueue, maxDisk: streamCaptureDisk,
 		retention: streamCaptureRetention, stored: make(map[string]*captureStored), writePayload: func(f *os.File, p []byte) (int, error) { return f.Write(p) }}

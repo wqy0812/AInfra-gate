@@ -259,6 +259,14 @@ func (p *ProxyGateway) ObservationHandler() http.Handler {
 			runtimeError(w, 503, "profile_unavailable")
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/profile/v1/stream-incidents/requests/") {
+			if p.g.captures == nil {
+				runtimeError(w, 503, "capture_unavailable")
+				return
+			}
+			p.g.captures.serveEvidence(w, r)
+			return
+		}
 		if r.URL.Path == "/profile/v1/stream-incidents" {
 			if p.g.incidents == nil {
 				runtimeError(w, 503, "incident_storage_unavailable")
