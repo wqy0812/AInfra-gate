@@ -111,7 +111,7 @@ func buildReplayStats(segment string, planned int, coverage float64, results []r
 	var ttft, e2e, delay []float64
 	var prompt, completion, cached, promptForCache uint64
 	var promptKnown, completionKnown, cachedKnown bool
-	first, last := math.Inf(1), math.Inf(-1)
+	first, last, lastSent := math.Inf(1), math.Inf(-1), math.Inf(-1)
 	timeouts := 0
 	for _, r := range results {
 		s.Outcomes[r.Outcome]++
@@ -134,6 +134,7 @@ func buildReplayStats(segment string, planned int, coverage float64, results []r
 		}
 		first = math.Min(first, r.SentSeconds)
 		last = math.Max(last, r.SentSeconds+r.E2ESeconds)
+		lastSent = math.Max(lastSent, r.SentSeconds)
 		if r.Outcome != "completed" {
 			continue
 		}
@@ -177,7 +178,10 @@ func buildReplayStats(segment string, planned int, coverage float64, results []r
 		if completionKnown {
 			s.OutputTokensPerSecond = ratio(float64(completion), s.DurationSeconds)
 		}
-		s.ActualArrivalRate = ratio(float64(s.Sent), s.DurationSeconds)
+	}
+	// Arrivals are measured over the send interval, not until the last response ends.
+	if s.Sent > 0 && lastSent > first {
+		s.ActualArrivalRate = ratio(float64(s.Sent), lastSent-first)
 	}
 	s.ExpectedArrivalRate = ratio(float64(planned), coverage)
 	s.SuccessRate = ratio(float64(s.Completed), float64(s.Sent))

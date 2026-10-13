@@ -210,26 +210,30 @@ func readRecordingSegment(root, gateway, recording, name string) (replaySegmentS
 	return out, nil
 }
 
-// replayTailUsage returns the last usage object found in a response tail.
+// replayTailUsage returns the last usage object in a response tail. It matches
+// the "usage" key itself rather than whole lines: a summary tail of a large
+// non-stream body starts mid-object, and a quote inside a JSON string is always
+// escaped, so the unescaped key cannot come from content.
 func replayTailUsage(tail []byte) map[string]uint64 {
-	lines := bytes.Split(tail, []byte("\n"))
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := bytes.TrimSpace(lines[i])
-		line = bytes.TrimPrefix(line, []byte("data:"))
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 || line[0] != '{' || !bytes.Contains(line, []byte(`"usage"`)) {
+	key := []byte(`"usage"`)
+	for end := len(tail); ; {
+		i := bytes.LastIndex(tail[:end], key)
+		if i < 0 {
+			return nil
+		}
+		end = i
+		rest := bytes.TrimLeft(tail[i+len(key):], " \t\r\n")
+		if len(rest) == 0 || rest[0] != ':' {
 			continue
 		}
-		var v struct {
-			Usage json.RawMessage `json:"usage"`
+		var raw json.RawMessage
+		if json.NewDecoder(bytes.NewReader(rest[1:])).Decode(&raw) != nil || len(raw) == 0 || raw[0] != '{' {
+			continue
 		}
-		if json.Unmarshal(line, &v) == nil && len(v.Usage) > 0 && string(v.Usage) != "null" {
-			if usage := profileUsage(v.Usage); len(usage) > 0 {
-				return usage
-			}
+		if usage := profileUsage(raw); len(usage) > 0 {
+			return usage
 		}
 	}
-	return nil
 }
 
 func replayFirstWrite(path string) *float64 {

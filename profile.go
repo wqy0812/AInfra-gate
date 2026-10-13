@@ -285,10 +285,10 @@ func (p *requestProfiler) emit(e profileEvent) {
 	}
 }
 func (p *requestProfiler) begin(id string, arrived ...time.Time) *profileRequest {
-	return p.beginRequest(id, true, arrived...)
+	return p.beginRequest(id, true, "", arrived...)
 }
-func (p *requestProfiler) beginRequest(id string, stream bool, arrived ...time.Time) *profileRequest {
-	r := &profileRequest{profiler: p, start: time.Now(), e: profileEvent{Kind: "start", Stream: stream, ID: id, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
+func (p *requestProfiler) beginRequest(id string, stream bool, traffic string, arrived ...time.Time) *profileRequest {
+	r := &profileRequest{profiler: p, start: time.Now(), e: profileEvent{Kind: "start", Stream: stream, ID: id, Traffic: traffic, Boot: p.boot, Seq: p.seq.Add(1), At: profileNow()}}
 	if len(arrived) > 0 {
 		r.start = arrived[0]
 		r.e.At = float64(r.start.UnixNano()) / 1e9

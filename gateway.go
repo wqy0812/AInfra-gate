@@ -285,8 +285,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 		entry.slowInput = data
 	}
 	if g.profile != nil {
-		pr := g.profile.beginRequest(entry.RequestID, body.stream, arrived)
-		pr.e.Traffic = entry.Traffic
+		pr := g.profile.beginRequest(entry.RequestID, body.stream, entry.Traffic, arrived)
 		entry.profile = pr
 		r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
 		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()

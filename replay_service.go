@@ -114,11 +114,6 @@ func (s *replayService) recover() error {
 	if err != nil {
 		return err
 	}
-	type kept struct {
-		name string
-		at   time.Time
-	}
-	var all []kept
 	for _, entry := range entries {
 		if !entry.IsDir() || !validOperationID(entry.Name()) {
 			continue
@@ -127,7 +122,6 @@ func (s *replayService) recover() error {
 		var view replayRunView
 		data, err := recordingReadSmall(filepath.Join(dir, "state.json"))
 		if err != nil || json.Unmarshal(data, &view) != nil {
-			all = append(all, kept{entry.Name(), time.Time{}})
 			continue
 		}
 		if view.State == "planning" || view.State == "running" || view.State == "stopping" {
@@ -137,11 +131,40 @@ func (s *replayService) recover() error {
 				return err
 			}
 		}
+	}
+	return s.pruneRuns(replayRunsKept)
+}
+
+// pruneRuns removes the oldest run directories until at most keep remain.
+// Callers hold s.mu with no active run, or run before the service starts, so
+// every directory belongs to an ended run.
+func (s *replayService) pruneRuns(keep int) error {
+	root := filepath.Join(s.dataRoot, "runs")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	type kept struct {
+		name string
+		at   time.Time
+	}
+	var all []kept
+	for _, entry := range entries {
+		if !entry.IsDir() || !validOperationID(entry.Name()) {
+			continue
+		}
+		var view replayRunView
+		data, err := recordingReadSmall(filepath.Join(root, entry.Name(), "state.json"))
+		if err != nil || json.Unmarshal(data, &view) != nil {
+			all = append(all, kept{entry.Name(), time.Time{}})
+			continue
+		}
 		all = append(all, kept{entry.Name(), view.CreatedAt})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
-	for len(all) > replayRunsKept {
+	for len(all) > keep {
 		_ = os.RemoveAll(filepath.Join(root, all[0].name))
+		delete(s.runs, all[0].name)
 		all = all[1:]
 	}
 	return nil
@@ -192,8 +215,12 @@ func (s *replayService) checkTarget(ctx context.Context, name string) (replayTar
 	}
 	// Only a functional proxy is a valid target: a switch business entry,
 	// including the one being recorded, has no /runtime/v1/status.
-	if err != nil || len(data) > 1<<20 || response.StatusCode != 200 || json.Unmarshal(data, &status) != nil || status.Service != "aigate-proxy" {
+	if err != nil || len(data) > 1<<20 || response.StatusCode != 200 || json.Unmarshal(data, &status) != nil || status.Service != "aigate-proxy" || !validDigest(status.ConfigDigest) {
 		return state, fmt.Errorf("target_not_proxy")
+	}
+	// Target names are Router IDs: the platform locks the Router by this name.
+	if status.RouterID != name {
+		return state, fmt.Errorf("target_router_mismatch")
 	}
 	state.ServiceID, state.RouterID, state.ConfigDigest = status.ServiceID, status.RouterID, status.ConfigDigest
 	return state, nil
@@ -239,12 +266,20 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// An identical request may have created the run since loadRun looked.
+	if r := s.runs[req.RunID]; r != nil {
+		if r.digest != digest {
+			return r.view(), 409, "run_conflict"
+		}
+		return r.view(), 200, ""
+	}
 	if s.ctx.Err() != nil {
 		return replayRunView{}, 409, "service_stopping"
 	}
 	if s.active != nil {
 		return replayRunView{}, 409, "run_active"
 	}
+	_ = s.pruneRuns(replayRunsKept - 1)
 	dir := s.runDir(req.RunID)
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return replayRunView{}, 409, "run_conflict"

@@ -654,4 +654,20 @@ func TestProxyLabelsOnlyVerifiedReplayTraffic(t *testing.T) {
 	if router.posts.Load() != 3 {
 		t.Fatal("replay label changed forwarding")
 	}
+	// Every event of the verified replay, including start, carries the label.
+	profileDrain(t, p.g.profile)
+	files, _ := filepath.Glob(filepath.Join(p.g.config.Profile.Directory, "events-v2-*.jsonl"))
+	labelled := map[string]int{}
+	for _, file := range files {
+		data, _ := os.ReadFile(file)
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var e profileEvent
+			if json.Unmarshal([]byte(line), &e) == nil && e.Traffic == "replay" {
+				labelled[e.Kind]++
+			}
+		}
+	}
+	if labelled["start"] != 1 || labelled["input"] != 1 || labelled["end"] != 1 {
+		t.Fatalf("replay events %v", labelled)
+	}
 }

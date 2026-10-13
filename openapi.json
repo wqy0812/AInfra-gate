@@ -1801,7 +1801,7 @@
           },
           "target": {
             "type": "string",
-            "description": "A name from the replay service targets file; arbitrary URLs are rejected"
+            "description": "A name from the replay service targets file; arbitrary URLs are rejected. The name must equal the target proxy's router_id (target_router_mismatch otherwise)"
           },
           "mode": {
             "type": "string",

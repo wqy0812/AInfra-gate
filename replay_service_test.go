@@ -114,9 +114,9 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 		}
 	}
 	before := len(rec.router.bodies)
-	f := newReplayFixture(t, rec.root, map[string]string{"candidate": rec.proxy.URL})
+	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	segment := summary.Segments[0].Segment
-	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "target": "candidate", "mode": "timed"}
+	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "target": "r1", "mode": "timed"}
 	code, out := f.call(t, "POST", "/control/replay/v1/runs", request)
 	if code != 200 {
 		t.Fatal(code, out)
@@ -158,9 +158,9 @@ func TestReplayConcurrencyWithEqualWorkRewrite(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-b", 4)
 	before := len(rec.router.bodies)
-	f := newReplayFixture(t, rec.root, map[string]string{"candidate": rec.proxy.URL})
+	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	request := map[string]any{"run_id": "run-c", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-b", "segments": []string{summary.Segments[0].Segment}},
-		"target": "candidate", "mode": "concurrency", "concurrency": 2, "fix_output": true, "set_model": "token-model"}
+		"target": "r1", "mode": "concurrency", "concurrency": 2, "fix_output": true, "set_model": "token-model"}
 	if code, out := f.call(t, "POST", "/control/replay/v1/runs", request); code != 200 {
 		t.Fatal(code, out)
 	}
@@ -184,7 +184,7 @@ func TestReplayControlValidationAndLifecycle(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-v", 3)
 	segment := summary.Segments[0].Segment
-	f := newReplayFixture(t, rec.root, map[string]string{"candidate": rec.proxy.URL, "entry": rec.switch_.URL})
+	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL, "entry": rec.switch_.URL})
 	req, _ := http.NewRequest("GET", f.server.URL+"/control/replay/v1/status", nil)
 	if response, _ := http.DefaultClient.Do(req); response.StatusCode != 403 {
 		t.Fatal("unauthenticated status allowed")
@@ -196,7 +196,7 @@ func TestReplayControlValidationAndLifecycle(t *testing.T) {
 		t.Fatal(code, out)
 	}
 	base := func(id string) map[string]any {
-		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "target": "candidate", "mode": "timed"}
+		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "target": "r1", "mode": "timed"}
 	}
 	for name, mutate := range map[string]func(map[string]any){
 		"unknown_target":  func(m map[string]any) { m["target"] = "http://127.0.0.1:1" },

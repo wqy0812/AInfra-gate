@@ -107,7 +107,7 @@ type replayRunView struct {
 
 func (r *replayRun) viewLocked() replayRunView {
 	progress := r.progress
-	if r.state == "running" || r.state == "stopping" {
+	if (r.state == "running" || r.state == "stopping") && !r.begin.IsZero() {
 		progress.Sent, progress.Completed, progress.Failed, progress.Inflight = r.sent.Load(), r.completed.Load(), r.failed.Load(), r.inflight.Load()
 		progress.Elapsed = time.Since(r.begin).Seconds()
 	}
@@ -162,6 +162,10 @@ func (r *replayRun) execute(ctx context.Context) {
 		return
 	}
 	target, err := r.svc.checkTarget(ctx, r.req.Target)
+	if r.stopped.Load() {
+		r.finish("stopped", "")
+		return
+	}
 	if err != nil {
 		r.finish("failed", err.Error())
 		return
@@ -319,6 +323,9 @@ func (r *replayRun) send(item replayPlanItem, due time.Time) {
 	for k, v := range item.Headers {
 		request.Header.Set(k, v)
 	}
+	// The proxy answers 409 if it was reconfigured or replaced after the check.
+	request.Header.Set(headerRouter, r.target.RouterID)
+	request.Header.Set(headerExpectedConfig, r.target.ConfigDigest)
 	request.Header.Set(headerReplay, replayMarkValue(r.svc.markKey, r.req.RunID, uint64(item.Sequence)))
 	request.Header.Set("X-Request-ID", result.ReplayRequestID)
 	result.InflightAtSend = int(r.inflight.Add(1))

@@ -62,8 +62,8 @@
 `aigate-replay serve` 常驻录制主机，与 switch 使用同一系统账号以读取录制文件。它是回放的唯一入口，调用方只有平台 engine：
 
 - 控制监听默认 `127.0.0.1:18085`，要求 `Authorization: Bearer <AIGATE_REPLAY_CONTROL_KEY>`（至少 32 字节，独立于切流密钥）和实际 TCP 来源 `--allowed-cidrs`。
-- `--targets` 指向本地 JSON 文件 `{"targets": {"candidate-a": "http://127.0.0.1:18084"}}`，控制请求只能按名字选择目标，不能传任意地址。开始前读取目标 `/runtime/v1/status`，只接受 `service=aigate-proxy`，从而拒绝把回放打到切流业务入口；目标的 Router 与配置摘要写入报告。
-- `--record-root` 为切流录制根目录（只读），`--data-root` 保存每次 run 的 `request.json`、`state.json`、`plan.json`、`plan.jsonl`、`results.jsonl`、`report.json`，最多保留 200 个 run。重启时把进行中的 run 标为 `end_unknown`。
+- `--targets` 指向本地 JSON 文件 `{"targets": {"r1": "http://127.0.0.1:18084"}}`，控制请求只能按名字选择目标，不能传任意地址。名字必须等于该功能服务的 `router_id`，平台按这个名字锁定 Router。开始前读取目标 `/runtime/v1/status`，只接受 `service=aigate-proxy`（否则 `target_not_proxy`），从而拒绝把回放打到切流业务入口；`router_id` 与名字不符时返回 `target_router_mismatch`。目标的 Router 与配置摘要写入报告，之后每个回放请求都带 `X-Aigate-Expected-Router` 和 `X-Aigate-Expected-Config`，目标中途换配置或换 Router 时功能服务返回 409，不会把不同配置的结果混进同一份报告。
+- `--record-root` 为切流录制根目录（只读），`--data-root` 保存每次 run 的 `request.json`、`state.json`、`plan.json`、`plan.jsonl`、`results.jsonl`、`report.json`，最多保留 200 个 run：每次开始新 run 前删除最旧的已结束 run，启动时同样清理。重启时把进行中的 run 标为 `end_unknown`。
 
 | 接口 | 说明 |
 | --- | --- |
