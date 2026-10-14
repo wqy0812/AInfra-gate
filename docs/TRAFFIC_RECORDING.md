@@ -98,7 +98,7 @@
 实际部署状态见[部署记录](DEPLOYMENT.md)。按 code-eval 停机窗口规则协调更新平台 Web/engine、switch 和 replay；普通 proxy/模型后端不新增预检接口，monitoring 无改动。升级前停止新增录制/回放、终止未结束旧窗口并确认已接收请求收尾；超时保留维护与锁，不强杀。平台迁移 `deploy/migration/recording_v2.py` 只移除现存规则 JSON 的 `response` 键，要求旧录制与回放均终态，并备份数据库。所有历史录制、任务结果原样保留，不转换旧 schema 或清理文件。随后只生成新版未来窗口；失败修复当前版本，不回退。
 
 
-### 双录制同步叠加（新增源码能力，尚未部署）
+### 双录制同步叠加（2026-10-15 已部署）
 
 `status.capabilities` 新增 `recording-overlay-sync-v1`。`runs` 接受与 `recording` 互斥的 `recordings` 数组（1～2 个 gateway_id/recording_id/segments 引用），最多合计 96 段和 20 万条计划请求。两份仅支持 timed：各自拼接选中段后，从相对 0 秒叠加，稳定排序并分配唯一计划序号，时长取最大值。计划、结果和 `sources` 进度包含来源与录制标识，避免不同来源请求 ID 重名。
 
