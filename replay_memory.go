@@ -18,6 +18,17 @@ func newReplayByteBudget() *replayByteBudget {
 	return &replayByteBudget{changed: make(chan struct{})}
 }
 
+// Timed dispatch never queues on memory. Reserve before creating its sender.
+func (b *replayByteBudget) tryAcquire(n int64) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if n < 0 || n > replayBodyBudget-b.used {
+		return false
+	}
+	b.used += n
+	return true
+}
+
 func (b *replayByteBudget) acquire(ctx context.Context, n int64) bool {
 	if n > replayBodyBudget {
 		return false

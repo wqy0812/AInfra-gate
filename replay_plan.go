@@ -1,11 +1,10 @@
 package aigate
 
 // Replay planning reads sealed recording segments and fixes the request
-// sequence before anything is sent. Response tails are read only for fix_output;
-// request bodies are read at send time.
+// sequence before anything is sent. Equal-output targets come only from schema-2
+// metadata. Request integrity is checked locally and rechecked at send time.
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,10 +42,8 @@ type replayRequest struct {
 	Target                string             `json:"target"`
 	Mode                  string             `json:"mode"`
 	Concurrency           int                `json:"concurrency,omitempty"`
-	MaxInflight           int                `json:"max_inflight,omitempty"`
 	FixOutput             bool               `json:"fix_output,omitempty"`
 	SetModel              string             `json:"set_model,omitempty"`
-	SetMaxTokens          int                `json:"set_max_tokens,omitempty"`
 	ForceStream           bool               `json:"force_stream,omitempty"`
 	RequestTimeoutSeconds int                `json:"request_timeout_seconds,omitempty"`
 }
@@ -66,7 +63,7 @@ func (r *replayRequest) normalize() error {
 		seen[name] = true
 	}
 	if r.Filter.Status == "" {
-		r.Filter.Status = "2xx"
+		r.Filter.Status = "all"
 	}
 	if r.Filter.Status != "2xx" && r.Filter.Status != "all" {
 		return fmt.Errorf("invalid_filter")
@@ -77,25 +74,22 @@ func (r *replayRequest) normalize() error {
 	if r.Filter.Path != "/v1/chat/completions" {
 		return fmt.Errorf("invalid_filter")
 	}
+	if r.Mode == "" {
+		r.Mode = "timed"
+	}
 	switch r.Mode {
 	case "timed":
 		if r.Concurrency != 0 {
 			return fmt.Errorf("invalid_concurrency")
 		}
-		if r.MaxInflight == 0 {
-			r.MaxInflight = 512
-		}
-		if r.MaxInflight < 1 || r.MaxInflight > 4096 {
-			return fmt.Errorf("invalid_max_inflight")
-		}
 	case "concurrency":
-		if r.Concurrency < 1 || r.Concurrency > 1024 || r.MaxInflight != 0 {
+		if r.Concurrency < 1 || r.Concurrency > 1024 {
 			return fmt.Errorf("invalid_concurrency")
 		}
 	default:
 		return fmt.Errorf("invalid_mode")
 	}
-	if len(r.SetModel) > 256 || r.SetMaxTokens < 0 || r.SetMaxTokens > 1_000_000 || (r.FixOutput && r.SetMaxTokens > 0) {
+	if len(r.SetModel) > 256 {
 		return fmt.Errorf("invalid_rewrite")
 	}
 	if r.RequestTimeoutSeconds == 0 {
@@ -111,9 +105,6 @@ func (r replayRequest) rewritten() []string {
 	out := []string{}
 	if r.SetModel != "" {
 		out = append(out, "set_model")
-	}
-	if r.SetMaxTokens > 0 {
-		out = append(out, "set_max_tokens")
 	}
 	if r.ForceStream {
 		out = append(out, "force_stream")
@@ -199,32 +190,6 @@ func readRecordingSegment(root, gateway, recording, name string) (replaySegmentS
 	return out, nil
 }
 
-// replayTailUsage returns the last usage object in a response tail. It matches
-// the "usage" key itself rather than whole lines: a summary tail of a large
-// non-stream body starts mid-object, and a quote inside a JSON string is always
-// escaped, so the unescaped key cannot come from content.
-func replayTailUsage(tail []byte) map[string]uint64 {
-	key := []byte(`"usage"`)
-	for end := len(tail); ; {
-		i := bytes.LastIndex(tail[:end], key)
-		if i < 0 {
-			return nil
-		}
-		end = i
-		rest := bytes.TrimLeft(tail[i+len(key):], " \t\r\n")
-		if len(rest) == 0 || rest[0] != ':' {
-			continue
-		}
-		var raw json.RawMessage
-		if json.NewDecoder(bytes.NewReader(rest[1:])).Decode(&raw) != nil || len(raw) == 0 || raw[0] != '{' {
-			continue
-		}
-		if usage := profileUsage(raw); len(usage) > 0 {
-			return usage
-		}
-	}
-}
-
 func copyableHeaders(headers map[string]string) map[string]string {
 	out := map[string]string{}
 	for _, k := range strings.Split(replayHeaderCopyable, ",") {
@@ -239,10 +204,14 @@ func copyableHeaders(headers map[string]string) map[string]string {
 // Segments are concatenated in time order by their covered durations, so
 // contiguous segments keep real time and gaps between distant ones collapse.
 func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
-	if _, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID); err != nil {
+	session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
+	if err != nil {
 		return nil, err
 	}
-	plan := &replayPlan{Schema: 1, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
+	if session.Schema != recordingSchema {
+		return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+	}
+	plan := &replayPlan{Schema: recordingSchema, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
 		Excluded: map[string]int{}, Rewritten: req.rewritten(), Segments: []replayPlanSegment{}}
 	plan.OriginalBytes = len(plan.Rewritten) == 0
 	segments := []replaySegmentStatus{}
@@ -250,6 +219,9 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		status, err := readRecordingSegment(root, req.Recording.GatewayID, req.Recording.RecordingID, name)
 		if err != nil {
 			return nil, err
+		}
+		if status.Schema != recordingSchema {
+			return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
 		}
 		if status.State != "sealed" {
 			return nil, fmt.Errorf("segment_not_sealed")
@@ -327,36 +299,39 @@ func planSegment(dir string, seg replaySegmentStatus, base float64, req replayRe
 		}
 		recordDir := filepath.Join(dir, line.Directory)
 		var meta recordingMeta
+		// Decode response metadata separately so an invalid token value has the
+		// explicit equal-output error rather than silently excluding the record.
+		wire := struct {
+			*recordingMeta
+			ResponseResult json.RawMessage `json:"response_result"`
+		}{recordingMeta: &meta}
 		data, err := recordingReadSmall(filepath.Join(recordDir, "meta.json"))
-		if err != nil || json.Unmarshal(data, &meta) != nil || meta.RequestID != line.RequestID {
+		if err != nil || json.Unmarshal(data, &wire) != nil || meta.RequestID != line.RequestID {
 			plan.Excluded["meta_unreadable"]++
 			continue
+		}
+		if meta.Schema != recordingSchema {
+			return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+		}
+		if err := json.Unmarshal(wire.ResponseResult, &meta.ResponseResult); err != nil && req.FixOutput {
+			return nil, fmt.Errorf("fix_output_usage_unknown")
 		}
 		item := replayPlanItem{Segment: seg.Segment, OffsetSeconds: base + line.OffsetSeconds - shift, Directory: recordDir, RequestID: meta.RequestID,
 			Path: meta.Path, Headers: copyableHeaders(meta.Headers), RequestSHA256: meta.RequestSHA256, RequestBytes: meta.RequestBytes}
 		if item.OffsetSeconds < base {
 			item.OffsetSeconds = base
 		}
+		body, err := readReplayBody(item)
+		if err != nil {
+			return nil, err
+		}
 		if req.FixOutput {
-			// The recorder keeps usage in the response tail. Read only its last
-			// 8 KiB even for full recordings; planning must not load whole replies.
-			f, err := os.Open(filepath.Join(recordDir, meta.ResponseFile))
-			if err != nil {
+			item.TargetTokens = meta.ResponseResult.Usage["completion_tokens"]
+			if !meta.ResponseResult.UsageKnown || item.TargetTokens == 0 {
 				return nil, fmt.Errorf("fix_output_usage_unknown")
 			}
-			info, err := f.Stat()
-			var tail []byte
-			if err == nil {
-				offset := max(int64(0), info.Size()-recordingTailBytes)
-				tail, err = io.ReadAll(io.NewSectionReader(f, offset, recordingTailBytes))
-			}
-			f.Close()
-			if err != nil {
-				return nil, fmt.Errorf("fix_output_usage_unknown")
-			}
-			item.TargetTokens = replayTailUsage(tail)["completion_tokens"]
-			if item.TargetTokens == 0 {
-				return nil, fmt.Errorf("fix_output_usage_unknown")
+			if err := checkSingleCandidate(body); err != nil {
+				return nil, err
 			}
 		}
 		items = append(items, item)
@@ -371,7 +346,7 @@ func planSegment(dir string, seg replaySegmentStatus, base float64, req replayRe
 // rewriteReplayBody applies the only allowed rewrites. Without rewrites the
 // recorded bytes are sent unchanged.
 func rewriteReplayBody(body []byte, req replayRequest, item replayPlanItem) ([]byte, error) {
-	if req.SetModel == "" && req.SetMaxTokens == 0 && !req.ForceStream && item.TargetTokens == 0 {
+	if req.SetModel == "" && !req.ForceStream && !req.FixOutput {
 		return body, nil
 	}
 	var fields map[string]json.RawMessage
@@ -381,20 +356,73 @@ func rewriteReplayBody(body []byte, req replayRequest, item replayPlanItem) ([]b
 	if req.SetModel != "" {
 		fields["model"] = encodeJSON(req.SetModel)
 	}
-	if req.SetMaxTokens > 0 {
-		fields["max_tokens"] = encodeJSON(req.SetMaxTokens)
-		delete(fields, "max_completion_tokens")
-	}
 	if req.ForceStream {
 		fields["stream"] = json.RawMessage("true")
 	}
-	if item.TargetTokens > 0 {
+	if req.FixOutput {
+		if item.TargetTokens == 0 {
+			return nil, fmt.Errorf("fix_output_usage_unknown")
+		}
+		if err := checkSingleCandidate(body); err != nil {
+			return nil, err
+		}
 		// Equal work: the recorded output length with end-of-sequence ignored
 		// (SGLang/vLLM ignore_eos and min_tokens).
 		fields["max_tokens"] = encodeJSON(item.TargetTokens)
 		fields["min_tokens"] = encodeJSON(item.TargetTokens)
 		fields["ignore_eos"] = json.RawMessage("true")
 		delete(fields, "max_completion_tokens")
+		delete(fields, "stop")
+		delete(fields, "stop_token_ids")
+		var stream bool
+		if raw, ok := fields["stream"]; ok {
+			if string(raw) == "null" || json.Unmarshal(raw, &stream) != nil {
+				return nil, fmt.Errorf("invalid_stream")
+			}
+		}
+		if stream {
+			options := map[string]json.RawMessage{}
+			if raw, ok := fields["stream_options"]; ok {
+				if json.Unmarshal(raw, &options) != nil || options == nil {
+					return nil, fmt.Errorf("invalid_stream_options")
+				}
+			}
+			options["include_usage"] = json.RawMessage("true")
+			fields["stream_options"] = encodeJSON(options)
+		}
 	}
 	return encodeJSON(fields), nil
+}
+
+// Only metadata from new recordings is supported. Reading one bounded request
+// at a time catches corruption and multi-candidate requests before any sends.
+func readReplayBody(item replayPlanItem) ([]byte, error) {
+	file, err := os.Open(filepath.Join(item.Directory, "request.json"))
+	if err != nil {
+		return nil, fmt.Errorf("record_unreadable")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != item.RequestBytes || info.Size() < 0 || info.Size() > recordingMemory {
+		return nil, fmt.Errorf("record_changed")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, info.Size()+1))
+	if err != nil || int64(len(body)) != info.Size() || sha256Hex(body) != item.RequestSHA256 {
+		return nil, fmt.Errorf("record_changed")
+	}
+	return body, nil
+}
+
+func checkSingleCandidate(body []byte) error {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || fields == nil {
+		return fmt.Errorf("body_not_rewritable")
+	}
+	if raw, ok := fields["n"]; ok {
+		var n int
+		if json.Unmarshal(raw, &n) != nil || n != 1 {
+			return fmt.Errorf("fix_output_single_candidate_required")
+		}
+	}
+	return nil
 }

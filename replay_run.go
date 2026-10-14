@@ -1,7 +1,7 @@
 package aigate
 
 // Replay sending. timed keeps the recorded arrival schedule and never slows
-// arrivals when the target slows (max_inflight only records send delay);
+// arrivals when the target slows; resource exhaustion ends new dispatch;
 // concurrency sends the planned sequence with a fixed number of workers.
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,12 +20,14 @@ import (
 )
 
 type replayProgress struct {
-	Planned   int     `json:"planned"`
-	Sent      int64   `json:"sent"`
-	Completed int64   `json:"completed"`
-	Failed    int64   `json:"failed"`
-	Inflight  int64   `json:"inflight"`
-	Elapsed   float64 `json:"elapsed_seconds"`
+	Planned     int     `json:"planned"`
+	Sent        int64   `json:"sent"`
+	Completed   int64   `json:"completed"`
+	Failed      int64   `json:"failed"`
+	Inflight    int64   `json:"inflight"`
+	Unsent      int64   `json:"unsent"`
+	Unconfirmed int64   `json:"unconfirmed"`
+	Elapsed     float64 `json:"elapsed_seconds"`
 }
 
 type replayTargetState struct {
@@ -59,21 +62,31 @@ type replayRun struct {
 	sent, completed, failed, inflight atomic.Int64
 	lastError                         string
 	maxSendDelay                      float64
+	maxWriteDelay                     *float64
+	fatalError                        string
+	output                            replayOutputSummary
+	resultMu                          sync.Mutex
+	results                           replayResultFile
 }
 
 type replayRunView struct {
-	RunID          string            `json:"run_id"`
-	State          string            `json:"state"`
-	Error          string            `json:"error,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
-	StartedAt      *time.Time        `json:"started_at,omitempty"`
-	EndedAt        *time.Time        `json:"ended_at,omitempty"`
-	Request        *replayRequest    `json:"request,omitempty"`
-	Target         replayTargetState `json:"target"`
-	Progress       replayProgress    `json:"progress"`
-	LastError      string            `json:"last_error,omitempty"`
-	MaxSendDelay   float64           `json:"max_send_delay_seconds"`
-	StartCancelled bool              `json:"start_cancelled,omitempty"`
+	RunID          string              `json:"run_id"`
+	State          string              `json:"state"`
+	Error          string              `json:"error,omitempty"`
+	CreatedAt      time.Time           `json:"created_at"`
+	StartedAt      *time.Time          `json:"started_at,omitempty"`
+	EndedAt        *time.Time          `json:"ended_at,omitempty"`
+	Request        *replayRequest      `json:"request,omitempty"`
+	Target         replayTargetState   `json:"target"`
+	Progress       replayProgress      `json:"progress"`
+	LastError      string              `json:"last_error,omitempty"`
+	MaxSendDelay   float64             `json:"max_send_delay_seconds"`
+	MaxWriteDelay  *float64            `json:"max_write_delay_seconds"`
+	Output         replayOutputSummary `json:"output_verification"`
+	Excluded       map[string]int      `json:"excluded,omitempty"`
+	Rewritten      []string            `json:"rewritten"`
+	EndReason      string              `json:"end_reason,omitempty"`
+	StartCancelled bool                `json:"start_cancelled,omitempty"`
 }
 
 func (r *replayRun) viewLocked() replayRunView {
@@ -82,7 +95,16 @@ func (r *replayRun) viewLocked() replayRunView {
 		progress.Sent, progress.Completed, progress.Failed, progress.Inflight = r.sent.Load(), r.completed.Load(), r.failed.Load(), r.inflight.Load()
 		progress.Elapsed = time.Since(r.begin).Seconds()
 	}
-	return replayRunView{RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
+	progress.Unsent = max(0, int64(progress.Planned)-progress.Sent)
+	var excluded map[string]int
+	if r.plan != nil {
+		excluded = r.plan.Excluded
+	}
+	reason := r.errText
+	if reason == "" && r.ended != nil {
+		reason = r.state
+	}
+	return replayRunView{EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
 		Request: &r.req, Target: r.target, Progress: progress, LastError: r.lastError, MaxSendDelay: r.maxSendDelay}
 }
 
@@ -111,6 +133,9 @@ func (r *replayRun) finish(state, errText string) {
 	r.mu.Lock()
 	// stop() acknowledges under this same lock. A successful stop cannot be
 	// overwritten by an already chosen completed transition.
+	if r.fatalError != "" {
+		state, errText = "failed", r.fatalError
+	}
 	if state == "completed" && r.stopped.Load() {
 		state = "stopped"
 	}
@@ -188,10 +213,25 @@ func (r *replayRun) execute(ctx context.Context) {
 		r.finish("failed", "storage_failed")
 		return
 	}
+	results, err := r.svc.openResults(filepath.Join(r.dir, "results.jsonl"))
+	if err != nil {
+		r.mu.Lock()
+		r.output.ResultsFailed = true
+		r.mu.Unlock()
+		r.finish("failed", "replay_results_failed")
+		return
+	}
+	r.results = results
 	if r.req.Mode == "timed" {
 		r.sendTimed(ctx, plan)
 	} else {
 		r.sendConcurrent(ctx, plan)
+	}
+	if err := results.Close(); err != nil {
+		r.mu.Lock()
+		r.output.ResultsFailed = true
+		r.mu.Unlock()
+		r.abort("replay_results_failed")
 	}
 	r.finish("completed", "")
 }
@@ -209,7 +249,6 @@ func writeReplayPlan(dir string, plan *replayPlan) error {
 }
 
 func (r *replayRun) sendTimed(ctx context.Context, plan *replayPlan) {
-	slots := make(chan struct{}, r.req.MaxInflight)
 	var wg sync.WaitGroup
 	timer := time.NewTimer(0)
 	defer timer.Stop()
@@ -231,20 +270,15 @@ func (r *replayRun) sendTimed(ctx context.Context, plan *replayPlan) {
 		if ctx.Err() != nil {
 			break
 		}
-		// At max_inflight the send waits and the delay is recorded; the
-		// schedule itself never stretches into a fixed concurrency.
-		select {
-		case slots <- struct{}{}:
-		case <-ctx.Done():
-		}
-		if ctx.Err() != nil {
+		charge := replayBodyCharge(item)
+		if !r.svc.bodyMemory.tryAcquire(charge) {
+			r.abort("replay_resource_exhausted")
 			break
 		}
 		wg.Add(1)
 		go func(item replayPlanItem, due time.Time) {
 			defer wg.Done()
-			defer func() { <-slots }()
-			r.send(ctx, item, due)
+			r.send(ctx, item, due, charge)
 		}(item, due)
 	}
 	wg.Wait()
@@ -262,47 +296,46 @@ func (r *replayRun) sendConcurrent(ctx context.Context, plan *replayPlan) {
 				if n >= len(plan.items) {
 					return
 				}
-				r.send(ctx, plan.items[n], time.Now())
+				charge := replayBodyCharge(plan.items[n])
+				if !r.svc.bodyMemory.acquire(ctx, charge) {
+					return
+				}
+				r.send(ctx, plan.items[n], time.Now(), charge)
 			}
 		}()
 	}
 	wg.Wait()
 }
 
-// send reserves bounded body memory before reading. The dispatch claim under
-// r.mu is the stop boundary; claimed requests drain using the service context.
-func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.Time) {
+func replayBodyCharge(item replayPlanItem) int64 { return item.RequestBytes*6 + (1 << 20) }
+
+// The dispatch claim under r.mu is the stop boundary; claimed requests drain
+// using the service context. Every started preparation also joins the drain.
+func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.Time, charge int64) {
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { r.svc.bodyMemory.release(charge) }) }
+	defer release()
+	result := replayResult{Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: r.req.rewritten()}
+	if r.req.FixOutput {
+		result.RecordedTokens, result.TargetTokens = &item.TargetTokens, &item.TargetTokens
+	}
+	// Preparation failures and stop-before-send remain visible with null offsets.
+	defer func() { r.saveResult(result) }()
 	fail := func(detail string) {
+		result.Error = detail
 		r.failed.Add(1)
 		r.mu.Lock()
 		r.lastError = detail
 		r.mu.Unlock()
 	}
-	path := filepath.Join(item.Directory, "request.json")
-	info, err := os.Stat(path)
+	if runCtx.Err() != nil {
+		result.Error = "not_sent"
+		return
+	}
+	body, err := readReplayBody(item)
 	if err != nil {
-		fail("record_unreadable")
-		return
-	}
-	if !info.Mode().IsRegular() || info.Size() != item.RequestBytes || info.Size() < 0 || info.Size() > recordingMemory {
-		fail("record_changed")
-		return
-	}
-	// Charge for the source, rewritten body and JSON temporary allocations.
-	charge := info.Size()*6 + (1 << 20)
-	if !r.svc.bodyMemory.acquire(runCtx, charge) {
-		return
-	}
-	defer r.svc.bodyMemory.release(charge)
-	file, err := os.Open(path)
-	if err != nil {
-		fail("record_unreadable")
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(file, info.Size()+1))
-	file.Close()
-	if err != nil || int64(len(body)) != info.Size() || sha256Hex(body) != item.RequestSHA256 {
-		fail("record_changed")
+		fail(err.Error())
+		r.abort(err.Error())
 		return
 	}
 	if body, err = rewriteReplayBody(body, r.req, item); err != nil {
@@ -311,11 +344,35 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	}
 	ctx, cancel := context.WithTimeout(r.svc.ctx, time.Duration(r.req.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, r.svc.targets[r.req.Target]+item.Path, bytes.NewReader(body))
+	var traceMu sync.Mutex
+	var written *float64
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		if info.Err == nil {
+			offset := time.Since(r.begin).Seconds()
+			traceMu.Lock()
+			written = &offset
+			traceMu.Unlock()
+		}
+	}})
+	defer func() {
+		traceMu.Lock()
+		result.WriteOffset = written
+		if written != nil {
+			delay := *written - due.Sub(r.begin).Seconds()
+			result.writeDelay = &delay
+		}
+		traceMu.Unlock()
+	}()
+	upload := &replayUpload{reader: bytes.NewReader(body), release: release}
+	defer upload.Close()
+	length := len(body)
+	body = nil
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, r.svc.targets[r.req.Target]+item.Path, upload)
 	if err != nil {
 		fail("invalid_request")
 		return
 	}
+	request.ContentLength = int64(length)
 	for k, v := range item.Headers {
 		request.Header.Set(k, v)
 	}
@@ -325,12 +382,15 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	request.Header.Set(headerRouter, r.target.RouterID)
 	request.Header.Set(headerExpectedConfig, r.target.ConfigDigest)
 	request.Header.Set(headerReplay, replayMarkValue(r.svc.markKey, r.req.RunID, uint64(item.Sequence)))
-	request.Header.Set("X-Request-ID", randomID())
+	request.Header.Set("X-Request-ID", result.RequestID)
 	r.mu.Lock()
 	if r.stopped.Load() || runCtx.Err() != nil {
 		r.mu.Unlock()
+		result.Error = "not_sent"
 		return
 	}
+	offset := time.Since(r.begin).Seconds()
+	result.SendOffset = &offset
 	if delay := time.Since(due).Seconds(); delay > r.maxSendDelay {
 		r.maxSendDelay = delay
 	}
@@ -344,15 +404,44 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		return
 	}
 	defer response.Body.Close()
-	// Consume responses with constant memory; performance analysis belongs to
-	// monitoring, so replay does not parse usage, TTFT or full response bodies.
-	_, err = io.Copy(io.Discard, response.Body)
+	result.HTTPStatus = response.StatusCode
+	if r.req.FixOutput {
+		observer := newResponseObserver(response.Header)
+		var destination io.Writer = observer
+		var errorPrefix replayErrorPrefix
+		if response.StatusCode < 200 || response.StatusCode > 299 {
+			destination = io.MultiWriter(observer, &errorPrefix)
+		}
+		_, err = io.CopyBuffer(destination, response.Body, make([]byte, 32<<10))
+		transport := ""
+		if err != nil {
+			transport = replayErrorClass(err)
+		}
+		observed := observer.finish(transport)
+		result.Observation, result.ErrorSummary = &observed, observed.ErrorSummary
+		if result.ErrorSummary == "" {
+			result.ErrorSummary = string(errorPrefix.data[:errorPrefix.used])
+		}
+	} else if response.StatusCode < 200 || response.StatusCode > 299 {
+		prefix, readErr := io.ReadAll(io.LimitReader(response.Body, responseErrorLimit))
+		result.ErrorSummary = string(prefix)
+		if readErr == nil {
+			_, readErr = io.Copy(io.Discard, response.Body)
+		}
+		err = readErr
+	} else {
+		_, err = io.Copy(io.Discard, response.Body)
+	}
 	if err != nil {
 		fail(replayErrorClass(err))
 		return
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		fail("http_" + strconv.Itoa(response.StatusCode))
+		return
+	}
+	if result.Observation != nil && result.Observation.ResponseError {
+		fail("response_error")
 		return
 	}
 	r.completed.Add(1)

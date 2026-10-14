@@ -116,7 +116,7 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 	before := len(rec.router.bodies)
 	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	segment := summary.Segments[0].Segment
-	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "target": "r1", "mode": "timed"}
+	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "timed"}
 	code, out := f.call(t, "POST", "/control/replay/v1/runs", request)
 	if code != 200 {
 		t.Fatal(code, out)
@@ -150,7 +150,7 @@ func TestReplayConcurrencyWithEqualWorkRewrite(t *testing.T) {
 	before := len(rec.router.bodies)
 	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	request := map[string]any{"run_id": "run-c", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-b", "segments": []string{summary.Segments[0].Segment}},
-		"target": "r1", "mode": "concurrency", "concurrency": 2, "fix_output": true, "set_model": "token-model"}
+		"filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "concurrency", "concurrency": 2, "fix_output": true, "set_model": "token-model"}
 	if code, out := f.call(t, "POST", "/control/replay/v1/runs", request); code != 200 {
 		t.Fatal(code, out)
 	}
@@ -181,17 +181,22 @@ func TestReplayControlValidationAndLifecycle(t *testing.T) {
 	if code, out := f.call(t, "GET", "/control/replay/v1/status", nil); code != 200 || out["service"] != "aigate-replay" {
 		t.Fatal(code, out)
 	}
+	if _, out := f.call(t, "GET", "/control/replay/v1/status", nil); !strings.Contains(string(encodeJSON(out["capabilities"])), replayProtocolCapability) || out["recording_schema"] != float64(2) {
+		t.Fatal("missing protocol capability", out)
+	}
 	if code, out := f.call(t, "GET", "/control/replay/v1/recordings?gateway_id=g1", nil); code != 200 || !strings.Contains(string(encodeJSON(out)), segment) {
 		t.Fatal(code, out)
 	}
 	base := func(id string) map[string]any {
-		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "target": "r1", "mode": "timed"}
+		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "timed"}
 	}
 	for name, mutate := range map[string]func(map[string]any){
-		"unknown_target":  func(m map[string]any) { m["target"] = "http://127.0.0.1:1" },
-		"invalid_mode":    func(m map[string]any) { m["mode"] = "speed" },
-		"invalid_filter":  func(m map[string]any) { m["filter"] = map[string]any{"path": "/v1/models"} },
-		"invalid_rewrite": func(m map[string]any) { m["fix_output"] = true; m["set_max_tokens"] = 5 },
+		"retired_inflight": func(m map[string]any) { m["max_inflight"] = 0 },
+		"retired_output":   func(m map[string]any) { m["set_max_tokens"] = nil },
+		"unknown_target":   func(m map[string]any) { m["target"] = "http://127.0.0.1:1" },
+		"invalid_mode":     func(m map[string]any) { m["mode"] = "speed" },
+		"invalid_filter":   func(m map[string]any) { m["filter"] = map[string]any{"path": "/v1/models"} },
+		"invalid_rewrite":  func(m map[string]any) { m["fix_output"] = true; m["set_max_tokens"] = 5 },
 	} {
 		m := base("bad")
 		mutate(m)

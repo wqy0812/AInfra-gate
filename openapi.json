@@ -849,7 +849,7 @@
         "summary": "Replay service identity, target names and the active run",
         "responses": {
           "200": {
-            "description": "OK",
+            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-v2-timed-unlimited-output-verified.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1602,7 +1602,7 @@
           "start_at",
           "end_at"
         ],
-        "description": "A recording window. A start_at already past while end_at is ahead starts sampling immediately (used to re-send the rest of a window after a switch restart). One sampling or pending session per switch; a pending session may queue only behind a recording one that ends no later than its start.",
+        "description": "A recording window. A start_at already past while end_at is ahead starts sampling immediately (used to re-send the rest of a window after a switch restart). One sampling or pending session per switch; a pending session may queue only behind a recording one that ends no later than its start. Schema 2 always captures the complete bounded request, the last 8 KiB response tail and structured usage. The retired response field is rejected.",
         "properties": {
           "recording_id": {
             "type": "string",
@@ -1627,15 +1627,6 @@
             "minimum": 1,
             "maximum": 1000000,
             "default": 1
-          },
-          "response": {
-            "type": "string",
-            "enum": [
-              "summary",
-              "full"
-            ],
-            "default": "summary",
-            "description": "summary keeps the last 8 KiB of each response; full keeps whole responses for troubleshooting"
           },
           "max_bytes": {
             "type": "integer",
@@ -1699,9 +1690,6 @@
           },
           "sample_one_in": {
             "type": "integer"
-          },
-          "response": {
-            "type": "string"
           },
           "max_bytes": {
             "type": "integer",
@@ -1824,10 +1812,9 @@
         "required": [
           "run_id",
           "recording",
-          "target",
-          "mode"
+          "target"
         ],
-        "description": "Idempotent by run_id. Only one run at a time. No speed-up, copies or ramps: timed keeps the recorded arrival times, concurrency uses a fixed number of senders.",
+        "description": "Schema-2 recordings only. timed sends at original offsets without an inflight cap; nonblocking body-budget exhaustion stops new dispatch and fails the run after drain. Retired max_inflight/set_max_tokens fields are rejected.",
         "properties": {
           "run_id": {
             "type": "string",
@@ -1872,7 +1859,7 @@
                   "2xx",
                   "all"
                 ],
-                "default": "2xx"
+                "default": "all"
               },
               "path": {
                 "type": "string",
@@ -1891,7 +1878,8 @@
             "enum": [
               "timed",
               "concurrency"
-            ]
+            ],
+            "default": "timed"
           },
           "concurrency": {
             "type": "integer",
@@ -1899,24 +1887,13 @@
             "maximum": 1024,
             "description": "concurrency mode only"
           },
-          "max_inflight": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 4096,
-            "default": 512,
-            "description": "timed mode only; reaching it records send delay"
-          },
           "fix_output": {
             "type": "boolean",
-            "description": "Set max_tokens, min_tokens and ignore_eos to the recorded completion tokens"
+            "description": "Use schema-2 structured completion_tokens R>0 as T=R for a single candidate. Override max_tokens/min_tokens/ignore_eos; delete max_completion_tokens/stop/stop_token_ids. Merge include_usage=true for streaming. No target preflight, budget shrinking, retries or continuations."
           },
           "set_model": {
             "type": "string",
             "maxLength": 256
-          },
-          "set_max_tokens": {
-            "type": "integer",
-            "minimum": 0
           },
           "force_stream": {
             "type": "boolean"
@@ -1990,6 +1967,14 @@
               },
               "elapsed_seconds": {
                 "type": "number"
+              },
+              "unsent": {
+                "type": "integer",
+                "description": "Requests known not to have reached HTTP dispatch. After interrupted-run recovery, only explicit unsent result records are counted."
+              },
+              "unconfirmed": {
+                "type": "integer",
+                "description": "After interrupted-run recovery, planned requests without a complete result record. Their dispatch and completion are unknown; sent/completed/failed are confirmed lower bounds."
               }
             }
           },
@@ -2004,6 +1989,63 @@
           "max_send_delay_seconds": {
             "type": "number",
             "description": "Maximum delay from scheduled send time to dispatch."
+          },
+          "max_write_delay_seconds": {
+            "type": "number",
+            "nullable": true,
+            "description": "Maximum successful WroteRequest offset minus planned offset (timed); null if no successful write was observed. Replayer observation, not target receipt."
+          },
+          "end_reason": {
+            "type": "string"
+          },
+          "rewritten": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "excluded": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "output_verification": {
+            "type": "object",
+            "properties": {
+              "matched": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "short": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "long": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unverifiable": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "actual_tokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unknown": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "results_failed": {
+                "type": "boolean",
+                "description": "Results recording failed; verification success must not be reported."
+              },
+              "incomplete": {
+                "type": "boolean",
+                "description": "Recovered statistics cover only complete persisted result records; other results remain unknown."
+              }
+            }
           }
         }
       }

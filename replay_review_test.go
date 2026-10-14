@@ -143,7 +143,8 @@ func TestReplayFixOutputRejectsUnknownUsageBeforeSending(t *testing.T) {
 	recordDir := filepath.Join(dir, index[0].Directory)
 	var meta recordingMeta
 	readJSONFile(t, filepath.Join(recordDir, "meta.json"), &meta)
-	if err := os.WriteFile(filepath.Join(recordDir, meta.ResponseFile), []byte("data: [DONE]\n\n"), 0600); err != nil {
+	meta.ResponseResult = responseObservation{ParseStatus: "ok"}
+	if _, err := recordingAtomicJSON(recordDir, "meta.json", meta); err != nil {
 		t.Fatal(err)
 	}
 	before := rec.router.posts.Load()

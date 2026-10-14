@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	replayControlKeyEnv = "AIGATE_REPLAY_CONTROL_KEY"
-	replayRunsKept      = 200
-	replayRecordingList = 500
+	replayControlKeyEnv      = "AIGATE_REPLAY_CONTROL_KEY"
+	replayRunsKept           = 200
+	replayRecordingList      = 500
+	replayProtocolCapability = "recording-v2-timed-unlimited-output-verified"
 )
 
 type replayTargetsFile struct {
@@ -55,20 +56,21 @@ func readReplayTargets(path string) (map[string]string, error) {
 }
 
 type replayService struct {
-	key        string
-	cidrs      []netip.Prefix
-	recordRoot string
-	dataRoot   string
-	targets    map[string]string
-	markKey    []byte
-	boot       string
-	audit      *log.Logger
-	client     *http.Client
-	bodyMemory *replayByteBudget
-	writeJSON  func(string, string, any) (int64, error)
-	directory  *os.File
-	ctx        context.Context
-	cancel     context.CancelFunc
+	key         string
+	cidrs       []netip.Prefix
+	recordRoot  string
+	dataRoot    string
+	targets     map[string]string
+	markKey     []byte
+	boot        string
+	audit       *log.Logger
+	client      *http.Client
+	bodyMemory  *replayByteBudget
+	openResults func(string) (replayResultFile, error)
+	writeJSON   func(string, string, any) (int64, error)
+	directory   *os.File
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	mu     sync.Mutex
 	active *replayRun
@@ -99,7 +101,9 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 4096, IdleConnTimeout: 90 * time.Second, DisableCompression: true}
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
-		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
+		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, openResults: func(path string) (replayResultFile, error) {
+			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
 		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err = s.recover(); err != nil {
 		s.Close()
@@ -127,8 +131,12 @@ func (s *replayService) recover() error {
 			continue
 		}
 		if view.State == "planning" || view.State == "running" || view.State == "stopping" {
+			if err := recoverReplayResults(dir, &view); err != nil {
+				s.audit.Print(string(encodeJSON(map[string]any{"event": "replay_results_recovery_incomplete", "run_id": view.RunID, "error": err.Error()})))
+			}
 			now := time.Now().UTC()
 			view.State, view.Error, view.EndedAt = "end_unknown", "service_restarted", &now
+			view.EndReason = "service_restarted"
 			if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 				return err
 			}
@@ -406,7 +414,7 @@ func (s *replayService) Handler() http.Handler {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active})
+			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "capabilities": []string{replayProtocolCapability}, "recording_schema": recordingSchema})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"recordings":
 			gateway := r.URL.Query().Get("gateway_id")
 			if !validOperationID(gateway) {

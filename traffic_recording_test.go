@@ -303,6 +303,9 @@ func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
 	}
 	var meta recordingMeta
 	readJSONFile(t, filepath.Join(recordDir, "meta.json"), &meta)
+	if meta.Schema != 2 || !meta.ResponseResult.UsageKnown || !meta.ResponseResult.ProtocolComplete || meta.ResponseResult.Usage["completion_tokens"] == 0 {
+		t.Fatalf("missing structured response: %+v", meta.ResponseResult)
+	}
 	if meta.Headers["X-Request-ID"] != "client-1" || meta.Headers["Authorization"] != "" || meta.RouterID != "r1" || meta.BindingRevision != 1 || meta.ConfigDigest != f.p.digest ||
 		meta.UpstreamRequestID == "" || !strings.HasPrefix(meta.ResponseHeaders["Content-Type"], "text/event-stream") || meta.RequestSHA256 != sha256Hex([]byte(streamBody)) || meta.Segment != session.Segments[0] {
 		t.Fatalf("meta %+v", meta)
@@ -315,6 +318,39 @@ func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
 	}
 	if info, _ := os.Stat(filepath.Join(recordDir, "request.json")); info.Mode().Perm() != 0600 {
 		t.Fatal("record file permissions", info.Mode())
+	}
+}
+
+func TestRecordingLongResponseOnlyWritesTailAndStructuredUsage(t *testing.T) {
+	f := newRecordingFixture(t, recordingDefaultMaxBytes)
+	now := time.Now()
+	startRecording(t, f.c, "long-json", halfHour(now), halfHour(now).Add(time.Hour), nil)
+	body := `{"model":"token-model","messages":[{"role":"user","content":"long answer"}],"max_tokens":20000}`
+	code, response := postChat(t, f.switch_.URL, body, nil)
+	if code != 200 || len(response) < 20000 {
+		t.Fatal("forwarding changed", code, response[:min(160, len(response))])
+	}
+	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "long-json"})
+	summary := waitRecordingEnded(t, f.c, "long-json")
+	dir := filepath.Join(f.root, "g1", "long-json", summary.Segments[0].Segment)
+	index := readIndex(t, filepath.Join(dir, "index.jsonl"))
+	record := filepath.Join(dir, index[0].Directory)
+	tail, err := os.ReadFile(filepath.Join(record, "response.tail"))
+	if err != nil || len(tail) != recordingTailBytes || string(tail) != response[len(response)-recordingTailBytes:] {
+		t.Fatal("tail did not roll", err)
+	}
+	var meta recordingMeta
+	readJSONFile(t, filepath.Join(record, "meta.json"), &meta)
+	if meta.ResponseResult.Usage["completion_tokens"] != 20000 || !meta.ResponseResult.ProtocolComplete || meta.ResponseBytes != int64(len(response)) {
+		t.Fatalf("%+v", meta)
+	}
+	entries, _ := os.ReadDir(record)
+	if len(entries) != 4 {
+		t.Fatalf("unexpected files: %v", entries)
+	}
+	raw, _ := os.ReadFile(filepath.Join(record, "meta.json"))
+	if strings.Contains(string(raw), "response_mode") {
+		t.Fatal("retired mode persisted")
 	}
 }
 

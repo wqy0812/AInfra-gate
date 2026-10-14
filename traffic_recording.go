@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	recordingSchema          = 1
+	recordingSchema          = 2
 	recordingSegment         = 30 * time.Minute
 	recordingSegmentLayout   = "20060102T1504"
 	recordingMemory          = int64(64 << 20)
@@ -35,7 +35,7 @@ const (
 	recordingTimelineEvents  = 8192
 	recordingEventBlock      = 128
 	recordingEventCharge     = int64(64)
-	recordingRecordCharge    = int64(recordingTailBytes + 8<<10)
+	recordingRecordCharge    = int64(recordingTailBytes + responseObserverBuffer + 64<<10)
 	recordingDrain           = 5 * time.Second
 	recordingFinishedKept    = 64
 	recordingMaxSampleOneIn  = 1_000_000
@@ -55,7 +55,6 @@ type recordingParams struct {
 	StartAt     time.Time `json:"start_at"`
 	EndAt       time.Time `json:"end_at"`
 	SampleOneIn uint64    `json:"sample_one_in"`
-	Response    string    `json:"response"`
 	MaxBytes    int64     `json:"max_bytes"`
 }
 
@@ -85,12 +84,6 @@ func (p *recordingParams) normalize(limit int64, now time.Time) error {
 	}
 	if p.SampleOneIn > recordingMaxSampleOneIn {
 		return fmt.Errorf("invalid_sample_rate")
-	}
-	if p.Response == "" {
-		p.Response = "summary"
-	}
-	if p.Response != "summary" && p.Response != "full" {
-		return fmt.Errorf("invalid_response_mode")
 	}
 	if p.MaxBytes == 0 {
 		p.MaxBytes = limit
@@ -226,7 +219,6 @@ type recordingSummary struct {
 	StartedAt   *time.Time                `json:"started_at,omitempty"`
 	StoppedAt   *time.Time                `json:"stopped_at,omitempty"`
 	SampleOneIn uint64                    `json:"sample_one_in"`
-	Response    string                    `json:"response"`
 	MaxBytes    int64                     `json:"max_bytes"`
 	Requests    uint64                    `json:"requests"`
 	Recorded    uint64                    `json:"recorded"`
@@ -239,7 +231,7 @@ type recordingSummary struct {
 
 func (s *recordingSession) summaryLocked(now time.Time) recordingSummary {
 	out := recordingSummary{RecordingID: s.params.RecordingID, ScheduleID: s.params.ScheduleID, State: s.stateAt(now), EndReason: s.endReason,
-		StartAt: s.params.StartAt, EndAt: s.params.EndAt, SampleOneIn: s.params.SampleOneIn, Response: s.params.Response, MaxBytes: s.params.MaxBytes,
+		StartAt: s.params.StartAt, EndAt: s.params.EndAt, SampleOneIn: s.params.SampleOneIn, MaxBytes: s.params.MaxBytes,
 		Requests: s.requests, Recorded: s.recorded, Dropped: s.dropped, Truncated: s.truncated, Bytes: s.bytes, Inflight: s.inflight, Segments: []recordingSegmentSummary{}}
 	if s.ready && !now.Before(s.activeFrom()) {
 		at := s.activeFrom()
@@ -329,44 +321,44 @@ type recordingIndexLine struct {
 }
 
 type recordingMeta struct {
-	Schema            int               `json:"schema_version"`
-	RequestID         string            `json:"request_id"`
-	RecordingID       string            `json:"recording_id"`
-	GatewayID         string            `json:"gateway_id"`
-	BootID            string            `json:"boot_id"`
-	Segment           string            `json:"segment"`
-	Sequence          uint64            `json:"sequence"`
-	ArrivedAt         time.Time         `json:"arrived_at"`
-	OffsetSeconds     float64           `json:"offset_seconds"`
-	Method            string            `json:"method"`
-	Path              string            `json:"path"`
-	ContentLength     int64             `json:"content_length"`
-	Peer              string            `json:"peer,omitempty"`
-	Headers           map[string]string `json:"headers"`
-	RouterID          string            `json:"router_id,omitempty"`
-	BindingRevision   uint64            `json:"binding_revision,omitempty"`
-	ConfigDigest      string            `json:"config_digest,omitempty"`
-	UpstreamRequestID string            `json:"upstream_request_id,omitempty"`
-	Status            int               `json:"status"`
-	ResponseHeaders   map[string]string `json:"response_headers"`
-	Outcome           string            `json:"outcome"`
-	EndedAt           time.Time         `json:"ended_at"`
-	DurationSeconds   float64           `json:"duration_seconds"`
-	RequestState      string            `json:"request_state"`
-	RequestError      string            `json:"request_error,omitempty"`
-	RequestBytes      int64             `json:"request_bytes"`
-	RequestSavedBytes int64             `json:"request_saved_bytes"`
-	RequestSHA256     string            `json:"request_sha256"`
-	ResponseMode      string            `json:"response_mode"`
-	ResponseFile      string            `json:"response_file"`
-	ResponseBytes     int64             `json:"response_bytes"`
-	ResponseSaved     int64             `json:"response_saved_bytes"`
-	ResponseSHA256    string            `json:"response_sha256"`
-	TimelineEvents    int               `json:"timeline_events"`
-	TimelineTruncated bool              `json:"timeline_truncated"`
-	TimelineSHA256    string            `json:"timeline_sha256"`
-	CaptureState      string            `json:"capture_state"`
-	FailureReason     string            `json:"failure_reason,omitempty"`
+	Schema            int                 `json:"schema_version"`
+	RequestID         string              `json:"request_id"`
+	RecordingID       string              `json:"recording_id"`
+	GatewayID         string              `json:"gateway_id"`
+	BootID            string              `json:"boot_id"`
+	Segment           string              `json:"segment"`
+	Sequence          uint64              `json:"sequence"`
+	ArrivedAt         time.Time           `json:"arrived_at"`
+	OffsetSeconds     float64             `json:"offset_seconds"`
+	Method            string              `json:"method"`
+	Path              string              `json:"path"`
+	ContentLength     int64               `json:"content_length"`
+	Peer              string              `json:"peer,omitempty"`
+	Headers           map[string]string   `json:"headers"`
+	RouterID          string              `json:"router_id,omitempty"`
+	BindingRevision   uint64              `json:"binding_revision,omitempty"`
+	ConfigDigest      string              `json:"config_digest,omitempty"`
+	UpstreamRequestID string              `json:"upstream_request_id,omitempty"`
+	Status            int                 `json:"status"`
+	ResponseHeaders   map[string]string   `json:"response_headers"`
+	Outcome           string              `json:"outcome"`
+	EndedAt           time.Time           `json:"ended_at"`
+	DurationSeconds   float64             `json:"duration_seconds"`
+	RequestState      string              `json:"request_state"`
+	RequestError      string              `json:"request_error,omitempty"`
+	RequestBytes      int64               `json:"request_bytes"`
+	RequestSavedBytes int64               `json:"request_saved_bytes"`
+	RequestSHA256     string              `json:"request_sha256"`
+	ResponseResult    responseObservation `json:"response_result"`
+	ResponseFile      string              `json:"response_file"`
+	ResponseBytes     int64               `json:"response_bytes"`
+	ResponseSaved     int64               `json:"response_saved_bytes"`
+	ResponseSHA256    string              `json:"response_sha256"`
+	TimelineEvents    int                 `json:"timeline_events"`
+	TimelineTruncated bool                `json:"timeline_truncated"`
+	TimelineSHA256    string              `json:"timeline_sha256"`
+	CaptureState      string              `json:"capture_state"`
+	FailureReason     string              `json:"failure_reason,omitempty"`
 }
 
 type recordingTimelineLine struct {
@@ -409,7 +401,6 @@ type trafficRecord struct {
 	peer     string
 	length   int64
 	headers  map[string]string
-	mode     string
 	mu       sync.Mutex
 	finished bool
 	charge   int64
@@ -426,14 +417,13 @@ type trafficRecord struct {
 	responseHeaders     map[string]string
 	tail                []byte
 	tailPos             int
-	full                []byte
 	responseBytes       int64
-	responseTruncated   bool
 	events              []recordingEvent
 	eventsCharged       int
 	timelineTruncated   bool
 	outcome             string
 	truncationReason    string
+	observer            *responseObserver
 	responseHeaderKnown bool
 }
 
@@ -543,6 +533,7 @@ func (t *trafficRecord) header(status int, h http.Header) {
 		return
 	}
 	t.responseHeaderKnown = true
+	t.observer = newResponseObserver(h)
 	t.status = status
 	t.responseHeaders = map[string]string{}
 	for _, k := range recordingResponseHeaders {
@@ -565,16 +556,8 @@ func (t *trafficRecord) write(start, end time.Time, p []byte) {
 	offset := t.responseBytes
 	t.responseBytes += int64(len(p))
 	t.eventLocked(recordingEvent{kind: recordingEventWrite, at: start.Sub(t.arrived), dur: end.Sub(start), start: offset, end: t.responseBytes})
-	if t.mode == "full" {
-		if !t.responseTruncated {
-			if t.reserveLocked(int64(len(p))) {
-				t.full = append(t.full, p...)
-			} else {
-				t.responseTruncated = true
-				t.truncationReason = "memory_full"
-			}
-		}
-		return
+	if t.observer != nil {
+		_, _ = t.observer.Write(p)
 	}
 	if len(p) >= len(t.tail) {
 		copy(t.tail, p[len(p)-len(t.tail):])
@@ -666,12 +649,9 @@ func (t *trafficRecord) finish(clientErr error) {
 	default:
 		requestState = "incomplete"
 	}
-	response, file := t.full, "response.sse"
-	if t.mode != "full" {
-		response, file = t.tailBytes(), "response.tail"
-	}
+	response, file := t.tailBytes(), "response.tail"
 	capture := "complete"
-	if t.bodyTruncated || t.responseTruncated {
+	if t.bodyTruncated {
 		capture = "truncated"
 	}
 	segStart := t.segment.start
@@ -680,13 +660,21 @@ func (t *trafficRecord) finish(clientErr error) {
 		ContentLength: t.length, Peer: t.peer, Headers: t.headers, RouterID: t.router.RouterID, BindingRevision: t.router.BindingRevision, ConfigDigest: t.router.ConfigDigest,
 		UpstreamRequestID: t.upstreamID, Status: t.status, ResponseHeaders: t.responseHeaders, Outcome: outcome, EndedAt: ended.UTC(),
 		DurationSeconds: ended.Sub(t.arrived).Seconds(), RequestState: requestState, RequestError: t.bodyError, RequestBytes: t.bodyBytes,
-		RequestSavedBytes: int64(len(t.body)), ResponseMode: t.mode, ResponseFile: file, ResponseBytes: t.responseBytes, ResponseSaved: int64(len(response)),
+		RequestSavedBytes: int64(len(t.body)), ResponseFile: file, ResponseBytes: t.responseBytes, ResponseSaved: int64(len(response)),
 		TimelineEvents: len(t.events), TimelineTruncated: t.timelineTruncated, CaptureState: capture, FailureReason: t.truncationReason}
+	transportError := ""
+	if outcome != "completed" && outcome != "upstream_error" && outcome != "rejected" {
+		transportError = outcome
+	}
+	if t.observer == nil {
+		t.observer = newResponseObserver(http.Header{})
+	}
+	meta.ResponseResult = t.observer.finish(transportError)
 	if meta.ResponseHeaders == nil {
 		meta.ResponseHeaders = map[string]string{}
 	}
 	snapshot := &recordingSnapshot{meta: meta, body: t.body, response: response, events: t.events, session: t.session, segment: t.segment, charge: t.charge, truncate: capture == "truncated"}
-	t.body, t.full, t.tail, t.events = nil, nil, nil, nil
+	t.body, t.tail, t.events, t.observer = nil, nil, nil, nil
 	t.mu.Unlock()
 	t.rec.submit(snapshot)
 }
@@ -1028,10 +1016,8 @@ func (r *trafficRecorder) begin(req *http.Request, id string, arrived time.Time)
 	seg.inflight++
 	seg.seq++
 	t := &trafficRecord{rec: r, session: s, segment: seg, seq: seg.seq, id: id, arrived: arrived, method: req.Method, path: req.URL.Path,
-		peer: req.RemoteAddr, length: req.ContentLength, headers: map[string]string{}, mode: s.params.Response, charge: recordingRecordCharge}
-	if t.mode != "full" {
-		t.tail = make([]byte, recordingTailBytes)
-	}
+		peer: req.RemoteAddr, length: req.ContentLength, headers: map[string]string{}, charge: recordingRecordCharge}
+	t.tail = make([]byte, recordingTailBytes)
 	for _, k := range recordingRequestHeaders {
 		if v := req.Header.Get(k); v != "" {
 			t.headers[k] = captureString(v, 256)

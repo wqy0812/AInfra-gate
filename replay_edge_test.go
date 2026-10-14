@@ -18,7 +18,7 @@ import (
 
 func normalizedReplayRequest(t *testing.T, id, recording, segment, target string) replayRequest {
 	t.Helper()
-	req := replayRequest{RunID: id, Recording: replayRecordingRef{GatewayID: "g1", RecordingID: recording, Segments: []string{segment}}, Target: target, Mode: "concurrency", Concurrency: 1}
+	req := replayRequest{RunID: id, Recording: replayRecordingRef{GatewayID: "g1", RecordingID: recording, Segments: []string{segment}}, Filter: replayFilter{Status: "2xx"}, Target: target, Mode: "concurrency", Concurrency: 1}
 	if err := req.normalize(); err != nil {
 		t.Fatal(err)
 	}
@@ -138,21 +138,5 @@ func TestReplayAssertsTheCheckedTargetOnEveryRequest(t *testing.T) {
 	f.svc.start(req)
 	if view := f.wait(t, "mismatch"); view.State != "failed" || view.Error != "target_router_mismatch" {
 		t.Fatalf("%+v", view)
-	}
-}
-
-func TestReplayTailUsageFindsUsageInTruncatedBodies(t *testing.T) {
-	usage := map[string]any{"prompt_tokens": 1200, "completion_tokens": 4096, "prompt_tokens_details": map[string]any{"cached_tokens": 512}}
-	body, _ := json.Marshal(map[string]any{"id": "x", "choices": []any{map[string]any{"message": map[string]any{"content": strings.Repeat("长回答", 4000)}}}, "usage": usage})
-	want := map[string]uint64{"prompt_tokens": 1200, "completion_tokens": 4096, "cached_tokens": 512}
-	if got := replayTailUsage(body[len(body)-recordingTailBytes:]); fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("truncated body: %v", got)
-	}
-	sse := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"usage\":null}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n")
-	if got := replayTailUsage(sse); got["prompt_tokens"] != 7 || got["completion_tokens"] != 3 {
-		t.Fatalf("sse: %v", got)
-	}
-	if got := replayTailUsage([]byte(`d\"usage\": {\"prompt_tokens\": 9}"}}]}`)); got != nil {
-		t.Fatalf("escaped content matched: %v", got)
 	}
 }
