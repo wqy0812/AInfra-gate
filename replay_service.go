@@ -130,13 +130,16 @@ func (s *replayService) recover() error {
 		if err != nil || json.Unmarshal(data, &view) != nil {
 			continue
 		}
-		if view.State == "planning" || view.State == "running" || view.State == "stopping" {
+		if view.State == "prepared" || view.State == "scheduled" || view.State == "planning" || view.State == "running" || view.State == "stopping" {
 			if err := recoverReplayResults(dir, &view); err != nil {
 				s.audit.Print(string(encodeJSON(map[string]any{"event": "replay_results_recovery_incomplete", "run_id": view.RunID, "error": err.Error()})))
 			}
 			now := time.Now().UTC()
 			view.State, view.Error, view.EndedAt = "end_unknown", "service_restarted", &now
 			view.EndReason = "service_restarted"
+			for i := range view.Sources {
+				view.Sources[i].State = "end_unknown"
+			}
 			if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 				return err
 			}
@@ -285,7 +288,7 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 		return replayRunView{}, 409, "run_conflict"
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	r := &replayRun{svc: s, req: req, digest: digest, dir: dir, cancel: cancel, done: make(chan struct{}), state: "planning", created: time.Now().UTC()}
+	r := &replayRun{svc: s, req: req, digest: digest, dir: dir, cancel: cancel, done: make(chan struct{}), state: "planning", created: time.Now().UTC(), startSignal: make(chan struct{}), leaseUntil: time.Now().Add(15 * time.Second)}
 	if _, err := recordingAtomicJSON(dir, "request.json", req); err != nil {
 		cancel()
 		_ = os.RemoveAll(dir)
@@ -304,6 +307,10 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 				delete(s.runs, id)
 			}
 		}
+	}
+	if req.PrepareOnly {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); r.watchLease(ctx) }()
 	}
 	s.wg.Add(1)
 	go func() {
@@ -402,6 +409,9 @@ func (s *replayService) Handler() http.Handler {
 		const prefix = "/control/replay/v1/"
 		path := strings.TrimPrefix(r.URL.Path, prefix)
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == prefix+"clock":
+			received := time.Now().UTC()
+			replayJSON(w, 200, map[string]any{"boot_id": s.boot, "received_at": received, "sent_at": time.Now().UTC()})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"status":
 			s.mu.Lock()
 			var active any
@@ -414,7 +424,7 @@ func (s *replayService) Handler() http.Handler {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "capabilities": []string{replayProtocolCapability}, "recording_schema": recordingSchema})
+			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "capabilities": []string{replayProtocolCapability, replayOverlayCapability}, "recording_schema": recordingSchema})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"recordings":
 			gateway := r.URL.Query().Get("gateway_id")
 			if !validOperationID(gateway) {
@@ -432,6 +442,14 @@ func (s *replayService) Handler() http.Handler {
 			var req replayRequest
 			if err != nil || strictDecode(data, &req) != nil {
 				runtimeError(w, 400, "invalid_request")
+				return
+			}
+			var fields map[string]json.RawMessage
+			_ = json.Unmarshal(data, &fields)
+			_, single := fields["recording"]
+			_, multiple := fields["recordings"]
+			if single && multiple {
+				runtimeError(w, 400, "invalid_recordings")
 				return
 			}
 			if err := req.normalize(); err != nil {
@@ -461,6 +479,21 @@ func (s *replayService) Handler() http.Handler {
 				} else {
 					runtimeError(w, 404, "run_not_found")
 				}
+				return
+			}
+			if r.Method == http.MethodPost && (action == "start" || action == "lease") {
+				var command replaySyncCommand
+				data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+				if err != nil || strictDecode(data, &command) != nil {
+					runtimeError(w, 400, "invalid_request")
+					return
+				}
+				view, status, code := s.syncRun(id, action, command)
+				if code != "" {
+					runtimeError(w, status, code)
+					return
+				}
+				replayJSON(w, 200, view)
 				return
 			}
 			if r.Method == http.MethodPost && action == "stop" {

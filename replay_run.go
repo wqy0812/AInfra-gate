@@ -38,15 +38,30 @@ type replayTargetState struct {
 }
 
 // replayRun is one run. Its state is persisted in the run directory.
+type replaySourceProgress struct {
+	State        string         `json:"state"`
+	LastError    string         `json:"last_error,omitempty"`
+	MaxSendDelay float64        `json:"max_send_delay_seconds"`
+	GatewayID    string         `json:"gateway_id"`
+	RecordingID  string         `json:"recording_id"`
+	Progress     replayProgress `json:"progress"`
+}
+
 type replayRun struct {
-	svc          *replayService
-	req          replayRequest
-	digest       string
-	dir          string
-	cancel       context.CancelFunc
-	stopped      atomic.Bool
-	done         chan struct{}
-	segmentFiles []*os.File
+	persistMu     sync.Mutex
+	sources       []replaySourceProgress
+	svc           *replayService
+	req           replayRequest
+	digest        string
+	dir           string
+	cancel        context.CancelFunc
+	stopped       atomic.Bool
+	done          chan struct{}
+	segmentFiles  []*os.File
+	leaseUntil    time.Time
+	scheduledAt   *time.Time
+	startDeadline time.Time
+	startSignal   chan struct{}
 
 	mu       sync.Mutex
 	state    string
@@ -70,23 +85,26 @@ type replayRun struct {
 }
 
 type replayRunView struct {
-	RunID          string              `json:"run_id"`
-	State          string              `json:"state"`
-	Error          string              `json:"error,omitempty"`
-	CreatedAt      time.Time           `json:"created_at"`
-	StartedAt      *time.Time          `json:"started_at,omitempty"`
-	EndedAt        *time.Time          `json:"ended_at,omitempty"`
-	Request        *replayRequest      `json:"request,omitempty"`
-	Target         replayTargetState   `json:"target"`
-	Progress       replayProgress      `json:"progress"`
-	LastError      string              `json:"last_error,omitempty"`
-	MaxSendDelay   float64             `json:"max_send_delay_seconds"`
-	MaxWriteDelay  *float64            `json:"max_write_delay_seconds"`
-	Output         replayOutputSummary `json:"output_verification"`
-	Excluded       map[string]int      `json:"excluded,omitempty"`
-	Rewritten      []string            `json:"rewritten"`
-	EndReason      string              `json:"end_reason,omitempty"`
-	StartCancelled bool                `json:"start_cancelled,omitempty"`
+	Sources        []replaySourceProgress `json:"sources,omitempty"`
+	ScheduledAt    *time.Time             `json:"scheduled_at,omitempty"`
+	Plan           *replayPlan            `json:"plan,omitempty"`
+	RunID          string                 `json:"run_id"`
+	State          string                 `json:"state"`
+	Error          string                 `json:"error,omitempty"`
+	CreatedAt      time.Time              `json:"created_at"`
+	StartedAt      *time.Time             `json:"started_at,omitempty"`
+	EndedAt        *time.Time             `json:"ended_at,omitempty"`
+	Request        *replayRequest         `json:"request,omitempty"`
+	Target         replayTargetState      `json:"target"`
+	Progress       replayProgress         `json:"progress"`
+	LastError      string                 `json:"last_error,omitempty"`
+	MaxSendDelay   float64                `json:"max_send_delay_seconds"`
+	MaxWriteDelay  *float64               `json:"max_write_delay_seconds"`
+	Output         replayOutputSummary    `json:"output_verification"`
+	Excluded       map[string]int         `json:"excluded,omitempty"`
+	Rewritten      []string               `json:"rewritten"`
+	EndReason      string                 `json:"end_reason,omitempty"`
+	StartCancelled bool                   `json:"start_cancelled,omitempty"`
 }
 
 func (r *replayRun) viewLocked() replayRunView {
@@ -104,7 +122,15 @@ func (r *replayRun) viewLocked() replayRunView {
 	if reason == "" && r.ended != nil {
 		reason = r.state
 	}
-	return replayRunView{EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
+	sources := append([]replaySourceProgress(nil), r.sources...)
+	for i := range sources {
+		sources[i].State = r.state
+		if !r.begin.IsZero() && sources[i].Progress.Sent == int64(sources[i].Progress.Planned) && sources[i].Progress.Inflight == 0 {
+			sources[i].State = "completed"
+		}
+		sources[i].Progress.Unsent = max(0, int64(sources[i].Progress.Planned)-sources[i].Progress.Sent)
+	}
+	return replayRunView{Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
 		Request: &r.req, Target: r.target, Progress: progress, LastError: r.lastError, MaxSendDelay: r.maxSendDelay}
 }
 
@@ -115,6 +141,8 @@ func (r *replayRun) view() replayRunView {
 }
 
 func (r *replayRun) persist() error {
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
 	r.mu.Lock()
 	view := r.viewLocked()
 	r.mu.Unlock()
@@ -166,18 +194,20 @@ func (r *replayRun) finish(state, errText string) {
 func (r *replayRun) execute(ctx context.Context) {
 	// One descriptor per selected segment (at most 96), using the same
 	// nonblocking directory lock as capacity eviction. No source files change.
-	for _, name := range r.req.Recording.Segments {
-		f, err := os.Open(filepath.Join(r.svc.recordRoot, r.req.Recording.GatewayID, r.req.Recording.RecordingID, name))
-		if err != nil {
-			r.finish("failed", "segment_not_found")
-			return
+	for _, ref := range r.req.sources() {
+		for _, name := range ref.Segments {
+			f, err := os.Open(filepath.Join(r.svc.recordRoot, ref.GatewayID, ref.RecordingID, name))
+			if err != nil {
+				r.finish("failed", "segment_not_found")
+				return
+			}
+			if err := lockState(f); err != nil {
+				f.Close()
+				r.finish("failed", "segment_busy")
+				return
+			}
+			r.segmentFiles = append(r.segmentFiles, f)
 		}
-		if err := lockState(f); err != nil {
-			f.Close()
-			r.finish("failed", "segment_busy")
-			return
-		}
-		r.segmentFiles = append(r.segmentFiles, f)
 	}
 	plan, err := buildReplayPlan(r.svc.recordRoot, r.req)
 	if err != nil {
@@ -187,6 +217,15 @@ func (r *replayRun) execute(ctx context.Context) {
 	r.mu.Lock()
 	r.plan = plan
 	r.progress.Planned = plan.Planned
+	for _, ref := range r.req.sources() {
+		source := replaySourceProgress{GatewayID: ref.GatewayID, RecordingID: ref.RecordingID}
+		for _, seg := range plan.Segments {
+			if seg.GatewayID == ref.GatewayID && seg.RecordingID == ref.RecordingID {
+				source.Progress.Planned += seg.Planned
+			}
+		}
+		r.sources = append(r.sources, source)
+	}
 	r.mu.Unlock()
 	if err = writeReplayPlan(r.dir, plan); err != nil {
 		r.finish("failed", "storage_failed")
@@ -201,13 +240,52 @@ func (r *replayRun) execute(ctx context.Context) {
 		r.finish("failed", err.Error())
 		return
 	}
+	if r.req.PrepareOnly {
+		r.mu.Lock()
+		if r.stopped.Load() || ctx.Err() != nil {
+			r.mu.Unlock()
+			r.finish("stopped", "")
+			return
+		}
+		r.target = target
+		r.state = "prepared"
+		r.mu.Unlock()
+		if err := r.persist(); err != nil {
+			r.finish("failed", "storage_failed")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			r.finish("stopped", "")
+			return
+		case <-r.startSignal:
+		}
+		r.mu.Lock()
+		due := r.startDeadline
+		r.mu.Unlock()
+		timer := time.NewTimer(time.Until(due))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			r.finish("stopped", "")
+			return
+		case <-timer.C:
+		}
+		if time.Since(due) > replayStartTolerance {
+			r.finish("failed", "sync_start_late")
+			return
+		}
+	}
 	now := time.Now()
 	started := now.UTC()
 	r.mu.Lock()
-	r.target, r.started, r.begin = target, &started, now
-	if !r.stopped.Load() {
-		r.state = "running"
+	if r.stopped.Load() || ctx.Err() != nil {
+		r.mu.Unlock()
+		r.finish("stopped", "")
+		return
 	}
+	r.target, r.started, r.begin = target, &started, now
+	r.state = "running"
 	r.mu.Unlock()
 	if err := r.persist(); err != nil {
 		r.finish("failed", "storage_failed")
@@ -315,12 +393,31 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { r.svc.bodyMemory.release(charge) }) }
 	defer release()
-	result := replayResult{Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: r.req.rewritten()}
+	result := replayResult{GatewayID: item.GatewayID, RecordingID: item.RecordingID, Segment: item.Segment, Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: r.req.rewritten()}
 	if r.req.FixOutput {
 		result.RecordedTokens, result.TargetTokens = &item.TargetTokens, &item.TargetTokens
 	}
 	// Preparation failures and stop-before-send remain visible with null offsets.
-	defer func() { r.saveResult(result) }()
+	defer func() {
+		r.saveResult(result)
+		r.mu.Lock()
+		for i := range r.sources {
+			source := &r.sources[i]
+			if source.GatewayID != item.GatewayID || source.RecordingID != item.RecordingID {
+				continue
+			}
+			if result.SendOffset != nil {
+				source.Progress.Inflight--
+			}
+			if result.Error != "" && result.Error != "not_sent" {
+				source.Progress.Failed++
+				source.LastError = result.Error
+			} else if result.SendOffset != nil {
+				source.Progress.Completed++
+			}
+		}
+		r.mu.Unlock()
+	}()
 	fail := func(detail string) {
 		result.Error = detail
 		r.failed.Add(1)
@@ -395,6 +492,13 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		r.maxSendDelay = delay
 	}
 	r.sent.Add(1)
+	for i := range r.sources {
+		if r.sources[i].GatewayID == item.GatewayID && r.sources[i].RecordingID == item.RecordingID {
+			r.sources[i].Progress.Sent++
+			r.sources[i].Progress.Inflight++
+			r.sources[i].MaxSendDelay = max(r.sources[i].MaxSendDelay, time.Since(due).Seconds())
+		}
+	}
 	r.inflight.Add(1)
 	r.mu.Unlock()
 	defer r.inflight.Add(-1)

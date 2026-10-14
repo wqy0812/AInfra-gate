@@ -69,6 +69,8 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/
 
 运行 `./scripts/test_coverage.sh`，可传 Go 测试参数（例如 `-run TestRuntime -race`）。入口使用离线 vendor 模式，覆盖网关及 `cmd/` 中的命令；本地忽略的 `deploy/` 发布工具不进入分母。结果输出到 `dist/coverage/coverage.out` 和 `dist/coverage/index.html`，测试失败时保留报告与失败退出码。
 
+`deploy/go.mod` 仅为历史发布材料建立独立模块边界，使仓库根目录的 `go test -mod=vendor ./...`、`go vet -mod=vendor ./...` 与包枚举不递归进入 `deploy/`。Git 只保留该边界文件，其余发布材料继续忽略；原始证据、历史测试片段和 overlay 路径保持不变。历史片段不构成可独立测试的应用模块，不在 `deploy/` 内递归运行测试。
+
 控制协议、配置边界、画像 HTTP/分析队列及预算、观测存储故障、控制进程启动与 SIGTERM 收尾均有离线回归。网络夹具仅使用本机临时监听器，磁盘夹具使用临时目录，不访问部署节点或真实模型。
 
 ## 业务响应与旁路观测

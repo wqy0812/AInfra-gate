@@ -24,6 +24,9 @@ type replayOutputSummary struct {
 }
 
 type replayResult struct {
+	GatewayID         string               `json:"gateway_id"`
+	RecordingID       string               `json:"recording_id"`
+	Segment           string               `json:"segment"`
 	Sequence          int                  `json:"sequence"`
 	OriginalRequestID string               `json:"original_request_id"`
 	RequestID         string               `json:"request_id"`
@@ -61,9 +64,17 @@ func (p *replayErrorPrefix) Write(b []byte) (int, error) {
 
 func (r *replayRun) abort(reason string) {
 	r.mu.Lock()
+	if r.ended != nil {
+		r.mu.Unlock()
+		return
+	}
 	if r.fatalError == "" {
 		r.fatalError = reason
 	}
+	// Expose fatal dispatch failure while accepted requests still drain, so
+	// the platform can stop the other overlay participant before we finish.
+	r.state, r.errText = "stopping", r.fatalError
+	r.stopped.Store(true)
 	r.mu.Unlock()
 	r.cancel()
 }
@@ -142,11 +153,19 @@ func (s *replayOutputSummary) add(result replayResult) {
 // Never rewrite the evidence file or restart any request during recovery.
 func recoverReplayResults(dir string, view *replayRunView) (err error) {
 	seen := make(map[int]bool)
+	sourceSeen := make(map[string]int64)
+	for i := range view.Sources {
+		view.Sources[i].Progress = replayProgress{Planned: view.Sources[i].Progress.Planned}
+	}
 	view.Progress.Sent, view.Progress.Completed, view.Progress.Failed = 0, 0, 0
 	view.Progress.Inflight, view.Progress.Unsent = 0, 0
 	view.Output = replayOutputSummary{ResultsFailed: view.Output.ResultsFailed}
 	defer func() {
 		view.Progress.Unconfirmed = max(0, int64(view.Progress.Planned)-int64(len(seen)))
+		for i := range view.Sources {
+			p := &view.Sources[i].Progress
+			p.Unconfirmed = max(0, int64(p.Planned)-sourceSeen[view.Sources[i].GatewayID+"/"+view.Sources[i].RecordingID])
+		}
 		view.Output.Incomplete = view.Progress.Unconfirmed > 0 || err != nil
 		view.Output.ResultsFailed = view.Output.ResultsFailed || err != nil
 	}()
@@ -182,6 +201,23 @@ func recoverReplayResults(dir string, view *replayRunView) (err error) {
 			view.Output.add(result)
 		}
 		seen[result.Sequence] = true
+		sourceSeen[result.GatewayID+"/"+result.RecordingID]++
+		for i := range view.Sources {
+			source := &view.Sources[i]
+			if source.GatewayID != result.GatewayID || source.RecordingID != result.RecordingID {
+				continue
+			}
+			if result.SendOffset != nil {
+				source.Progress.Sent++
+			} else {
+				source.Progress.Unsent++
+			}
+			if result.Error != "" && result.Error != "not_sent" {
+				source.Progress.Failed++
+			} else if result.SendOffset != nil {
+				source.Progress.Completed++
+			}
+		}
 		if result.SendOffset != nil {
 			view.Progress.Sent++
 		} else {

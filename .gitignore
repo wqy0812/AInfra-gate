@@ -22,7 +22,8 @@ management-state.json
 management-state.json.lock
 .management-*.json
 .backups/
-# Deployment files stay local and are not tracked by Git.
-/deploy/
+# Deployment artifacts stay local; retain only the Go package-scan boundary.
+/deploy/*
+!/deploy/go.mod
 
 management-state.json.v1-backup-*

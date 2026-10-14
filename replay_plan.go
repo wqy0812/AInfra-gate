@@ -36,19 +36,80 @@ type replayFilter struct {
 // replayRequest is the platform's run request. JSON names follow the design's
 // --option names with hyphens replaced by underscores.
 type replayRequest struct {
-	RunID                 string             `json:"run_id"`
-	Recording             replayRecordingRef `json:"recording"`
-	Filter                replayFilter       `json:"filter"`
-	Target                string             `json:"target"`
-	Mode                  string             `json:"mode"`
-	Concurrency           int                `json:"concurrency,omitempty"`
-	FixOutput             bool               `json:"fix_output,omitempty"`
-	SetModel              string             `json:"set_model,omitempty"`
-	ForceStream           bool               `json:"force_stream,omitempty"`
-	RequestTimeoutSeconds int                `json:"request_timeout_seconds,omitempty"`
+	RunID                 string               `json:"run_id"`
+	Recording             replayRecordingRef   `json:"recording"`
+	Recordings            []replayRecordingRef `json:"recordings,omitempty"`
+	PrepareOnly           bool                 `json:"prepare_only,omitempty"`
+	Filter                replayFilter         `json:"filter"`
+	Target                string               `json:"target"`
+	Mode                  string               `json:"mode"`
+	Concurrency           int                  `json:"concurrency,omitempty"`
+	FixOutput             bool                 `json:"fix_output,omitempty"`
+	SetModel              string               `json:"set_model,omitempty"`
+	ForceStream           bool                 `json:"force_stream,omitempty"`
+	RequestTimeoutSeconds int                  `json:"request_timeout_seconds,omitempty"`
+}
+
+// Omit the legacy selector from multi-source state as well as wire requests.
+func (r replayRequest) MarshalJSON() ([]byte, error) {
+	type plain replayRequest
+	var recording *replayRecordingRef
+	if len(r.Recordings) == 0 {
+		recording = &r.Recording
+	}
+	return json.Marshal(struct {
+		plain
+		Recording *replayRecordingRef `json:"recording,omitempty"`
+	}{plain: plain(r), Recording: recording})
+}
+
+func (r replayRequest) sources() []replayRecordingRef {
+	if len(r.Recordings) != 0 {
+		return r.Recordings
+	}
+	return []replayRecordingRef{r.Recording}
 }
 
 func (r *replayRequest) normalize() error {
+	if len(r.Recordings) > 0 {
+		if len(r.Recordings) > 2 || r.Recording.GatewayID != "" || r.Recording.RecordingID != "" || len(r.Recording.Segments) != 0 {
+			return fmt.Errorf("invalid_recordings")
+		}
+		seen := map[string]bool{}
+		total := 0
+		for _, ref := range r.Recordings {
+			key := ref.GatewayID + "/" + ref.RecordingID
+			if seen[key] {
+				return fmt.Errorf("duplicate_recording")
+			}
+			seen[key] = true
+			one := *r
+			one.Recordings = nil
+			one.Recording = ref
+			if err := one.normalize(); err != nil {
+				return err
+			}
+			total += len(ref.Segments)
+		}
+		if total > replayMaxSegments {
+			return fmt.Errorf("invalid_segments")
+		}
+		if len(r.Recordings) > 1 && r.Mode != "" && r.Mode != "timed" {
+			return fmt.Errorf("overlay_timed_required")
+		}
+		one := *r
+		one.Recordings = nil
+		one.Recording = r.Recordings[0]
+		if err := one.normalize(); err != nil {
+			return err
+		}
+		r.Filter, r.Mode, r.RequestTimeoutSeconds = one.Filter, one.Mode, one.RequestTimeoutSeconds
+		return nil
+	}
+	if r.PrepareOnly && r.Mode != "" && r.Mode != "timed" {
+		return fmt.Errorf("overlay_timed_required")
+	}
+
 	if !validOperationID(r.RunID) || !validOperationID(r.Recording.GatewayID) || !validOperationID(r.Recording.RecordingID) {
 		return fmt.Errorf("invalid_identity")
 	}
@@ -116,6 +177,8 @@ func (r replayRequest) rewritten() []string {
 }
 
 type replayPlanItem struct {
+	GatewayID     string            `json:"gateway_id"`
+	RecordingID   string            `json:"recording_id"`
 	Sequence      int               `json:"sequence"`
 	Segment       string            `json:"segment"`
 	OffsetSeconds float64           `json:"offset_seconds"`
@@ -129,6 +192,8 @@ type replayPlanItem struct {
 }
 
 type replayPlanSegment struct {
+	GatewayID     string    `json:"gateway_id"`
+	RecordingID   string    `json:"recording_id"`
 	Segment       string    `json:"segment"`
 	CoverageStart time.Time `json:"coverage_start"`
 	CoverageEnd   time.Time `json:"coverage_end"`
@@ -204,6 +269,34 @@ func copyableHeaders(headers map[string]string) map[string]string {
 // Segments are concatenated in time order by their covered durations, so
 // contiguous segments keep real time and gaps between distant ones collapse.
 func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
+	if len(req.Recordings) > 0 {
+		merged := &replayPlan{Schema: recordingSchema, RunID: req.RunID, Excluded: map[string]int{}, Rewritten: req.rewritten(), OriginalBytes: len(req.rewritten()) == 0}
+		for _, ref := range req.Recordings {
+			one := req
+			one.Recordings = nil
+			one.Recording = ref
+			plan, err := buildReplayPlan(root, one)
+			if err != nil {
+				return nil, err
+			}
+			merged.items = append(merged.items, plan.items...)
+			merged.Segments = append(merged.Segments, plan.Segments...)
+			merged.DurationSeconds = max(merged.DurationSeconds, plan.DurationSeconds)
+			for k, v := range plan.Excluded {
+				merged.Excluded[k] += v
+			}
+			if len(merged.items) > replayMaxPlanItems {
+				return nil, fmt.Errorf("plan_too_large")
+			}
+		}
+		sort.SliceStable(merged.items, func(i, j int) bool { return merged.items[i].OffsetSeconds < merged.items[j].OffsetSeconds })
+		for i := range merged.items {
+			merged.items[i].Sequence = i + 1
+		}
+		merged.Planned = len(merged.items)
+		return merged, nil
+	}
+
 	session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
 	if err != nil {
 		return nil, err
@@ -235,7 +328,7 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		if coverage < 0 {
 			coverage = 0
 		}
-		entry := replayPlanSegment{Segment: seg.Segment, CoverageStart: seg.CoverageStart, CoverageEnd: seg.CoverageEnd,
+		entry := replayPlanSegment{GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID, Segment: seg.Segment, CoverageStart: seg.CoverageStart, CoverageEnd: seg.CoverageEnd,
 			Partial: seg.Partial, BaseSeconds: base, Recorded: seg.Recorded, Dropped: seg.Dropped, Truncated: seg.Truncated}
 		dir := filepath.Join(root, req.Recording.GatewayID, req.Recording.RecordingID, seg.Segment)
 		items, err := planSegment(dir, seg, base, req, plan)
@@ -316,7 +409,7 @@ func planSegment(dir string, seg replaySegmentStatus, base float64, req replayRe
 		if err := json.Unmarshal(wire.ResponseResult, &meta.ResponseResult); err != nil && req.FixOutput {
 			return nil, fmt.Errorf("fix_output_usage_unknown")
 		}
-		item := replayPlanItem{Segment: seg.Segment, OffsetSeconds: base + line.OffsetSeconds - shift, Directory: recordDir, RequestID: meta.RequestID,
+		item := replayPlanItem{GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID, Segment: seg.Segment, OffsetSeconds: base + line.OffsetSeconds - shift, Directory: recordDir, RequestID: meta.RequestID,
 			Path: meta.Path, Headers: copyableHeaders(meta.Headers), RequestSHA256: meta.RequestSHA256, RequestBytes: meta.RequestBytes}
 		if item.OffsetSeconds < base {
 			item.OffsetSeconds = base
