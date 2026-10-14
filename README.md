@@ -1,11 +1,12 @@
 # aigate：独立切流与功能服务
 
-当前源码提供两个独立二进制；本次拆分尚未部署，源码、构建产物和在线运行版本需要分别核验。
+当前源码提供三个独立二进制；本次拆分尚未部署，源码、构建产物和在线运行版本需要分别核验。
 
 | 服务 | 职责 | 入站认证 | 配置来源 |
 | --- | --- | --- | --- |
 | `aigate-switch` | 请求转发、在线切流、准入、绑定版本、在途计数、测试占用 | 仅控制接口需要 Bearer 密钥与来源 CIDR | code-eval 下发内存绑定快照 |
 | `aigate-proxy` | 模型发现、适配、参数覆盖、SSE、指标、画像、慢请求与异常诊断 | 所有接口无需认证 | 本地 JSON 文件，修改后重启 |
+| `aigate-replay` | 回放录制的业务流量到本地白名单中的功能服务，提供状态与发送进度 | 控制接口需要独立 Bearer 密钥与来源 CIDR | 本地目标白名单文件；run 由平台下发 |
 
 每个功能服务固定连接一个 Router，可脱离切流服务和平台独立运行。多个切流入口可共享同一功能服务。指标与观测文件归属 Router，同时包含经过切流和直接访问的请求；切流不迁移这些数据。平台负责入口、目标登记、绑定及操作记录，功能参数的权威来源是功能服务本地文件。
 
@@ -23,18 +24,20 @@
 
 ## 构建与启动
 
-仅使用 Go 标准库，根包 `aigate` 供两个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
+仅使用 Go 标准库，根包 `aigate` 供三个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
 
 ```sh
 ./scripts/build.sh
 # 等价的独立构建：
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-switch ./cmd/aigate-switch
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-proxy ./cmd/aigate-proxy
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-replay ./cmd/aigate-replay
 ./bin/aigate-switch version
 ./bin/aigate-proxy version
+./bin/aigate-replay version
 ```
 
-`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch` 和 `bin/aigate-proxy`。版本命令分别标识 `control/v3 (v2 test compatibility)` 与 `runtime/v1`；发布身份仍需记录源码 commit 和二进制摘要。
+`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch`、`bin/aigate-proxy` 和 `bin/aigate-replay`。版本命令分别标识 `control/v3 (v2 test compatibility)` 、`runtime/v1` 与 `replay/v1`；发布身份仍需记录源码 commit 和二进制摘要。
 
 功能服务可单独启动，示例连接本机 Router 的 18077 端口：
 
@@ -98,6 +101,10 @@ sum by (backend, model) (
 ```
 
 设计边界与评审检查见 [设计原则](docs/DESIGN_PRINCIPLES.md)。完整接口、状态机、迁移和验收步骤见 [拆分服务操作说明](MANAGEMENT.md)。旧版配置、CLI 和设计方案通过 [Git 历史查阅](docs/archive/README.md)。
+
+### 流量录制与回放
+
+切流服务配置 `--record-root` 后，可由平台按整点、半点定时录制入口看到的原始业务流量（半小时分段、容量上限、可保留段），`aigate-replay` 把录制按原速或固定并发回放到候选功能服务，性能由监控观察。录制与回放只由平台控制，没有命令行入口。见 [流量录制与回放](docs/TRAFFIC_RECORDING.md)。
 
 ### 流停顿方向
 

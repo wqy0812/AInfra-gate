@@ -32,20 +32,31 @@ func RunSwitch(args []string, out, stderr io.Writer) error {
 	allowed := f.String("allowed-cidrs", "127.0.0.0/8,::1/128", "control source CIDRs")
 	forwardTimeout := f.Duration("forward-timeout", 62*time.Minute, "maximum forwarding duration including upload and client writes")
 	shutdown := f.Duration("shutdown-timeout", 62*time.Minute, "graceful shutdown deadline")
+	recordRoot := f.String("record-root", "", "traffic recording directory (empty disables recording)")
+	recordMax := f.Int64("record-max-bytes", recordingDefaultMaxBytes, "traffic recording capacity in bytes")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
-	if f.NArg() != 0 || *shutdown <= 0 || *forwardTimeout <= 0 {
+	if f.NArg() != 0 || *shutdown <= 0 || *forwardTimeout <= 0 || *recordMax <= 0 {
 		return fmt.Errorf("invalid arguments; use platform control API for management")
+	}
+	markKey, err := replayMarkKeyFromEnv()
+	if err != nil {
+		return err
 	}
 	c, err := newSwitchGateway(*id, os.Getenv("AIGATE_CONTROL_KEY"), strings.Split(*allowed, ","), stderr)
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+	if *recordRoot != "" {
+		if err = c.enableRecording(*recordRoot, *recordMax, markKey); err != nil {
+			return err
+		}
+	}
 	c.forwardTimeout = *forwardTimeout
 	servers := []*http.Server{businessHTTPServer(*listen, c), {Addr: *control, Handler: c.ControlHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}}
 	return serveProcess(servers, c.connections, func() { c.mu.Lock(); c.admission = false; c.retired = true; c.cancel(); c.mu.Unlock() }, *shutdown)
@@ -89,11 +100,16 @@ func RunProxy(args []string, out, stderr io.Writer) error {
 		_, err = fmt.Fprintln(out, string(encodeJSON(p.status())))
 		return err
 	}
+	markKey, err := replayMarkKeyFromEnv()
+	if err != nil {
+		return err
+	}
 	p, err := newProxyGateway(cfg, *root, stderr)
 	if err != nil {
 		return err
 	}
 	defer p.Close()
+	p.markKey = markKey
 	servers := []*http.Server{businessHTTPServer(*listen, p)}
 	if *profile != "" {
 		servers = append(servers, &http.Server{Addr: *profile, Handler: p.ObservationHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second})

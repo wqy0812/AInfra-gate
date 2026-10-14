@@ -39,14 +39,14 @@ var profileLiveStages = []string{
 var profileIdleThresholds = []int{5, 15, 30, 60}
 
 type profileLiveRequest struct {
-	start, lastUseful time.Time
-	backend, stage    string
-	terminal          bool
-	unknown           bool
-	nonstream         bool
-	ioOperation       string
-	ioStarted         time.Time
-	readWait          time.Duration
+	start, lastUseful       time.Time
+	backend, stage, traffic string
+	terminal                bool
+	unknown                 bool
+	nonstream               bool
+	ioOperation             string
+	ioStarted               time.Time
+	readWait                time.Duration
 }
 
 func profileFrom(ctx context.Context) *profileRequest {
@@ -123,28 +123,32 @@ func profileLiveMetrics(now time.Time, active map[uint64]profileLiveRequest, bac
 	for _, name := range base {
 		types["aigate_"+name] = "gauge"
 	}
-	tagsFor := func(backend string) string { return profileExtra("", "backend", backend) }
+	tagsFor := func(backend, traffic string) string {
+		return profileExtra(profileTrafficTags(traffic), "backend", backend)
+	}
 	for backend := range backends {
-		tags := tagsFor(backend)
-		for _, name := range []string{base[0], base[1], base[3], base[5], base[7], base[8], base[9]} {
-			values["aigate_"+name+tags] = 0
-		}
-		for _, threshold := range profileIdleThresholds {
-			values["aigate_stream_idle_requests"+profileExtra(tags, "threshold_seconds", strconv.Itoa(threshold))] = 0
-		}
-		for _, stage := range profileLiveStages {
-			values["aigate_inflight_requests_by_stage"+profileExtra(tags, "stage", stage)] = 0
-			values["aigate_inflight_oldest_stage"+profileExtra(tags, "stage", stage)] = 0
+		for _, traffic := range []string{"", "replay"} {
+			tags := tagsFor(backend, traffic)
+			for _, name := range []string{base[0], base[1], base[3], base[5], base[7], base[8], base[9]} {
+				values["aigate_"+name+tags] = 0
+			}
+			for _, threshold := range profileIdleThresholds {
+				values["aigate_stream_idle_requests"+profileExtra(tags, "threshold_seconds", strconv.Itoa(threshold))] = 0
+			}
+			for _, stage := range profileLiveStages {
+				values["aigate_inflight_requests_by_stage"+profileExtra(tags, "stage", stage)] = 0
+				values["aigate_inflight_oldest_stage"+profileExtra(tags, "stage", stage)] = 0
+			}
 		}
 	}
 	oldest := make(map[string]uint64)
 	for seq, live := range active {
-		tags := tagsFor(live.backend)
+		tags := tagsFor(live.backend, live.traffic)
 		age := max(0, now.Sub(live.start).Seconds())
 		values["aigate_inflight_requests_by_stage"+profileExtra(tags, "stage", live.stage)]++
-		previous, found := oldest[live.backend]
+		previous, found := oldest[tags]
 		if !found || live.start.Before(active[previous].start) || (live.start.Equal(active[previous].start) && seq < previous) {
-			oldest[live.backend] = seq
+			oldest[tags] = seq
 		}
 		if !live.nonstream && live.ioOperation == "write" {
 			key := "aigate_stream_write_active_max_seconds" + tags
@@ -176,8 +180,8 @@ func profileLiveMetrics(now time.Time, active map[uint64]profileLiveRequest, bac
 			}
 		}
 	}
-	for backend, seq := range oldest {
-		live, tags := active[seq], tagsFor(backend)
+	for tags, seq := range oldest {
+		live := active[seq]
 		values["aigate_inflight_oldest_age_seconds"+tags] = max(0, now.Sub(live.start).Seconds())
 		values["aigate_inflight_oldest_stage"+profileExtra(tags, "stage", live.stage)] = 1
 	}

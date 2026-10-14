@@ -3,7 +3,7 @@
   "info": {
     "title": "aigate switch and independent proxy",
     "version": "3.0.0",
-    "description": "Current split source contract; deployment is separately verified. Only switch control APIs require authentication. Proxy policy is a local immutable file; there is no remote configuration write API. Path servers identify the owning listener."
+    "description": "Current split source contract; deployment is separately verified. Only switch control APIs and the replay control service require authentication, each with its own key. Proxy policy is a local immutable file; there is no remote configuration write API. Path servers identify the owning listener."
   },
   "paths": {
     "/health": {
@@ -832,6 +832,225 @@
           }
         }
       }
+    },
+    "/control/replay/v1/status": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18085",
+          "description": "aigate-replay authenticated control listener (platform engine only)"
+        }
+      ],
+      "get": {
+        "security": [
+          {
+            "replayBearer": []
+          }
+        ],
+        "summary": "Replay service identity, target names and the active run",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/control/replay/v1/recordings": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18085",
+          "description": "aigate-replay authenticated control listener (platform engine only)"
+        }
+      ],
+      "get": {
+        "security": [
+          {
+            "replayBearer": []
+          }
+        ],
+        "summary": "List a gateway's recordings and segment metadata (no request or response bytes)",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "gateway_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,128}$"
+            }
+          }
+        ]
+      }
+    },
+    "/control/replay/v1/runs": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18085",
+          "description": "aigate-replay authenticated control listener (platform engine only)"
+        }
+      ],
+      "post": {
+        "security": [
+          {
+            "replayBearer": []
+          }
+        ],
+        "summary": "Start a replay run",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayRun"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReplayRunRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control/replay/v1/runs/{id}": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18085",
+          "description": "aigate-replay authenticated control listener (platform engine only)"
+        }
+      ],
+      "get": {
+        "security": [
+          {
+            "replayBearer": []
+          }
+        ],
+        "summary": "Read run state, progress and timestamps",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayRun"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,128}$"
+            }
+          }
+        ]
+      }
+    },
+    "/control/replay/v1/runs/{id}/stop": {
+      "servers": [
+        {
+          "url": "http://127.0.0.1:18085",
+          "description": "aigate-replay authenticated control listener (platform engine only)"
+        }
+      ],
+      "post": {
+        "security": [
+          {
+            "replayBearer": []
+          }
+        ],
+        "summary": "Stop new sends and drain already dispatched requests",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReplayRun"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,128}$"
+            }
+          }
+        ],
+        "description": "A valid unknown run ID is durably stopped before acknowledging. Delayed starts return stopped with start_cancelled=true and send no requests, including after restart, within the 200-run retention window."
+      }
     }
   },
   "components": {
@@ -840,6 +1059,11 @@
         "type": "http",
         "scheme": "bearer",
         "description": "AIGATE_CONTROL_KEY (minimum 32 bytes) plus actual TCP source CIDR allowlist; switch control APIs only."
+      },
+      "replayBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "AIGATE_REPLAY_CONTROL_KEY (minimum 32 bytes, distinct from the switch key) plus actual TCP source CIDR allowlist; replay control service only."
       }
     },
     "schemas": {
@@ -1032,6 +1256,13 @@
               "ended",
               "unknown"
             ]
+          },
+          "traffic": {
+            "type": "string",
+            "enum": [
+              "replay"
+            ],
+            "description": "Present only for requests with a verified replay mark"
           }
         }
       },
@@ -1171,12 +1402,17 @@
               "retire",
               "test-acquire",
               "test-release",
-              "test-status"
+              "test-status",
+              "record-start",
+              "record-stop",
+              "record-status",
+              "record-pin",
+              "record-unpin"
             ]
           },
           "payload": {
             "type": "object",
-            "description": "Action-specific: prepare=SwitchSnapshot; test-*=TestIdentity; activate={admission:boolean}; validate={rounds?,step_seconds?,timeout_seconds?,max_tokens?}; other actions={}. Unknown fields are rejected.",
+            "description": "Action-specific: prepare=SwitchSnapshot; test-*=TestIdentity; activate={admission:boolean}; validate={rounds?,step_seconds?,timeout_seconds?,max_tokens?}; record-start=RecordingStart; record-stop/record-status={recording_id}; record-pin/record-unpin={recording_id,segment}; other actions={}. Unknown fields are rejected.",
             "additionalProperties": true
           }
         },
@@ -1267,9 +1503,12 @@
           "finished_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "recording": {
+            "$ref": "#/components/schemas/RecordingSummary"
           }
         },
-        "description": "HTTP 200 is a receipt, not proof of completion. Poll running validation by its original sequence; failed receipts contain error."
+        "description": "HTTP 200 is a receipt, not proof of completion. Poll running validation by its original sequence; failed receipts contain error. record-start and record-pin/unpin complete asynchronously (running then completed/failed); record-stop and record-status return the session summary."
       },
       "ControlStatus": {
         "type": "object",
@@ -1343,6 +1582,428 @@
           },
           "business_read_header_timeout_seconds": {
             "type": "number"
+          },
+          "recording": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RecordingStatus"
+              }
+            ],
+            "nullable": true,
+            "description": "null when the switch runs without --record-root"
+          }
+        }
+      },
+      "RecordingStart": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "recording_id",
+          "start_at",
+          "end_at"
+        ],
+        "description": "A recording window. A start_at already past while end_at is ahead starts sampling immediately (used to re-send the rest of a window after a switch restart). One sampling or pending session per switch; a pending session may queue only behind a recording one that ends no later than its start.",
+        "properties": {
+          "recording_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "schedule_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC, on the hour or half hour"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC, on the hour or half hour"
+          },
+          "sample_one_in": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "default": 1
+          },
+          "response": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "full"
+            ],
+            "default": "summary",
+            "description": "summary keeps the last 8 KiB of each response; full keeps whole responses for troubleshooting"
+          },
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Session byte limit, at most --record-max-bytes (the default)"
+          }
+        }
+      },
+      "RecordingSummary": {
+        "type": "object",
+        "properties": {
+          "recording_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "schedule_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "preparing",
+              "scheduled",
+              "recording",
+              "draining",
+              "ended"
+            ]
+          },
+          "end_reason": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "stopped",
+              "retired",
+              "process_exit",
+              "max_bytes",
+              "capacity",
+              "disk_failed",
+              "end_unknown"
+            ]
+          },
+          "start_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC, on the hour or half hour"
+          },
+          "end_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC, on the hour or half hour"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stopped_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sample_one_in": {
+            "type": "integer"
+          },
+          "response": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "requests": {
+            "type": "integer"
+          },
+          "recorded": {
+            "type": "integer"
+          },
+          "dropped": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "integer"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "inflight": {
+            "type": "integer"
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "segment": {
+                  "type": "string",
+                  "pattern": "^[0-9]{8}T[0-9]{2}(00|30)$",
+                  "description": "UTC half-hour segment start, e.g. 20261012T1830"
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "open",
+                    "sealed"
+                  ]
+                },
+                "coverage_start": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "coverage_end": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "requests": {
+                  "type": "integer"
+                },
+                "recorded": {
+                  "type": "integer"
+                },
+                "dropped": {
+                  "type": "integer"
+                },
+                "truncated": {
+                  "type": "integer"
+                },
+                "bytes": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "pinned": {
+                  "type": "boolean"
+                },
+                "evicted": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      },
+      "RecordingStatus": {
+        "type": "object",
+        "properties": {
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "disk_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "pinned_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "active_records": {
+            "type": "integer"
+          },
+          "dropped": {
+            "type": "integer"
+          },
+          "write_failures": {
+            "type": "integer"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecordingSummary"
+            },
+            "description": "Sessions not yet ended"
+          }
+        }
+      },
+      "ReplayRunRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "recording",
+          "target",
+          "mode"
+        ],
+        "description": "Idempotent by run_id. Only one run at a time. No speed-up, copies or ramps: timed keeps the recorded arrival times, concurrency uses a fixed number of senders.",
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "recording": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "gateway_id",
+              "recording_id",
+              "segments"
+            ],
+            "properties": {
+              "gateway_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "recording_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,128}$"
+              },
+              "segments": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 96,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[0-9]{8}T[0-9]{2}(00|30)$",
+                  "description": "UTC half-hour segment start, e.g. 20261012T1830"
+                }
+              }
+            }
+          },
+          "filter": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "2xx",
+                  "all"
+                ],
+                "default": "2xx"
+              },
+              "path": {
+                "type": "string",
+                "enum": [
+                  "/v1/chat/completions"
+                ]
+              }
+            }
+          },
+          "target": {
+            "type": "string",
+            "description": "A name from the replay service targets file; arbitrary URLs are rejected. The name must equal the target proxy's router_id (target_router_mismatch otherwise)"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "timed",
+              "concurrency"
+            ]
+          },
+          "concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1024,
+            "description": "concurrency mode only"
+          },
+          "max_inflight": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096,
+            "default": 512,
+            "description": "timed mode only; reaching it records send delay"
+          },
+          "fix_output": {
+            "type": "boolean",
+            "description": "Set max_tokens, min_tokens and ignore_eos to the recorded completion tokens"
+          },
+          "set_model": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "set_max_tokens": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "force_stream": {
+            "type": "boolean"
+          },
+          "request_timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "default": 3720
+          }
+        }
+      },
+      "ReplayRun": {
+        "type": "object",
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "planning",
+              "running",
+              "stopping",
+              "completed",
+              "stopped",
+              "failed",
+              "end_unknown"
+            ]
+          },
+          "error": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ReplayRunRequest"
+          },
+          "target": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "progress": {
+            "type": "object",
+            "properties": {
+              "planned": {
+                "type": "integer"
+              },
+              "sent": {
+                "type": "integer"
+              },
+              "completed": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "integer"
+              },
+              "inflight": {
+                "type": "integer"
+              },
+              "elapsed_seconds": {
+                "type": "number"
+              }
+            }
+          },
+          "start_cancelled": {
+            "type": "boolean",
+            "description": "The stop arrived before start. The request is omitted and no traffic was sent."
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Most recent request preparation, transport or HTTP error."
+          },
+          "max_send_delay_seconds": {
+            "type": "number",
+            "description": "Maximum delay from scheduled send time to dispatch."
           }
         }
       }

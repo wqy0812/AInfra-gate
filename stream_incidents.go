@@ -42,6 +42,7 @@ type streamIncident struct {
 	BootID           string     `json:"boot_id"`
 	Router           string     `json:"router"`
 	Model            string     `json:"model"`
+	Traffic          string     `json:"traffic,omitempty"`
 	BindingRevision  uint64     `json:"binding_revision"`
 	QuestionHead     string     `json:"question_head"`
 	QuestionTail     string     `json:"question_tail"`

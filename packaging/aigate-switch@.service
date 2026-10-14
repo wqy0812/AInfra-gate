@@ -10,8 +10,12 @@ Group=aigate-switch
 Environment="AIGATE_SWITCH_LISTEN=127.0.0.1:10015"
 Environment="AIGATE_CONTROL_LISTEN=127.0.0.1:18083"
 Environment="AIGATE_ALLOWED_CIDRS=127.0.0.0/8,::1/128"
+Environment="AIGATE_RECORD_ROOT="
+Environment="AIGATE_RECORD_MAX_BYTES=53687091200"
+StateDirectory=aigate-record
+StateDirectoryMode=0700
 EnvironmentFile=/etc/aigate/switch-%i.env
-ExecStart=/usr/local/bin/aigate-switch serve --id %i --listen ${AIGATE_SWITCH_LISTEN} --control-listen ${AIGATE_CONTROL_LISTEN} --allowed-cidrs ${AIGATE_ALLOWED_CIDRS} --forward-timeout 62m --shutdown-timeout 62m
+ExecStart=/usr/local/bin/aigate-switch serve --id %i --listen ${AIGATE_SWITCH_LISTEN} --control-listen ${AIGATE_CONTROL_LISTEN} --allowed-cidrs ${AIGATE_ALLOWED_CIDRS} --record-root ${AIGATE_RECORD_ROOT} --record-max-bytes ${AIGATE_RECORD_MAX_BYTES} --forward-timeout 62m --shutdown-timeout 62m
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=63min
