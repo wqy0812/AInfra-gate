@@ -1,20 +1,24 @@
 # 当前部署身份
 
-2026-10-15 04:11（北京时间）完成双录制叠加发布，通过 SSH MCP 更新 A3-gate、xpu1、dcu1 的 replay 至 `b460fcca67417a73e1a1a045fc2ce2bc21a04e32`。Go 1.27.1，linux/amd64，CGO_ENABLED=0，离线 vendor 构建，vcs.modified=false；三台实际运行进程的二进制摘要逐一核验。switch/proxy 保持当日 02:57 发布的 `0f6ff9a5f46038ea1840f3209e413169887d2f25`，本次未替换。
+2026-10-16 05:23（北京时间）完成完整录制与原请求回放发布，通过 SSH MCP 更新 A3-gate、xpu1、dcu1 的 switch/replay 至 `6f28dadbb121e260b138c34d6d65140090e91817`。Go 1.27.1，linux/amd64，CGO_ENABLED=0，离线 vendor 构建，vcs.modified=false；三台实际运行进程的二进制摘要逐一核验。proxy 沿用 `0f6ff9a5f46038ea1840f3209e413169887d2f25`，进程 PID、参数和二进制摘要均与发布前一致。
 
 | 当前二进制 | 运行 SHA-256 |
 | --- | --- |
-| aigate-switch（沿用上次发布） | `56a6994202f3ce36a07871179501be95e3de00cf233564bfd8b6324054778400` |
-| aigate-proxy（沿用上次发布） | `ec987fbe1e2ac6f8428e66b367a0111d48d95acf67a8e007422fb8aec918fa8b` |
-| aigate-replay（本次更新） | `c56a90e3e54bfc69b034ee2b00f198271e51087c019de6c3d6f24f7831c9ba96` |
+| aigate-switch（本次更新） | `d69e3c2c9ec6517e68eda2c757f198a57550be9fdbc7f92bd72f34dd738870d9` |
+| aigate-proxy（沿用） | `ec987fbe1e2ac6f8428e66b367a0111d48d95acf67a8e007422fb8aec918fa8b` |
+| aigate-replay（本次更新） | `1bf85c7777fd1a8e3b6e0b5018ccc18dba378e3a8fe3ae2290ef17ae522a3419` |
 
-三处回放服务均返回 `recording-v2-timed-unlimited-output-verified` 与 `recording-overlay-sync-v1`。致命故障立即公布 stopping/error，平台停止同组另一侧新发送，已发请求继续收尾；启动相关容差放宽至 10 秒。窗口前后均无活动回放，未产生真实模型负载。平台认证访问与无凭据 403、目标白名单、启动参数、环境配置摘要和数据路径均已核验；两条每天 14:00–16:00 的录制规则保持不变。
+三处回放服务均返回 `recording-original-request-v1` 与 `recording-overlay-sync-v1`。新录制从头保存完整请求和响应，资源不足时明确截断或丢弃；回放全部完整请求，保留原响应方式和输出参数，仅由平台自动填写目标唯一模型。平台认证访问成功，无凭据访问为 403，三目标白名单与原配置一致。
 
-A3 replay 继续使用 namespace `a3-delivery` 下的直接 nerdctl 容器 `a3-aigate-replay`，新容器 ID `2a3fef236b4b97ac924d391b5b8c131ad5dd7674d694587b7db73b5cb85cba97`，镜像 config ID 仍为 `sha256:5441cfcb8dab40c8058ab59ef724427facaba19ef3d7a40c53386852c670165c`。仅二进制只读挂载换到本次发布目录；UID/GID、资源限制、配置与数据挂载、只读根文件系统、restart=no 均保持，无 systemd 服务。启动脚本为本次目录下 `start-aigate-replay.sh`。XPU/DCU 沿用 `aigate-replay.service`，仅替换 ExecStart 二进制路径。旧容器及受限配置快照保留作证据，未回退。
+A3 switch 沿用 systemd 管理的 nerdctl 容器；A3 replay 继续使用 namespace `a3-delivery` 下的直接容器 `a3-aigate-replay`，保持 restart=no、无 replay systemd unit。两者环境、UID/GID、资源限制、数据及配置挂载和根文件系统权限与发布前一致。XPU switch 沿用 Kubernetes Recreate，实际模板与发布补丁一致，1/1 ready；XPU/DCU replay 与 DCU switch 沿用原 systemd unit，仅更新二进制路径。旧容器、镜像和受限配置快照保留作证据。
 
-业务入口、管理入口、Router 绑定与 revision/admission 均保持窗口前状态：DCU/XPU revision=45/24、admission=true；**A3 沿用前次原上游 `122.209.21.24:8077` 拒绝连接后保留的 Router 维护，revision=38、admission=false。本次不代表 A3 业务入口恢复。** 无未结束控制操作或资源锁；平台全局维护已关闭，未改动模型后端。
+发布前无活动录制或回放；DCU 旧 revision=46 仍有一个流式请求，先更新其他组件，待该请求自然结束、全部代际计数为零后才替换 DCU switch，没有强制终止请求。平台在新 boot 上按原意图恢复绑定：DCU/XPU → DCU Router，A3 → A3 Router，Router 版本、运行配置版本及原准入不变；绑定 revision 因恢复递增为 DCU=48、XPU=28、A3=39。**A3 仍保留发布前 Router 维护和 admission=false，本次不代表原上游或 A3 业务入口恢复。** DCU/XPU admission=true，平台全局 maintenance=false，无未结束控制操作或资源锁。
 
-新增发布目录：A3-gate/xpu1 `/var/lib/ai-gate/releases/overlay-sync-20261015/`，dcu1 `/data4/aigate/releases/overlay-sync-20261015/`，包含 `bin/` 和受限 `private/`。每台 `verification.json` 记录运行身份；本地汇总在 `code-eval/deploy/evidence/overlay-sync-20261015/`。Go 回放 race 测试与 vet 通过；配套平台源码 `5e104cff19515301e47336c1338fd2539e1d3650`，实际镜像与 Chrome 两档视口验收见 code-eval 发布索引。真实双录制负载未执行；故障传播和 10 秒边界由本地回归验证。
+两条 DCU 录制规则（每天 14:00–16:00 与 09:30–11:00）、两条历史录制、三条历史回放的数据库摘要全部保持。没有执行历史规则迁移、转换录制格式或清理数据；旧 schema-2 录制的完整请求仍可回放，缺失的历史响应前缀无法补回。
+
+新增发布目录：A3-gate/xpu1 `/var/lib/ai-gate/releases/original-replay-20261016/`，dcu1 `/data4/aigate/releases/original-replay-20261016/`，含 `bin/` 和受限 `private/`。各主机 `verification.json` 记录实际进程身份，本地汇总在 `code-eval/deploy/evidence/original-replay-20261016/`。配套平台运行源码 `9fe0fd5bcfa95a32d201d932ee3681a3cc5dcdf3`，镜像和页面验收见 code-eval 发布索引。
+
+Go 相关回归、race 与 vet 通过，平台相关 Python 80 项、前端 JS 11 项和两档合成浏览器回归通过。线上三来源、桌面 Chrome 1280×720 与 iPhone 390×844 触控模拟六组检查通过。此次未发起真实模型回放；完整响应采集、原请求发送及恢复故障场景由本地合成回归覆盖。monitoring、模型后端和 proxy 均未更新。
 
 ## 上次部署及 A3 replay 生命周期背景
 
