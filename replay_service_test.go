@@ -75,7 +75,7 @@ func (f *replayFixture) wait(t *testing.T, id string) replayRunView {
 	return replayRunView{}
 }
 
-// recordSample records n streaming chat requests and one non-2xx answer.
+// recordSample records n streaming chat requests.
 func recordSample(t *testing.T, f *recordingFixture, id string, n int) recordingSummary {
 	t.Helper()
 	now := time.Now()
@@ -87,8 +87,6 @@ func recordSample(t *testing.T, f *recordingFixture, id string, n int) recording
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	f.router.failNext.Store(1)
-	postChat(t, f.switch_.URL, `{"messages":[{"role":"user","content":"fails"}],"stream":true}`, nil)
 	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": id})
 	return waitRecordingEnded(t, f.c, id)
 }
@@ -116,7 +114,7 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 	before := len(rec.router.bodies)
 	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	segment := summary.Segments[0].Segment
-	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "timed"}
+	request := map[string]any{"run_id": "run-1", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-a", "segments": []string{segment}}, "filter": map[string]any{"status": "all"}, "target": "r1", "mode": "timed"}
 	code, out := f.call(t, "POST", "/control/replay/v1/runs", request)
 	if code != 200 {
 		t.Fatal(code, out)
@@ -144,13 +142,13 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 	}
 }
 
-func TestReplayConcurrencyWithEqualWorkRewrite(t *testing.T) {
+func TestReplayConcurrencyPreservesOutputParameters(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-b", 4)
 	before := len(rec.router.bodies)
 	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	request := map[string]any{"run_id": "run-c", "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-b", "segments": []string{summary.Segments[0].Segment}},
-		"filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "concurrency", "concurrency": 2, "fix_output": true, "set_model": "token-model"}
+		"filter": map[string]any{"status": "all"}, "target": "r1", "mode": "concurrency", "concurrency": 2, "set_model": "token-model"}
 	if code, out := f.call(t, "POST", "/control/replay/v1/runs", request); code != 200 {
 		t.Fatal(code, out)
 	}
@@ -163,8 +161,8 @@ func TestReplayConcurrencyWithEqualWorkRewrite(t *testing.T) {
 	for _, body := range rec.router.bodies[before:] {
 		var fields map[string]json.RawMessage
 		json.Unmarshal(body, &fields)
-		if string(fields["ignore_eos"]) != "true" || len(fields["min_tokens"]) == 0 || string(fields["max_tokens"]) != string(fields["min_tokens"]) {
-			t.Fatalf("rewrite not forwarded: %s", body)
+		if len(fields["ignore_eos"]) != 0 || len(fields["min_tokens"]) != 0 || string(fields["stream"]) != "true" {
+			t.Fatalf("output parameters changed: %s", body)
 		}
 	}
 }
@@ -188,15 +186,18 @@ func TestReplayControlValidationAndLifecycle(t *testing.T) {
 		t.Fatal(code, out)
 	}
 	base := func(id string) map[string]any {
-		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "filter": map[string]any{"status": "2xx"}, "target": "r1", "mode": "timed"}
+		return map[string]any{"run_id": id, "recording": map[string]any{"gateway_id": "g1", "recording_id": "rec-v", "segments": []string{segment}}, "filter": map[string]any{"status": "all"}, "target": "r1", "mode": "timed"}
 	}
 	for name, mutate := range map[string]func(map[string]any){
-		"retired_inflight": func(m map[string]any) { m["max_inflight"] = 0 },
-		"retired_output":   func(m map[string]any) { m["set_max_tokens"] = nil },
-		"unknown_target":   func(m map[string]any) { m["target"] = "http://127.0.0.1:1" },
-		"invalid_mode":     func(m map[string]any) { m["mode"] = "speed" },
-		"invalid_filter":   func(m map[string]any) { m["filter"] = map[string]any{"path": "/v1/models"} },
-		"invalid_rewrite":  func(m map[string]any) { m["fix_output"] = true; m["set_max_tokens"] = 5 },
+		"retired_inflight":       func(m map[string]any) { m["max_inflight"] = 0 },
+		"retired_fix_output":     func(m map[string]any) { m["fix_output"] = false },
+		"retired_force_stream":   func(m map[string]any) { m["force_stream"] = false },
+		"retired_success_filter": func(m map[string]any) { m["filter"] = map[string]any{"status": "2xx"} },
+		"retired_output":         func(m map[string]any) { m["set_max_tokens"] = nil },
+		"unknown_target":         func(m map[string]any) { m["target"] = "http://127.0.0.1:1" },
+		"invalid_mode":           func(m map[string]any) { m["mode"] = "speed" },
+		"invalid_filter":         func(m map[string]any) { m["filter"] = map[string]any{"path": "/v1/models"} },
+		"invalid_rewrite":        func(m map[string]any) { m["fix_output"] = true; m["set_max_tokens"] = 5 },
 	} {
 		m := base("bad")
 		mutate(m)

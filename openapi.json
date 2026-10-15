@@ -849,7 +849,7 @@
         "summary": "Replay service identity, target names and the active run",
         "responses": {
           "200": {
-            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-v2-timed-unlimited-output-verified.",
+            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-original-request-v1.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1221,7 +1221,7 @@
         "summary": "Authenticated clock sample",
         "responses": {
           "200": {
-            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-v2-timed-unlimited-output-verified.",
+            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-original-request-v1.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1799,7 +1799,7 @@
           "start_at",
           "end_at"
         ],
-        "description": "A recording window. A start_at already past while end_at is ahead starts sampling immediately (used to re-send the rest of a window after a switch restart). One sampling or pending session per switch; a pending session may queue only behind a recording one that ends no later than its start. Schema 2 always captures the complete bounded request, the last 8 KiB response tail and structured usage. The retired response field is rejected.",
+        "description": "A recording window. A start_at already past while end_at is ahead starts sampling immediately (used to re-send the rest of a window after a switch restart). One sampling or pending session per switch; a pending session may queue only behind a recording one that ends no later than its start. Schema 2 captures the complete request and response from the beginning, subject to the shared memory budget, and structured usage. Memory exhaustion explicitly marks truncated capture. The retired response field is rejected.",
         "properties": {
           "recording_id": {
             "type": "string",
@@ -2010,7 +2010,7 @@
           "run_id",
           "target"
         ],
-        "description": "Schema-2 recordings only. timed sends at original offsets without an inflight cap; nonblocking body-budget exhaustion stops new dispatch and fails the run after drain. Retired max_inflight/set_max_tokens fields are rejected.",
+        "description": "Schema-2 recordings. Replay all complete requests regardless of original outcome, preserving stream and output controls. timed uses original offsets without an inflight cap. Retired fix_output/force_stream/max_inflight/set_max_tokens fields are rejected.",
         "properties": {
           "run_id": {
             "type": "string",
@@ -2026,7 +2026,6 @@
               "status": {
                 "type": "string",
                 "enum": [
-                  "2xx",
                   "all"
                 ],
                 "default": "all"
@@ -2057,16 +2056,10 @@
             "maximum": 1024,
             "description": "concurrency mode only"
           },
-          "fix_output": {
-            "type": "boolean",
-            "description": "Use schema-2 structured completion_tokens R>0 as T=R for a single candidate. Override max_tokens/min_tokens/ignore_eos; delete max_completion_tokens/stop/stop_token_ids. Merge include_usage=true for streaming. No target preflight, budget shrinking, retries or continuations."
-          },
           "set_model": {
             "type": "string",
-            "maxLength": 256
-          },
-          "force_stream": {
-            "type": "boolean"
+            "maxLength": 256,
+            "description": "Target model discovered and filled by the platform. All response and output controls remain unchanged."
           },
           "request_timeout_seconds": {
             "type": "integer",

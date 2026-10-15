@@ -2,6 +2,8 @@
 
 本文描述当前源码行为；2026-10-15 的部署身份、旧录制定向清理及 A3 上游恢复阻塞见[部署记录](DEPLOYMENT.md)。录制与回放只由 code eval 平台控制，主机上没有录制或回放的命令行入口。一套平台管理多个 aigate。回放负责发送负载，操作者查看中间稳定时段的监控；头尾完整性不作为整次回放的有效性门槛。
 
+2026-10-16 源码变更：默认完整录制、按原请求回放及平台自动填写模型已实现，尚未发布；线上身份仍以部署记录为准。
+
 ## 录制（aigate-switch）
 
 `aigate-switch serve --record-root <目录>` 启用录制能力，`--record-max-bytes` 为总容量（默认 50 GiB）；不传 `--record-root` 时录制关闭，`/control/v3/status` 的 `recording` 为 `null`。启用后切流服务只写 `<record-root>/<gateway_id>/`，该目录必须为 0700 并由进程独占加锁。请求线程只做内存拷贝和入队，文件创建、写入、封段、容量淘汰全部由一个 worker 完成；准入锁内不做磁盘 I/O，录制故障不影响转发和响应字节。
@@ -34,7 +36,7 @@
     pinned                  可选，保留标记
     r-<request_id>/
       request.json          客户端发来的原始正文字节
-      response.tail         响应最后 8 KiB（固定环形缓冲）
+      response.body         从头保存完整响应（JSON 或 SSE 原始字节）
       timeline.jsonl        到达、上传完成、响应头、每次 Write/Flush、结束
       meta.json             入口、快照、header 白名单、长度与 SHA-256、采集状态、response_result
 ```
@@ -51,7 +53,7 @@
 | 总容量 | `--record-max-bytes`，从最旧的已封尾、未保留段整段淘汰；当前段不删，只剩当前段仍超限则结束会话（`capacity`） |
 | 收尾 | 进程退出时最多 5 秒写完队列，未完成部分标 `end_unknown` |
 
-内存不足时只停止该请求的正文采集，记为 `truncated`；元数据都无法入队时计入 `dropped`；磁盘写失败结束所有会话（`disk_failed`）。保留丢弃与截断计数供排查；回放发送可用记录，不因此判定整次回放无效。磁盘状态发布失败时停止采样并保留会话重试，只有结束状态写入成功才移出活动列表。会话所有段淘汰后同步清理其目录和 session.json，避免元数据无限积累。
+请求与响应缓冲按实际分配容量计费，扩容时同时计入新旧缓冲。内存不足时停止对应正文的后续采集，记为 `truncated`；元数据都无法入队时计入 `dropped`；磁盘写失败结束所有会话（`disk_failed`）。保留丢弃与截断计数供排查；回放发送可用记录，不因此判定整次回放无效。磁盘状态发布失败时停止采样并保留会话重试，只有结束状态写入成功才移出活动列表。会话所有段淘汰后同步清理其目录和 session.json，避免元数据无限积累。
 
 ## 回放标记
 
@@ -73,29 +75,29 @@
 | `GET /control/replay/v1/runs/{id}` | 状态、进度、起止时间与最近错误 |
 | `POST /control/replay/v1/runs/{id}/stop` | 停止新发送，已发请求继续收尾，状态 `stopped`；尚未开始的 ID 先持久化 `start_cancelled=true`，阻止迟到的启动请求（同 run 保留期限） |
 
-请求字段见 `openapi.json` 的 `ReplayRunRequest`。默认 `mode=timed`、`filter.status=all`，回放 `/v1/chat/completions` 的正文与采集完整请求（包含 HTTP 失败），排除入口拒收。仅支持 schema 2；旧格式明确返回 `recording_schema_unsupported_rerecord`，不读取旧响应文件。段按覆盖时长拼接，筛选后仍保留原偏移。`concurrency` 必填 1～1024；`timed` 没有在途上限。旧 `max_inflight`、`set_max_tokens` 和录制 `response` 字段均被严格拒绝。
+请求字段见 `openapi.json` 的 `ReplayRunRequest`。默认 `mode=timed`、`filter.status=all`，回放 `/v1/chat/completions` 的完整请求正文，包含 HTTP 失败、取消及有完整正文的入口拒收记录；响应采集截断或 usage 缺失不排除请求。正文未读完、截断或损坏时明确记录排除或校验失败。`filter.status` 只接受 `all`，不提供仅成功筛选。仅支持 schema 2；旧格式明确返回 `recording_schema_unsupported_rerecord`，不读取旧响应文件。段按覆盖时长拼接，筛选后仍保留原偏移。`concurrency` 必填 1～1024；`timed` 没有在途上限。旧 `fix_output`、`force_stream`、`max_inflight`、`set_max_tokens` 和录制 `response` 字段均被严格拒绝。
 
 `timed` 使用单调时钟，到期即派发，磁盘、校验、改写和网络在独立发送路径执行。不存在活动连接数限制；空闲连接池不是并发上限。正文预算仍为 512 MiB，按 `6×原始大小+1 MiB` 保守预留，覆盖读取、改写及上传，在 transport 关闭上传并释放正文后归还。原速派发先非阻塞申请，预算不足立即以 `replay_resource_exhausted` 停止新派发，等待已经发送的请求收尾后失败；固定并发使用可被停止打断的预算等待。两者都不取消已发请求，也不自动重试。
 
-未选择改写时保留原始请求字节、stream 和全部输出控制参数。可选改写为替换模型、强制流式、按录制输出长度生成；任何改写都列在 `rewritten` 中。等输出只从 `meta.json.response_result.usage.completion_tokens` 读取 R，要求已知正整数，目标 T=R；缺失或零报 `fix_output_usage_unknown`，`n` 缺省或为 1，其余报 `fix_output_single_candidate_required`。本地计划检查请求完整性和单候选，不查询目标 tokenizer、上下文容量或参数能力。
+平台从目标 proxy 的 `/v1/models` 自动获取唯一模型名，创建意图时固定为 `set_model`，用户不再填写。查询使用目标 Router/config 校验头；无法获取模型时拒绝新建回放，不创建任务或发送负载。同编号重复提交沿用已保存模型，不重新查询或修改已接受意图。两份叠加录制共用同一模型快照。
 
-等输出设置 `max_tokens=T`、`min_tokens=T`、`ignore_eos=true`，删除 `max_completion_tokens`、`stop`、`stop_token_ids`，保留其他输入及采样参数。最终流式请求合并 `stream_options.include_usage=true` 并保留其他选项；原 `stream_options` 非对象时该请求失败。目标拒绝参数、上下文超限、模型错误按普通请求失败记录，后续请求继续；输出偏短不续写、不补发、不降参重试。R/A 都可能包含思考 token，跨模型 token 计数不保证分词或计算成本等价。
+回放只替换 `model`，在 `rewritten` 中记录 `set_model`；`stream`（含缺省）、`stream_options`、`max_tokens`、`max_completion_tokens`、`min_tokens`、`ignore_eos`、`stop`、`stop_token_ids` 和其他字段均保留。没有模型改写时保留整个请求的原始字节。无效 JSON 或非对象正文无法填写模型时也按原字节发送，逐请求结果不标记模型改写。不使用录制输出长度设定生成预算，不限制 n 为 1，不注入 usage 选项。目标参数、上下文或模型错误正常记录，后续请求继续；不续写、补发或降参重试。
 
 ### 响应观察与核验
 
-录制和等输出回放共享有界观察器：64 KiB 输入缓冲、最大 JSON 深度 128、最多 128 个结束原因（每个最多 256 字节）和 4 KiB 错误摘要。SSE 增量解析跨块、CRLF、多行 data、最终 usage 与 `[DONE]`；JSON 跳过长字符串，均不累计完整回答。多个有效 usage 使用最后一个，`usage_known` 表示 completion_tokens 存在；0 与未知分开。只保存实际存在的 prompt/completion/total token 字段。压缩或协议错误标记解析失败，不影响业务转发；usage 已收到而后传输失败时同时保存两者。录制不改写在线请求来索要 usage。非等输出回放仍直接消费响应。
+录制和回放共享有界观察器：64 KiB 输入缓冲、最大 JSON 深度 128、最多 128 个结束原因（每个最多 256 字节）和 4 KiB 错误摘要。SSE 增量解析跨块、CRLF、多行 data、最终 usage 与 `[DONE]`；JSON 跳过长字符串，观察器自身不累计完整回答（录制正文由独立缓冲完整保存）。多个有效 usage 使用最后一个，`usage_known` 表示 completion_tokens 存在；0 与未知分开。只保存实际存在的 prompt/completion/total token 字段。压缩或协议错误标记解析失败，不影响业务转发；usage 已收到而后传输失败时同时保存两者。录制不改写在线请求来索要 usage。回放按原请求消费 JSON/SSE，响应观察仅提取诊断，不改写请求。
 
-`results.jsonl` 0600 串行写入，每条包含计划序号、原/本次请求 ID、计划/HTTP 调用/成功写出偏移、HTTP 与传输结果、R/T/A、结束原因、解析状态及改写摘要，不保存请求或完整回答。成功写出由 `httptrace.WroteRequest` 观测，失败或未写出为 null。文件写入或同步失败停止新派发，以 `replay_results_failed` 失败，`results_failed=true` 禁止报告核验成功。明细仅留回放主机，没有下载接口。
+`results.jsonl` 0600 串行写入，每条包含计划序号、原/本次请求 ID、计划/HTTP 调用/成功写出偏移、HTTP 与传输结果、实际 token 数、结束原因、解析状态及改写摘要，不保存请求或完整回答。成功写出由 `httptrace.WroteRequest` 观测，失败或未写出为 null。文件写入或同步失败停止新派发，以 `replay_results_failed` 失败，`results_failed=true` 禁止报告核验成功。明细仅留回放主机，没有下载接口。
 
-`output_verification` 分别计数 matched / short / long / unverifiable，另含已知 actual_tokens 合计和 unknown 数量。只有 HTTP/传输/适用协议完整、解析成功且 A 已知才能判定长短，SSE 错误事件即使返回 HTTP 200 且已有 usage 也计为失败，其余不完整或未知结果无法验证。`completed` 只表示发送和收尾完成，不等于全部请求成功或达标。状态增加未发送数、排除原因、结束原因和最大写出延迟；原速延迟相对录制计划时刻，固定并发延迟相对 worker 领取时刻；这些时间是回放器观测，不证明目标收到时间，不做自动有效性评分。
+新任务不做等输出达标判断。`results.jsonl` 继续记录实际 usage、HTTP/传输错误及 SSE 错误事件；HTTP 200 的 SSE 错误仍计入失败。旧任务保留已有 `output_verification` 历史字段及结果恢复能力。`completed` 只表示发送和收尾完成，不等于全部请求成功。状态包含未发送数、排除原因、结束原因和最大写出延迟；这些时间是回放器观测，不证明目标收到时间。
 
-运行期间通过每段文件锁阻止容量淘汰；所有已启动路径收尾后才发布终态并释放占用。首次状态写盘失败不启动负载，运行或结束状态写盘失败报 `storage_failed`。服务状态的 capabilities 包含 `recording-v2-timed-unlimited-output-verified`，平台缺少该能力时禁止新建回放。
+运行期间通过每段文件锁阻止容量淘汰；所有已启动路径收尾后才发布终态并释放占用。首次状态写盘失败不启动负载，运行或结束状态写盘失败报 `storage_failed`。服务状态的 capabilities 包含 `recording-original-request-v1`，平台缺少该能力时禁止新建回放。
 
 运行中异常退出后，服务从 `results.jsonl` 的完整行恢复核验汇总与已确认的发送/完成/失败计数，仍将任务标记为 `end_unknown`，不重放请求。缺少完整结果的计划项计入 `progress.unconfirmed`，不能当作未发送；`unsent` 只统计明确未发送的结果。`output_verification.incomplete=true` 表示仅恢复了部分核验结果。末尾残行、重复序号或损坏记录会停止继续恢复并设置 `results_failed=true`，保留此前完整行的统计和原始文件；已终结任务不重新计算，重复启动也不会重复累计。
 
 ### 协调升级
 
-实际部署状态见[部署记录](DEPLOYMENT.md)。按 code-eval 停机窗口规则协调更新平台 Web/engine、switch 和 replay；普通 proxy/模型后端不新增预检接口，monitoring 无改动。升级前停止新增录制/回放、终止未结束旧窗口并确认已接收请求收尾；超时保留维护与锁，不强杀。平台迁移 `deploy/migration/recording_v2.py` 只移除现存规则 JSON 的 `response` 键，要求旧录制与回放均终态，并备份数据库。所有历史录制、任务结果原样保留，不转换旧 schema 或清理文件。随后只生成新版未来窗口；失败修复当前版本，不回退。
+本次源码改造尚未部署，实际部署状态见[部署记录](DEPLOYMENT.md)。按 code-eval 停机窗口规则协调更新平台 Web/engine、switch 和 replay；普通 proxy/模型后端不新增预检接口，monitoring 无改动。升级前停止新增录制/回放、终止未结束旧窗口并确认已接收请求收尾；超时保留维护与锁，不强杀。本次不改变数据库结构或既有规则；历史 v2 迁移脚本 `deploy/migration/recording_v2.py` 仅适用于更早版本的录制规则。所有历史录制、任务结果原样保留，不转换旧 schema 或清理文件。schema 2 的旧尾部录制仍可回放完整请求，但无法补回未曾保存的响应前缀。随后只生成新版未来窗口；失败修复当前版本，不回退。
 
 
 ### 双录制同步叠加（2026-10-15 已部署）

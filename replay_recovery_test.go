@@ -24,7 +24,6 @@ func openRecoveredReplay(t *testing.T, recordRoot, dataRoot string) *replayServi
 
 func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
 	root, req := syntheticReplay(t, 2, 30, `{}`)
-	req.FixOutput = true
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"usage":{"completion_tokens":800}}`)
@@ -35,7 +34,7 @@ func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		live, _ := f.svc.loadRun(req.RunID)
-		if live.Output.Matched == 1 {
+		if live.Progress.Completed == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -58,7 +57,7 @@ func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
 	view, ok := restored.loadRun(req.RunID)
 	restored.Close()
 	if !ok || view.State != "end_unknown" || view.EndReason != "service_restarted" ||
-		view.Output.Matched != 1 || view.Output.ActualTokens != 800 || !view.Output.Incomplete || view.Output.ResultsFailed {
+		view.Output.Matched != 0 || view.Output.ActualTokens != 800 || !view.Output.Incomplete || view.Output.ResultsFailed {
 		t.Fatalf("lost synced verification: %s", encodeJSON(view))
 	}
 	if view.Progress.Sent != 1 || view.Progress.Completed != 1 || view.Progress.Unsent != 0 || view.Progress.Unconfirmed != 1 {
@@ -101,7 +100,7 @@ func TestReplayRecoveryUsesOnlyCompleteUniqueResults(t *testing.T) {
 			if err := os.MkdirAll(dir, 0700); err != nil {
 				t.Fatal(err)
 			}
-			view := replayRunView{RunID: "old", State: "running", CreatedAt: time.Now(), Request: &replayRequest{FixOutput: true},
+			view := replayRunView{RunID: "old", State: "running", CreatedAt: time.Now(), Request: &replayRequest{},
 				Progress: replayProgress{Planned: 3}}
 			if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 				t.Fatal(err)
@@ -144,7 +143,7 @@ func TestReplayRecoveryRestoresAllResultClasses(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	view := replayRunView{RunID: "old", State: "stopping", CreatedAt: time.Now(), Request: &replayRequest{FixOutput: true}, Progress: replayProgress{Planned: 4}}
+	view := replayRunView{RunID: "old", State: "stopping", CreatedAt: time.Now(), Request: &replayRequest{}, Progress: replayProgress{Planned: 4}}
 	if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 		t.Fatal(err)
 	}

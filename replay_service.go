@@ -28,7 +28,7 @@ const (
 	replayControlKeyEnv      = "AIGATE_REPLAY_CONTROL_KEY"
 	replayRunsKept           = 200
 	replayRecordingList      = 500
-	replayProtocolCapability = "recording-v2-timed-unlimited-output-verified"
+	replayProtocolCapability = "recording-original-request-v1"
 )
 
 type replayTargetsFile struct {

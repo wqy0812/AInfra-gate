@@ -31,11 +31,10 @@ const (
 	recordingHandles         = 1024
 	recordingQueue           = 1024
 	recordingDefaultMaxBytes = int64(50 << 30)
-	recordingTailBytes       = 8 << 10
 	recordingTimelineEvents  = 8192
 	recordingEventBlock      = 128
 	recordingEventCharge     = int64(64)
-	recordingRecordCharge    = int64(recordingTailBytes + responseObserverBuffer + 64<<10)
+	recordingRecordCharge    = int64(responseObserverBuffer + 64<<10)
 	recordingDrain           = 5 * time.Second
 	recordingFinishedKept    = 64
 	recordingMaxSampleOneIn  = 1_000_000
@@ -415,8 +414,8 @@ type trafficRecord struct {
 	upstreamID          string
 	status              int
 	responseHeaders     map[string]string
-	tail                []byte
-	tailPos             int
+	response            []byte
+	responseTruncated   bool
 	responseBytes       int64
 	events              []recordingEvent
 	eventsCharged       int
@@ -494,9 +493,7 @@ func (t *trafficRecord) bodyChunk(p []byte, done bool, failure error) {
 	t.bodyRead = true
 	t.bodyBytes += int64(len(p))
 	if len(p) > 0 && !t.bodyTruncated {
-		if t.reserveLocked(int64(len(p))) {
-			t.body = append(t.body, p...)
-		} else {
+		if !t.appendCaptureLocked(&t.body, p) {
 			t.bodyTruncated = true
 			t.truncationReason = "memory_full"
 		}
@@ -559,16 +556,13 @@ func (t *trafficRecord) write(start, end time.Time, p []byte) {
 	if t.observer != nil {
 		_, _ = t.observer.Write(p)
 	}
-	if len(p) >= len(t.tail) {
-		copy(t.tail, p[len(p)-len(t.tail):])
-		t.tailPos = 0
-		return
+	if len(p) > 0 && !t.responseTruncated {
+		if t.appendCaptureLocked(&t.response, p) {
+			return
+		}
+		t.responseTruncated = true
+		t.truncationReason = "memory_full"
 	}
-	n := copy(t.tail[t.tailPos:], p)
-	if n < len(p) {
-		copy(t.tail, p[n:])
-	}
-	t.tailPos = (t.tailPos + len(p)) % len(t.tail)
 }
 
 func (t *trafficRecord) flush(start, end time.Time) {
@@ -593,11 +587,24 @@ func (t *trafficRecord) setOutcome(outcome string) {
 	}
 }
 
-func (t *trafficRecord) tailBytes() []byte {
-	if t.responseBytes < int64(len(t.tail)) {
-		return append([]byte(nil), t.tail[:t.responseBytes]...)
+// Charge allocated capacity, including the temporary old buffer during growth.
+func (t *trafficRecord) appendCaptureLocked(dst *[]byte, p []byte) bool {
+	if len(*dst)+len(p) > cap(*dst) {
+		n := max(len(*dst)+len(p), max(4096, cap(*dst)*2))
+		if !t.reserveLocked(int64(n)) {
+			return false
+		}
+		next := make([]byte, len(*dst), n)
+		copy(next, *dst)
+		old := int64(cap(*dst))
+		t.rec.mu.Lock()
+		t.rec.used -= old
+		t.rec.mu.Unlock()
+		t.charge -= old
+		*dst = next
 	}
-	return append(append([]byte(nil), t.tail[t.tailPos:]...), t.tail[:t.tailPos]...)
+	*dst = append(*dst, p...)
+	return true
 }
 
 // recordingSnapshot is immutable once handed to the worker.
@@ -649,9 +656,9 @@ func (t *trafficRecord) finish(clientErr error) {
 	default:
 		requestState = "incomplete"
 	}
-	response, file := t.tailBytes(), "response.tail"
+	response, file := t.response, "response.body"
 	capture := "complete"
-	if t.bodyTruncated {
+	if t.bodyTruncated || t.responseTruncated {
 		capture = "truncated"
 	}
 	segStart := t.segment.start
@@ -674,7 +681,7 @@ func (t *trafficRecord) finish(clientErr error) {
 		meta.ResponseHeaders = map[string]string{}
 	}
 	snapshot := &recordingSnapshot{meta: meta, body: t.body, response: response, events: t.events, session: t.session, segment: t.segment, charge: t.charge, truncate: capture == "truncated"}
-	t.body, t.tail, t.events, t.observer = nil, nil, nil, nil
+	t.body, t.response, t.events, t.observer = nil, nil, nil, nil
 	t.mu.Unlock()
 	t.rec.submit(snapshot)
 }
@@ -1017,7 +1024,6 @@ func (r *trafficRecorder) begin(req *http.Request, id string, arrived time.Time)
 	seg.seq++
 	t := &trafficRecord{rec: r, session: s, segment: seg, seq: seg.seq, id: id, arrived: arrived, method: req.Method, path: req.URL.Path,
 		peer: req.RemoteAddr, length: req.ContentLength, headers: map[string]string{}, charge: recordingRecordCharge}
-	t.tail = make([]byte, recordingTailBytes)
 	for _, k := range recordingRequestHeaders {
 		if v := req.Header.Get(k); v != "" {
 			t.headers[k] = captureString(v, 256)

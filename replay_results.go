@@ -24,25 +24,26 @@ type replayOutputSummary struct {
 }
 
 type replayResult struct {
-	GatewayID         string               `json:"gateway_id"`
-	RecordingID       string               `json:"recording_id"`
-	Segment           string               `json:"segment"`
-	Sequence          int                  `json:"sequence"`
-	OriginalRequestID string               `json:"original_request_id"`
-	RequestID         string               `json:"request_id"`
-	PlannedOffset     float64              `json:"planned_offset_seconds"`
-	SendOffset        *float64             `json:"send_offset_seconds"`
-	WriteOffset       *float64             `json:"write_offset_seconds"`
-	HTTPStatus        int                  `json:"http_status"`
-	Error             string               `json:"error,omitempty"`
-	ErrorSummary      string               `json:"error_summary,omitempty"`
-	RecordedTokens    *uint64              `json:"recorded_tokens,omitempty"`
-	TargetTokens      *uint64              `json:"target_tokens,omitempty"`
-	ActualTokens      *uint64              `json:"actual_tokens"`
-	Observation       *responseObservation `json:"response_result,omitempty"`
-	Verification      string               `json:"verification,omitempty"`
-	Rewritten         []string             `json:"rewritten"`
-	writeDelay        *float64
+	GatewayID         string   `json:"gateway_id"`
+	RecordingID       string   `json:"recording_id"`
+	Segment           string   `json:"segment"`
+	Sequence          int      `json:"sequence"`
+	OriginalRequestID string   `json:"original_request_id"`
+	RequestID         string   `json:"request_id"`
+	PlannedOffset     float64  `json:"planned_offset_seconds"`
+	SendOffset        *float64 `json:"send_offset_seconds"`
+	WriteOffset       *float64 `json:"write_offset_seconds"`
+	HTTPStatus        int      `json:"http_status"`
+	Error             string   `json:"error,omitempty"`
+	ErrorSummary      string   `json:"error_summary,omitempty"`
+	// Retained only for reading historical equal-output result files.
+	RecordedTokens *uint64              `json:"recorded_tokens,omitempty"`
+	TargetTokens   *uint64              `json:"target_tokens,omitempty"`
+	ActualTokens   *uint64              `json:"actual_tokens"`
+	Observation    *responseObservation `json:"response_result,omitempty"`
+	Verification   string               `json:"verification,omitempty"`
+	Rewritten      []string             `json:"rewritten"`
+	writeDelay     *float64
 }
 
 type replayResultFile interface {
@@ -80,22 +81,9 @@ func (r *replayRun) abort(reason string) {
 }
 
 func (r *replayRun) saveResult(result replayResult) {
-	if r.req.FixOutput {
-		result.Verification = "unverifiable"
-		if result.Observation != nil && result.Observation.UsageKnown {
-			a := result.Observation.Usage["completion_tokens"]
-			result.ActualTokens = &a
-			if result.Error == "" && result.Observation.ProtocolComplete {
-				switch {
-				case a == *result.TargetTokens:
-					result.Verification = "matched"
-				case a < *result.TargetTokens:
-					result.Verification = "short"
-				default:
-					result.Verification = "long"
-				}
-			}
-		}
+	if result.Observation != nil && result.Observation.UsageKnown {
+		a := result.Observation.Usage["completion_tokens"]
+		result.ActualTokens = &a
 	}
 	// Serialize file writes separately from dispatch/state locks. A slow disk
 	// cannot throttle timed dispatch by holding the run lock.
@@ -125,9 +113,7 @@ func (r *replayRun) saveResult(result replayResult) {
 			r.maxWriteDelay = &v
 		}
 	}
-	if r.req.FixOutput {
-		r.output.add(result)
-	}
+	r.output.add(result)
 }
 
 func (s *replayOutputSummary) add(result replayResult) {
@@ -138,7 +124,7 @@ func (s *replayOutputSummary) add(result replayResult) {
 		s.Short++
 	case "long":
 		s.Long++
-	default:
+	case "unverifiable":
 		s.Unverifiable++
 	}
 	if result.ActualTokens == nil {
@@ -192,14 +178,14 @@ func recoverReplayResults(dir string, view *replayRunView) (err error) {
 			result.Sequence > replayMaxPlanItems || seen[result.Sequence] || result.RequestID == "" || result.OriginalRequestID == "" {
 			return fmt.Errorf("invalid_result_line")
 		}
-		if view.Request != nil && view.Request.FixOutput {
+		if result.Verification != "" {
 			switch result.Verification {
 			case "matched", "short", "long", "unverifiable":
 			default:
 				return fmt.Errorf("invalid_result_verification")
 			}
-			view.Output.add(result)
 		}
+		view.Output.add(result)
 		seen[result.Sequence] = true
 		sourceSeen[result.GatewayID+"/"+result.RecordingID]++
 		for i := range view.Sources {

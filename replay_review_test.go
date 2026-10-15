@@ -134,7 +134,7 @@ func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
 	}
 }
 
-func TestReplayFixOutputRejectsUnknownUsageBeforeSending(t *testing.T) {
+func TestReplayIncludesUnknownUsage(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-usage", 1)
 	name := summary.Segments[0].Segment
@@ -150,10 +150,9 @@ func TestReplayFixOutputRejectsUnknownUsageBeforeSending(t *testing.T) {
 	before := rec.router.posts.Load()
 	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
 	req := normalizedReplayRequest(t, "unknown-usage", "rec-usage", name, "r1")
-	req.FixOutput = true
 	f.svc.start(req)
 	view := f.wait(t, req.RunID)
-	if view.State != "failed" || view.Error != "fix_output_usage_unknown" || rec.router.posts.Load() != before {
+	if view.State != "completed" || rec.router.posts.Load() != before+1 {
 		t.Fatalf("%s", encodeJSON(view))
 	}
 }

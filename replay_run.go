@@ -393,10 +393,7 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { r.svc.bodyMemory.release(charge) }) }
 	defer release()
-	result := replayResult{GatewayID: item.GatewayID, RecordingID: item.RecordingID, Segment: item.Segment, Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: r.req.rewritten()}
-	if r.req.FixOutput {
-		result.RecordedTokens, result.TargetTokens = &item.TargetTokens, &item.TargetTokens
-	}
+	result := replayResult{GatewayID: item.GatewayID, RecordingID: item.RecordingID, Segment: item.Segment, Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: []string{}}
 	// Preparation failures and stop-before-send remain visible with null offsets.
 	defer func() {
 		r.saveResult(result)
@@ -435,10 +432,11 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		r.abort(err.Error())
 		return
 	}
-	if body, err = rewriteReplayBody(body, r.req, item); err != nil {
-		fail(err.Error())
-		return
+	rewritten := rewriteReplayBody(body, r.req)
+	if !bytes.Equal(body, rewritten) {
+		result.Rewritten = r.req.rewritten()
 	}
+	body = rewritten
 	ctx, cancel := context.WithTimeout(r.svc.ctx, time.Duration(r.req.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	var traceMu sync.Mutex
@@ -509,32 +507,21 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	}
 	defer response.Body.Close()
 	result.HTTPStatus = response.StatusCode
-	if r.req.FixOutput {
-		observer := newResponseObserver(response.Header)
-		var destination io.Writer = observer
-		var errorPrefix replayErrorPrefix
-		if response.StatusCode < 200 || response.StatusCode > 299 {
-			destination = io.MultiWriter(observer, &errorPrefix)
-		}
-		_, err = io.CopyBuffer(destination, response.Body, make([]byte, 32<<10))
-		transport := ""
-		if err != nil {
-			transport = replayErrorClass(err)
-		}
-		observed := observer.finish(transport)
-		result.Observation, result.ErrorSummary = &observed, observed.ErrorSummary
-		if result.ErrorSummary == "" {
-			result.ErrorSummary = string(errorPrefix.data[:errorPrefix.used])
-		}
-	} else if response.StatusCode < 200 || response.StatusCode > 299 {
-		prefix, readErr := io.ReadAll(io.LimitReader(response.Body, responseErrorLimit))
-		result.ErrorSummary = string(prefix)
-		if readErr == nil {
-			_, readErr = io.Copy(io.Discard, response.Body)
-		}
-		err = readErr
-	} else {
-		_, err = io.Copy(io.Discard, response.Body)
+	observer := newResponseObserver(response.Header)
+	var destination io.Writer = observer
+	var errorPrefix replayErrorPrefix
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		destination = io.MultiWriter(observer, &errorPrefix)
+	}
+	_, err = io.CopyBuffer(destination, response.Body, make([]byte, 32<<10))
+	transport := ""
+	if err != nil {
+		transport = replayErrorClass(err)
+	}
+	observed := observer.finish(transport)
+	result.Observation, result.ErrorSummary = &observed, observed.ErrorSummary
+	if result.ErrorSummary == "" {
+		result.ErrorSummary = string(errorPrefix.data[:errorPrefix.used])
 	}
 	if err != nil {
 		fail(replayErrorClass(err))

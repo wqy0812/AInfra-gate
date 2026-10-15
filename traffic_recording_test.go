@@ -297,8 +297,8 @@ func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
 	if string(body) != streamBody {
 		t.Fatalf("request bytes %q", body)
 	}
-	tail, _ := os.ReadFile(filepath.Join(recordDir, "response.tail"))
-	if !strings.HasSuffix(streamed, string(tail)) || !strings.Contains(string(tail), "completion_tokens") {
+	tail, _ := os.ReadFile(filepath.Join(recordDir, "response.body"))
+	if streamed != string(tail) || !strings.Contains(string(tail), "completion_tokens") {
 		t.Fatalf("tail %q", tail)
 	}
 	var meta recordingMeta
@@ -321,36 +321,44 @@ func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
 	}
 }
 
-func TestRecordingLongResponseOnlyWritesTailAndStructuredUsage(t *testing.T) {
-	f := newRecordingFixture(t, recordingDefaultMaxBytes)
-	now := time.Now()
-	startRecording(t, f.c, "long-json", halfHour(now), halfHour(now).Add(time.Hour), nil)
-	body := `{"model":"token-model","messages":[{"role":"user","content":"long answer"}],"max_tokens":20000}`
-	code, response := postChat(t, f.switch_.URL, body, nil)
-	if code != 200 || len(response) < 20000 {
-		t.Fatal("forwarding changed", code, response[:min(160, len(response))])
-	}
-	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "long-json"})
-	summary := waitRecordingEnded(t, f.c, "long-json")
-	dir := filepath.Join(f.root, "g1", "long-json", summary.Segments[0].Segment)
-	index := readIndex(t, filepath.Join(dir, "index.jsonl"))
-	record := filepath.Join(dir, index[0].Directory)
-	tail, err := os.ReadFile(filepath.Join(record, "response.tail"))
-	if err != nil || len(tail) != recordingTailBytes || string(tail) != response[len(response)-recordingTailBytes:] {
-		t.Fatal("tail did not roll", err)
-	}
-	var meta recordingMeta
-	readJSONFile(t, filepath.Join(record, "meta.json"), &meta)
-	if meta.ResponseResult.Usage["completion_tokens"] != 20000 || !meta.ResponseResult.ProtocolComplete || meta.ResponseBytes != int64(len(response)) {
-		t.Fatalf("%+v", meta)
-	}
-	entries, _ := os.ReadDir(record)
-	if len(entries) != 4 {
-		t.Fatalf("unexpected files: %v", entries)
-	}
-	raw, _ := os.ReadFile(filepath.Join(record, "meta.json"))
-	if strings.Contains(string(raw), "response_mode") {
-		t.Fatal("retired mode persisted")
+func TestRecordingLongResponseWritesFullBodyAndStructuredUsage(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprint(stream), func(t *testing.T) {
+			f := newRecordingFixture(t, recordingDefaultMaxBytes)
+			now := time.Now()
+			startRecording(t, f.c, "long-json", halfHour(now), halfHour(now).Add(time.Hour), nil)
+			body := `{"model":"token-model","messages":[{"role":"user","content":"` + strings.Repeat("input", 4000) + `"}],"max_tokens":20000,"stream":` + fmt.Sprint(stream) + `}`
+			code, response := postChat(t, f.switch_.URL, body, nil)
+			if code != 200 || len(response) < 20000 {
+				t.Fatal("forwarding changed", code, response[:min(160, len(response))])
+			}
+			recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": "long-json"})
+			summary := waitRecordingEnded(t, f.c, "long-json")
+			dir := filepath.Join(f.root, "g1", "long-json", summary.Segments[0].Segment)
+			index := readIndex(t, filepath.Join(dir, "index.jsonl"))
+			record := filepath.Join(dir, index[0].Directory)
+			savedRequest, _ := os.ReadFile(filepath.Join(record, "request.json"))
+			if string(savedRequest) != body {
+				t.Fatal("request was truncated")
+			}
+			tail, err := os.ReadFile(filepath.Join(record, "response.body"))
+			if err != nil || string(tail) != response {
+				t.Fatal("full response differs", err)
+			}
+			var meta recordingMeta
+			readJSONFile(t, filepath.Join(record, "meta.json"), &meta)
+			if meta.ResponseResult.Usage["completion_tokens"] != 20000 || !meta.ResponseResult.ProtocolComplete || meta.ResponseBytes != int64(len(response)) || meta.ResponseSaved != int64(len(response)) || meta.ResponseSHA256 != sha256Hex(tail) {
+				t.Fatalf("%+v", meta)
+			}
+			entries, _ := os.ReadDir(record)
+			if len(entries) != 4 {
+				t.Fatalf("unexpected files: %v", entries)
+			}
+			raw, _ := os.ReadFile(filepath.Join(record, "meta.json"))
+			if strings.Contains(string(raw), "response_mode") {
+				t.Fatal("retired mode persisted")
+			}
+		})
 	}
 }
 
@@ -776,5 +784,40 @@ func TestRecordingCancellationBeforeResponseHeaders(t *testing.T) {
 	rows := readIndex(t, filepath.Join(f.root, "g1", "rec-cancel-early", summary.Segments[0].Segment, "index.jsonl"))
 	if len(rows) != 1 || rows[0].Outcome != "client_cancelled" {
 		t.Fatalf("%+v", rows)
+	}
+}
+
+func TestRecordingResponseBudgetPreservesRequestAndReportsTruncation(t *testing.T) {
+	now := time.Now()
+	rec := &trafficRecorder{used: recordingRecordCharge, active: 1, queue: make(chan *recordingSnapshot, 1)}
+	session := &recordingSession{params: recordingParams{RecordingID: "budget"}, inflight: 1}
+	seg := &recordingSegmentState{start: halfHour(now), name: recordingSegmentName(halfHour(now)), inflight: 1}
+	record := &trafficRecord{rec: rec, session: session, segment: seg, arrived: now, method: "POST", charge: recordingRecordCharge}
+	body := []byte(`{"messages":[]}`)
+	record.bodyChunk(body, true, nil)
+	record.forwarding()
+	record.header(200, http.Header{"Content-Type": {"application/json"}})
+	prefix := []byte(`{"answer":"` + strings.Repeat("x", 10000))
+	record.write(now, now, prefix)
+	reserved := recordingMemory - rec.used
+	if !rec.reserve(reserved) {
+		t.Fatal("could not reserve budget")
+	}
+	suffix := []byte(strings.Repeat("y", 10000) + `","usage":{"completion_tokens":99}}`)
+	record.write(now, now, suffix)
+	record.finish(nil)
+	snapshot := <-rec.queue
+	if snapshot.meta.CaptureState != "truncated" || snapshot.meta.FailureReason != "memory_full" || snapshot.meta.RequestState != "complete" || !bytes.Equal(snapshot.body, body) {
+		t.Fatalf("lost request or truncation status: %+v", snapshot.meta)
+	}
+	if !bytes.Equal(snapshot.response, prefix) || snapshot.meta.ResponseBytes != int64(len(prefix)+len(suffix)) || snapshot.meta.ResponseSaved != int64(len(prefix)) || snapshot.meta.ResponseResult.Usage["completion_tokens"] != 99 {
+		t.Fatalf("lost prefix, byte counts or observation: %+v", snapshot.meta)
+	}
+	if rec.used != recordingMemory {
+		t.Fatal("budget exceeded")
+	}
+	rec.releaseLocked(snapshot)
+	if rec.used != reserved || rec.active != 0 {
+		t.Fatal("capture budget leaked")
 	}
 }

@@ -18,7 +18,7 @@ import (
 
 func normalizedReplayRequest(t *testing.T, id, recording, segment, target string) replayRequest {
 	t.Helper()
-	req := replayRequest{RunID: id, Recording: replayRecordingRef{GatewayID: "g1", RecordingID: recording, Segments: []string{segment}}, Filter: replayFilter{Status: "2xx"}, Target: target, Mode: "concurrency", Concurrency: 1}
+	req := replayRequest{RunID: id, Recording: replayRecordingRef{GatewayID: "g1", RecordingID: recording, Segments: []string{segment}}, Filter: replayFilter{Status: "all"}, Target: target, Mode: "concurrency", Concurrency: 1}
 	if err := req.normalize(); err != nil {
 		t.Fatal(err)
 	}

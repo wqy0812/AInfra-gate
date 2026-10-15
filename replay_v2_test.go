@@ -149,23 +149,26 @@ func TestReplayTimedKeepsSparseOffsetsAndFilterGaps(t *testing.T) {
 	dir := filepath.Join(root, "g1", "synthetic", req.Recording.Segments[0])
 	lines := readIndex(t, filepath.Join(dir, "index.jsonl"))
 	lines[0].Status = 400
+	lines[0].Outcome = "rejected"
+	lines[1].Status = 502
+	lines[1].CaptureState = "truncated"
 	var index bytes.Buffer
 	for _, line := range lines {
 		index.Write(encodeJSON(line))
 		index.WriteByte('\n')
 	}
 	os.WriteFile(filepath.Join(dir, "index.jsonl"), index.Bytes(), 0600)
-	req.Filter.Status = "2xx"
+	req.Filter.Status = "all"
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) { io.Copy(io.Discard, r.Body); io.WriteString(w, `{}`) })
 	f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
 	f.svc.start(req)
 	view := f.wait(t, req.RunID)
 	results := readReplayResults(t, f, req.RunID)
-	if view.Progress.Sent != 2 || view.Excluded["status"] != 1 {
+	if view.Progress.Sent != 3 || view.Excluded["status"] != 0 {
 		t.Fatalf("%+v", view)
 	}
 	for _, result := range results {
-		want := float64(result.Sequence) * .3
+		want := float64(result.Sequence-1) * .3
 		if result.PlannedOffset != want || result.SendOffset == nil || *result.SendOffset < want-.02 || result.WriteOffset == nil {
 			t.Fatalf("offsets: %+v", result)
 		}
@@ -241,7 +244,6 @@ func (failedReplayResults) Close() error              { return nil }
 
 func TestReplayResultFailureStopsNewSends(t *testing.T) {
 	root, req := syntheticReplay(t, 4, .3, `{}`)
-	req.FixOutput = true
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"usage":{"completion_tokens":800}}`)
@@ -258,14 +260,14 @@ func TestReplayResultFailureStopsNewSends(t *testing.T) {
 	}
 }
 
-func TestReplayOutputVerificationContinuesWithoutRetries(t *testing.T) {
+func TestReplayObservesResponsesWithoutRewritesOrRetries(t *testing.T) {
 	root, req := syntheticReplay(t, 10, 0, `{"messages":[],"stream":true}`)
-	req.FixOutput, req.Mode, req.Concurrency = true, "concurrency", 1
+	req.Mode, req.Concurrency = "concurrency", 1
 	var calls atomic.Int64
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		if !bytes.Contains(body, []byte(`"include_usage":true`)) {
-			t.Error("usage not requested")
+		if string(body) != `{"messages":[],"stream":true}` {
+			t.Error("request was rewritten")
 		}
 		switch calls.Add(1) {
 		case 1:
@@ -307,7 +309,7 @@ func TestReplayOutputVerificationContinuesWithoutRetries(t *testing.T) {
 	f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
 	f.svc.start(req)
 	view := f.wait(t, req.RunID)
-	if view.State != "completed" || view.Progress.Sent != 10 || view.Progress.Failed != 3 || view.Output.Matched != 2 || view.Output.Short != 1 || view.Output.Long != 1 || view.Output.Unverifiable != 6 || view.Output.Unknown != 2 || view.Output.ActualTokens != 5701 {
+	if view.State != "completed" || view.Progress.Sent != 10 || view.Progress.Failed != 3 || view.Output.Matched != 0 || view.Output.Short != 0 || view.Output.Long != 0 || view.Output.Unverifiable != 0 || view.Output.Unknown != 2 || view.Output.ActualTokens != 5701 {
 		t.Fatalf("%+v", view)
 	}
 	results := readReplayResults(t, f, req.RunID)
@@ -319,29 +321,24 @@ func TestReplayOutputVerificationContinuesWithoutRetries(t *testing.T) {
 	}
 }
 
-func TestReplayRewritePreservesOriginalAndRemovesStops(t *testing.T) {
-	body := []byte(` {"messages":[{"role":"user","content":"unchanged"}],"max_tokens":9,"max_completion_tokens":12,"stop":["x"],"stop_token_ids":[3],"min_tokens":1,"ignore_eos":false,"temperature":0.6,"stream":true,"stream_options":{"other":7}} `)
-	got, err := rewriteReplayBody(body, replayRequest{}, replayPlanItem{})
-	if err != nil || !bytes.Equal(body, got) {
-		t.Fatal("original bytes changed")
-	}
-	got, err = rewriteReplayBody(body, replayRequest{FixOutput: true}, replayPlanItem{TargetTokens: 800})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out map[string]any
-	json.Unmarshal(got, &out)
-	for _, key := range []string{"stop", "stop_token_ids", "max_completion_tokens"} {
-		if _, ok := out[key]; ok {
-			t.Fatal("conflict", key)
+func TestReplayModelRewritePreservesEveryOtherField(t *testing.T) {
+	for _, stream := range []string{"", `,"stream":false`, `,"stream":true`} {
+		body := []byte(` {"model":"old","messages":[{"role":"user","content":"unchanged"}],"n":2,"max_tokens":9,"max_completion_tokens":12,"stop":["x"],"stop_token_ids":[3],"min_tokens":1,"ignore_eos":false,"temperature":0.6,"stream_options":{"other":7}` + stream + `} `)
+		got := rewriteReplayBody(body, replayRequest{})
+		if !bytes.Equal(body, got) {
+			t.Fatal("original bytes changed")
 		}
-	}
-	if out["max_tokens"] != float64(800) || out["min_tokens"] != float64(800) || out["ignore_eos"] != true || out["temperature"] != .6 || out["stream_options"].(map[string]any)["other"] != float64(7) {
-		t.Fatalf("%s", got)
-	}
-	for _, body := range []string{`{"n":2}`, `{"n":0}`, `{"n":null}`, `{"stream":true,"stream_options":false}`, `{"stream":true,"stream_options":null}`} {
-		if _, err := rewriteReplayBody([]byte(body), replayRequest{FixOutput: true}, replayPlanItem{TargetTokens: 800}); err == nil {
-			t.Fatal("accepted", body)
+		got = rewriteReplayBody(body, replayRequest{SetModel: "new"})
+		var before, after map[string]json.RawMessage
+		json.Unmarshal(body, &before)
+		json.Unmarshal(got, &after)
+		if string(after["model"]) != `"new"` {
+			t.Fatal("model not filled")
+		}
+		delete(before, "model")
+		delete(after, "model")
+		if !bytes.Equal(encodeJSON(before), encodeJSON(after)) {
+			t.Fatalf("parameters changed: %s", got)
 		}
 	}
 }
@@ -384,7 +381,7 @@ func TestReplayWriteTimingUnknownAndDelayed(t *testing.T) {
 	}
 }
 
-func TestReplayPlanRequiresSchemaUsageAndSingleCandidate(t *testing.T) {
+func TestReplayPlanRequiresSchemaAndRequestIntegrity(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*recordingMeta)
@@ -392,14 +389,10 @@ func TestReplayPlanRequiresSchemaUsageAndSingleCandidate(t *testing.T) {
 		want   string
 	}{
 		{"old_schema", func(m *recordingMeta) { m.Schema = 1 }, `{}`, "recording_schema_unsupported_rerecord"},
-		{"unknown", func(m *recordingMeta) { m.ResponseResult.UsageKnown = false }, `{}`, "fix_output_usage_unknown"},
-		{"zero", func(m *recordingMeta) { m.ResponseResult.Usage["completion_tokens"] = 0 }, `{}`, "fix_output_usage_unknown"},
-		{"multiple", func(m *recordingMeta) {}, `{"n":2}`, "fix_output_single_candidate_required"},
 		{"corrupt", func(m *recordingMeta) { m.RequestSHA256 = "bad" }, `{}`, "record_changed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root, req := syntheticReplay(t, 1, 0, test.body)
-			req.FixOutput = true
 			dir := filepath.Join(root, "g1", "synthetic", req.Recording.Segments[0], "r-000000")
 			var meta recordingMeta
 			readJSONFile(t, filepath.Join(dir, "meta.json"), &meta)
@@ -415,13 +408,38 @@ func TestReplayPlanRequiresSchemaUsageAndSingleCandidate(t *testing.T) {
 
 func TestReplayInvalidStructuredUsageDoesNotReadTail(t *testing.T) {
 	root, req := syntheticReplay(t, 1, 0, `{}`)
-	req.FixOutput = true
 	dir := filepath.Join(root, "g1", "synthetic", req.Recording.Segments[0], "r-000000")
 	raw, _ := os.ReadFile(filepath.Join(dir, "meta.json"))
 	raw = bytes.Replace(raw, []byte(`"completion_tokens":800`), []byte(`"completion_tokens":-1`), 1)
 	os.WriteFile(filepath.Join(dir, "meta.json"), raw, 0600)
 	os.WriteFile(filepath.Join(dir, "response.tail"), []byte(`{"usage":{"completion_tokens":800}}`), 0600)
-	if _, err := buildReplayPlan(root, req); err == nil || err.Error() != "fix_output_usage_unknown" {
+	if _, err := buildReplayPlan(root, req); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReplayMalformedRequestsAreSentUnchanged(t *testing.T) {
+	for _, body := range []string{`{"broken":`, `null`, `[1,2]`} {
+		t.Run(body, func(t *testing.T) {
+			root, req := syntheticReplay(t, 1, 0, body)
+			req.SetModel = "automatic-model"
+			var calls atomic.Int64
+			target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
+				got, _ := io.ReadAll(r.Body)
+				if string(got) != body {
+					t.Errorf("failed request changed: %s", got)
+				}
+				calls.Add(1)
+				w.WriteHeader(400)
+				io.WriteString(w, `{"error":{"message":"invalid request"}}`)
+			})
+			f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
+			f.svc.start(req)
+			view := f.wait(t, req.RunID)
+			result := readReplayResults(t, f, req.RunID)[0]
+			if calls.Load() != 1 || view.Progress.Sent != 1 || view.Progress.Failed != 1 || result.Error != "http_400" || len(result.Rewritten) != 0 {
+				t.Fatalf("failure not replayed faithfully: %+v %+v", view, result)
+			}
+		})
 	}
 }
