@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-// RuntimeSettings is the seven-field settings object accepted by control v2.
+// RuntimeSettings holds the seven feature-service settings read from the proxy's
+// local configuration file.
 // Deployment paths and the Router snapshot are supplied separately.
 type RuntimeSettings struct {
 	TimeoutSeconds          float64           `json:"timeout_seconds"`
