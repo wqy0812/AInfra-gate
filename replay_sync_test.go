@@ -29,8 +29,12 @@ func waitPrepared(t *testing.T, f *replayFixture, id string) replayRunView {
 }
 
 func overlayFixture(t *testing.T) (string, replayRequest) {
+	return overlayFixtureCount(t, 2)
+}
+
+func overlayFixtureCount(t *testing.T, count int) (string, replayRequest) {
 	t.Helper()
-	root, req := syntheticReplay(t, 2, .08, `{"stream":true}`)
+	root, req := syntheticReplay(t, count, .08, `{"stream":true}`)
 	source := filepath.Join(root, "g1", "synthetic")
 	dest := filepath.Join(root, "g2", "other")
 	if err := os.MkdirAll(dest, 0700); err != nil {
@@ -67,8 +71,8 @@ func TestReplayOverlayPlanAndValidation(t *testing.T) {
 		}
 	}
 	req.Mode, req.Concurrency = "concurrency", 2
-	if req.normalize() == nil {
-		t.Fatal("concurrent overlay accepted")
+	if err := req.normalize(); err != nil || req.localConcurrency() != 4 {
+		t.Fatal("concurrent overlay rejected or wrong allowance", err)
 	}
 	req.Mode, req.Concurrency = "timed", 0
 	req.Recordings[1] = req.Recordings[0]

@@ -449,7 +449,7 @@ func (s *replayService) Handler() http.Handler {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "active_runs": ids, "active_batch": batch, "capabilities": []string{replayProtocolCapability, replayOverlayCapability, replayMultiTargetCapability, replayPerformanceCapability}, "recording_schema": recordingSchema})
+			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "active_runs": ids, "active_batch": batch, "capabilities": []string{replayProtocolCapability, replayOverlayCapability, replayMultiTargetCapability, replayPerformanceCapability, replaySourceConcurrencyCapability}, "recording_schema": recordingSchema})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"recordings":
 			gateway := r.URL.Query().Get("gateway_id")
 			if !validOperationID(gateway) {

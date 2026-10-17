@@ -91,41 +91,48 @@ type replayCurve struct {
 	InflightPeak int             `json:"inflight_peak"`
 	Success      int             `json:"success"`
 }
+type replaySourceInput struct {
+	GatewayID   string `json:"gateway_id"`
+	RecordingID string `json:"recording_id"`
+	InputDigest string `json:"input_digest"`
+}
+
 type replayReport struct {
-	BucketSeconds          int               `json:"bucket_seconds"`
-	LatencyBasis           string            `json:"latency_basis"`
-	InputDigest            string            `json:"input_digest"`
-	FilterPolicy           string            `json:"filter_policy"`
-	FilterEvidence         string            `json:"filter_evidence"`
-	Truncation             *replayTruncation `json:"truncation,omitempty"`
-	Version                int               `json:"version"`
-	State                  string            `json:"state"`
-	Reason                 string            `json:"reason,omitempty"`
-	RunID                  string            `json:"run_id"`
-	RunState               string            `json:"run_state"`
-	StartedAt              any               `json:"started_at"`
-	Target                 replayTargetState `json:"target"`
-	Request                *replayRequest    `json:"request"`
-	Progress               replayProgress    `json:"progress"`
-	Metrics                replayMetrics     `json:"metrics"`
-	Stream                 replayMetrics     `json:"stream"`
-	Nonstream              replayMetrics     `json:"nonstream"`
-	Errors                 map[string]int    `json:"errors"`
-	SendDelay              replayHistogram   `json:"send_delay"`
-	MaxSendDelay           float64           `json:"max_send_delay_seconds"`
-	FirstSend              *float64          `json:"first_send_seconds"`
-	LastSend               *float64          `json:"last_send_seconds"`
-	LastEnd                *float64          `json:"last_end_seconds"`
-	Window                 float64           `json:"window_seconds"`
-	Drain                  *float64          `json:"drain_seconds"`
-	RequestRate            *float64          `json:"requests_per_second"`
-	TokenRate              *float64          `json:"tokens_per_second"`
-	InflightMean           float64           `json:"inflight_mean"`
-	InflightPeak           int               `json:"inflight_peak"`
-	Curve                  []replayCurve     `json:"curve"`
-	CurveTruncated         bool              `json:"curve_truncated,omitempty"`
-	PlannedDuration        float64           `json:"planned_duration_seconds"`
-	HistogramRelativeError float64           `json:"histogram_relative_error"`
+	SourceInputs           []replaySourceInput `json:"source_inputs,omitempty"`
+	BucketSeconds          int                 `json:"bucket_seconds"`
+	LatencyBasis           string              `json:"latency_basis"`
+	InputDigest            string              `json:"input_digest"`
+	FilterPolicy           string              `json:"filter_policy"`
+	FilterEvidence         string              `json:"filter_evidence"`
+	Truncation             *replayTruncation   `json:"truncation,omitempty"`
+	Version                int                 `json:"version"`
+	State                  string              `json:"state"`
+	Reason                 string              `json:"reason,omitempty"`
+	RunID                  string              `json:"run_id"`
+	RunState               string              `json:"run_state"`
+	StartedAt              any                 `json:"started_at"`
+	Target                 replayTargetState   `json:"target"`
+	Request                *replayRequest      `json:"request"`
+	Progress               replayProgress      `json:"progress"`
+	Metrics                replayMetrics       `json:"metrics"`
+	Stream                 replayMetrics       `json:"stream"`
+	Nonstream              replayMetrics       `json:"nonstream"`
+	Errors                 map[string]int      `json:"errors"`
+	SendDelay              replayHistogram     `json:"send_delay"`
+	MaxSendDelay           float64             `json:"max_send_delay_seconds"`
+	FirstSend              *float64            `json:"first_send_seconds"`
+	LastSend               *float64            `json:"last_send_seconds"`
+	LastEnd                *float64            `json:"last_end_seconds"`
+	Window                 float64             `json:"window_seconds"`
+	Drain                  *float64            `json:"drain_seconds"`
+	RequestRate            *float64            `json:"requests_per_second"`
+	TokenRate              *float64            `json:"tokens_per_second"`
+	InflightMean           float64             `json:"inflight_mean"`
+	InflightPeak           int                 `json:"inflight_peak"`
+	Curve                  []replayCurve       `json:"curve"`
+	CurveTruncated         bool                `json:"curve_truncated,omitempty"`
+	PlannedDuration        float64             `json:"planned_duration_seconds"`
+	HistogramRelativeError float64             `json:"histogram_relative_error"`
 }
 type replayTimingEvent struct {
 	at      float64
@@ -183,7 +190,7 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 		return r
 	}
 	defer f.Close()
-	r.InputDigest, r.FilterPolicy, r.FilterEvidence = replayReportInput(dir, view)
+	r.InputDigest, r.FilterPolicy, r.FilterEvidence, r.SourceInputs = replayReportInput(dir, view)
 	if view.State == "truncated" {
 		r.Reason = "tail_truncated"
 	}
@@ -420,10 +427,10 @@ func mergeReplayHistogram(to *replayHistogram, from replayHistogram) {
 
 // The fingerprint excludes local paths and run/target identity. Historical
 // stream eligibility is only certified from hash-verified original requests.
-func replayReportInput(dir string, view replayRunView) (string, string, string) {
+func replayReportInput(dir string, view replayRunView) (string, string, string, []replaySourceInput) {
 	file, err := os.Open(filepath.Join(dir, "plan.jsonl"))
 	if err != nil {
-		return "", "legacy_unverified", "missing_plan"
+		return "", "legacy_unverified", "missing_plan", nil
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
@@ -437,13 +444,16 @@ func replayReportInput(dir string, view replayRunView) (string, string, string) 
 		Offset    float64
 	}
 	items := []identity{}
+	sources := map[string][]identity{}
 	verified := true
 	for scanner.Scan() {
 		var item replayPlanItem
 		if json.Unmarshal(scanner.Bytes(), &item) != nil || len(items) >= replayMaxPlanItems {
-			return "", "legacy_unverified", "invalid_plan"
+			return "", "legacy_unverified", "invalid_plan", nil
 		}
 		items = append(items, identity{item.GatewayID, item.RecordingID, item.Segment, item.RequestID, item.RequestSHA256, item.OffsetSeconds})
+		key := item.GatewayID + "/" + item.RecordingID
+		sources[key] = append(sources[key], items[len(items)-1])
 		if view.Plan == nil || view.Plan.FilterPolicy != "stream_only_v1" {
 			body, err := readReplayBody(item)
 			if err != nil || replayStreamExclusion(body) != "" {
@@ -452,13 +462,20 @@ func replayReportInput(dir string, view replayRunView) (string, string, string) 
 		}
 	}
 	if scanner.Err() != nil || len(items) == 0 {
-		return "", "legacy_unverified", "invalid_plan"
+		return "", "legacy_unverified", "invalid_plan", nil
 	}
+	inputs := []replaySourceInput{}
+	for _, source := range sources {
+		inputs = append(inputs, replaySourceInput{source[0].Gateway, source[0].Recording, runtimeDigest(source)})
+	}
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].GatewayID+"/"+inputs[i].RecordingID < inputs[j].GatewayID+"/"+inputs[j].RecordingID
+	})
 	if view.Plan != nil && view.Plan.FilterPolicy == "stream_only_v1" {
-		return runtimeDigest(items), "stream_only_v1", "execution_plan"
+		return runtimeDigest(items), "stream_only_v1", "execution_plan", inputs
 	}
 	if verified {
-		return runtimeDigest(items), "stream_only_v1", "historical_request_bodies"
+		return runtimeDigest(items), "stream_only_v1", "historical_request_bodies", inputs
 	}
-	return runtimeDigest(items), "legacy_unverified", "requests_unavailable_or_mixed"
+	return runtimeDigest(items), "legacy_unverified", "requests_unavailable_or_mixed", nil
 }

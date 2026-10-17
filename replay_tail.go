@@ -3,6 +3,7 @@ package aigate
 import "time"
 
 const replayPerformanceCapability = "replay-performance-v2"
+const replaySourceConcurrencyCapability = "recording-concurrency-per-source-v1"
 
 type replayTruncation struct {
 	At        time.Time `json:"at"`
@@ -33,7 +34,7 @@ func (r *replayRun) truncateTail(coordinated bool) (replayRunView, int, string) 
 		return v, 200, ""
 	}
 	n := r.inflight.Load()
-	eligible := r.plan != nil && replayTailEligible(r.req.Mode, r.req.Concurrency, r.plan.DurationSeconds, time.Since(r.begin).Seconds(), r.plan.Planned, r.sent.Load(), n)
+	eligible := r.plan != nil && replayTailEligible(r.req.Mode, r.req.tailConcurrency(), r.plan.DurationSeconds, time.Since(r.begin).Seconds(), r.plan.Planned, r.sent.Load(), n)
 	if coordinated && r.req.CoordinatedTruncation && r.req.Mode == "timed" && r.plan != nil {
 		eligible = r.sent.Load() == int64(r.plan.Planned) && time.Since(r.begin).Seconds() > r.plan.DurationSeconds && n <= 5
 	}
@@ -49,7 +50,7 @@ func (r *replayRun) truncateTail(coordinated bool) (replayRunView, int, string) 
 	}
 	threshold := 5.0
 	if r.req.Mode == "concurrency" {
-		threshold = float64(r.req.Concurrency) / 2
+		threshold = float64(r.req.tailConcurrency()) / 2
 	}
 	r.truncation = &replayTruncation{At: time.Now().UTC(), Elapsed: time.Since(r.begin).Seconds(), Inflight: n, Threshold: threshold, Mode: r.req.Mode}
 	// Persist the decision before cancellation. Holding the run mutex prevents

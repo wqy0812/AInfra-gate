@@ -46,6 +46,7 @@ type replayRequest struct {
 	Target                string               `json:"target"`
 	Mode                  string               `json:"mode"`
 	Concurrency           int                  `json:"concurrency,omitempty"`
+	TargetConcurrency     int                  `json:"target_concurrency,omitempty"`
 	SetModel              string               `json:"set_model,omitempty"`
 	RequestTimeoutSeconds int                  `json:"request_timeout_seconds,omitempty"`
 	AutoTruncate          bool                 `json:"auto_truncate,omitempty"`
@@ -99,9 +100,6 @@ func (r *replayRequest) normalize() error {
 		if total > replayMaxSegments {
 			return fmt.Errorf("invalid_segments")
 		}
-		if len(r.Recordings) > 1 && r.Mode != "" && r.Mode != "timed" {
-			return fmt.Errorf("overlay_timed_required")
-		}
 		one := *r
 		one.Recordings = nil
 		one.Recording = r.Recordings[0]
@@ -109,6 +107,9 @@ func (r *replayRequest) normalize() error {
 			return err
 		}
 		r.Filter, r.Mode, r.RequestTimeoutSeconds = one.Filter, one.Mode, one.RequestTimeoutSeconds
+		if r.TargetConcurrency != 0 && r.TargetConcurrency < r.localConcurrency() {
+			return fmt.Errorf("invalid_target_concurrency")
+		}
 		return nil
 	}
 	if !validOperationID(r.RunID) || !validOperationID(r.Recording.GatewayID) || !validOperationID(r.Recording.RecordingID) {
@@ -151,6 +152,9 @@ func (r *replayRequest) normalize() error {
 	default:
 		return fmt.Errorf("invalid_mode")
 	}
+	if r.TargetConcurrency != 0 && (r.Mode != "concurrency" || !r.CoordinatedTruncation || r.TargetConcurrency < r.Concurrency || r.TargetConcurrency > 2*r.Concurrency) {
+		return fmt.Errorf("invalid_target_concurrency")
+	}
 	if len(r.SetModel) > 256 {
 		return fmt.Errorf("invalid_rewrite")
 	}
@@ -161,6 +165,16 @@ func (r *replayRequest) normalize() error {
 		return fmt.Errorf("invalid_timeout")
 	}
 	return nil
+}
+
+// Concurrency is a separate allowance for every recording, never a shared pool.
+func (r replayRequest) localConcurrency() int { return r.Concurrency * len(r.sources()) }
+
+func (r replayRequest) tailConcurrency() int {
+	if r.CoordinatedTruncation && r.TargetConcurrency != 0 {
+		return r.TargetConcurrency
+	}
+	return r.localConcurrency()
 }
 
 func (r replayRequest) rewritten() []string {

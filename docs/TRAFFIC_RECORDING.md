@@ -102,7 +102,7 @@
 
 ### 双录制同步叠加（2026-10-15 已部署）
 
-`status.capabilities` 新增 `recording-overlay-sync-v1`。`runs` 接受与 `recording` 互斥的 `recordings` 数组（1～2 个 gateway_id/recording_id/segments 引用），最多合计 96 段和 20 万条计划请求。两份仅支持 timed：各自拼接选中段后，从相对 0 秒叠加，稳定排序并分配唯一计划序号，时长取最大值。计划、结果和 `sources` 进度包含来源与录制标识，避免不同来源请求 ID 重名。
+`status.capabilities` 新增 `recording-overlay-sync-v1`。`runs` 接受与 `recording` 互斥的 `recordings` 数组（1～2 个 gateway_id/recording_id/segments 引用），最多合计 96 段和 20 万条计划请求。当前源码两份支持 timed 与 concurrency。timed 各自拼接选中段后从相对 0 秒叠加，时长取最大值；concurrency 按来源分别维护固定 worker 数。计划稳定排序并分配唯一计划序号。计划、结果和 `sources` 进度包含来源与录制标识，避免不同来源请求 ID 重名。
 
 平台使用 `prepare_only=true` 创建准备任务。服务锁段、校验文件、生成计划并核验目标，进入 `prepared` 后不发模型请求。`POST runs/{id}/start` 接收 `{boot_id,start_at}`：必须为未来 30 秒内的时刻，持久化 `scheduled` 后按单调时钟等待起跑；同时间重复调用幂等，不同时间冲突，迟到命令拒绝，不补发。已约定起跑的实际唤醒允许最多 60 秒迟到，超过则失败；允许范围内从实际起点按原速发送，操作者观察中间稳定时段。`GET clock` 返回 boot_id 与 received_at/sent_at，用于平台估算时钟差和网络误差；使用现有控制认证。平台的时钟估计不确定度、估计起点偏差及起跑后状态确认窗口均采用 60 秒宽松阈值，不宣称精确同步。
 
@@ -112,7 +112,7 @@
 
 新增能力 `replay-performance-v2`。新回放计划要求片段已封尾且保留；只接收请求体明确的 `stream: true`，分开统计 `nonstream`、`stream_unspecified`、`stream_unclassifiable`。结果增加 `request_stream`，与响应类型 `stream` 分开记录，失败响应不会改变请求资格。
 
-`auto_truncate` 控制收尾截断，平台默认启用。`coordinated_truncation=true` 时由平台对同一目标各来源的总在途判断并调用 `POST runs/{id}/truncate`。全部计划请求实际派发后：原速须超过计划时长且在途为 1–5；固定并发须严格低于设定并发的 50%。普通 `stop` 只取消派发，`truncate` 使用独立请求取消上下文终止残余在途。自然完成的结果不覆盖；截断结果记 `tail_truncated`，单列 `progress.truncated`，终态 `truncated`。
+`auto_truncate` 控制收尾截断，平台默认启用。`coordinated_truncation=true` 时由平台对同一目标各来源的总在途判断并调用 `POST runs/{id}/truncate`。全部计划请求实际派发后：原速须超过计划时长且在途为 1–5；固定并发总在途须严格低于每目标总并发的 50%。普通 `stop` 只取消派发，`truncate` 使用独立请求取消上下文终止残余在途。自然完成的结果不覆盖；截断结果记 `tail_truncated`，单列 `progress.truncated`，终态 `truncated`。
 
 `GET /control/replay/v1/runs/{id}/report` 默认返回 version=2，可显式选择 version=1。查询只读原结果，不发送模型请求；读取期间保护结果目录不被轮转删除。旧缓存版本不符时从结果重新聚合，原始结果缺失则不可用，平台保留已归档旧版。
 
@@ -128,8 +128,14 @@ v2 固定 30 秒桶，曲线仍最多七天。原速延迟按计划发送时间�
 
 `recording-multi-target-v1` 支持同一批次的多个目标任务在同一回放服务中并行运行。平台分别提交单目标 `runs`，每个任务携带共同 `batch_id`、独立 `run_id`、`prepare_only=true` 和通过模型发现冻结的 `expected_target`。不同批次仍互斥，同一批次不能重复占用同一目标；没有批次字段的历史调用仍保持单任务互斥。
 
-一份录制支持原速或固定并发，每个目标各自使用完整录制和配置的并发数；两份录制仅支持原速叠加。同服务同批次共享一个片段文件锁并按使用者计数，最后一个使用者结束后释放；不复制录制正文。正文内存预算仍为整个服务共享的 512 MiB，各目标拥有独立发送循环和结果文件。资源不足或某个任务失败不主动取消其他目标。
+一份或两份录制均支持原速与固定并发；`concurrency` 表示每份录制的额度，每目标总额度为录制数乘以该值。来源之间不借额度；同服务和跨服务语义一致。同服务同批次共享一个片段文件锁并按使用者计数，最后一个使用者结束后释放；不复制录制正文。正文内存预算仍为整个服务共享的 512 MiB，各目标拥有独立发送循环和结果文件。资源不足或某个任务失败不主动取消其他目标。
 
 `status` 保留 `active_run`（任一活跃任务编号），新增完整的 `active_runs` 数组和 `active_batch`；新平台使用这些字段识别占用。历史清理保护所有活跃任务及同批次兄弟任务的证据。进程重启将未结束任务逐个恢复为 `end_unknown`，不会自动重放。
 
 平台在全部目标及来源准备完成后统一下发起点，时钟不确定度、实际起点偏差和迟醒门槛为 60 秒；准备超时 120 秒、租约 15 秒及未来 30 秒内起点的命令校验保持不变。准备失败取消整批；启动命令部分送达时保留已发送与未知证据；运行后按目标停止全部来源，其他目标继续。共享来源服务故障可能同时影响多个目标。
+
+## 每份录制并发与分组证据（2026-10-18 当前源码，待部署）
+
+`recording-concurrency-per-source-v1` 能力允许双录制固定并发，单录制旧请求含义保持。平台在双录制并发子请求中附带 `target_concurrency`（每目标总并发），仅允许 coordinated 模式且取值介于本地来源总额度与两份录制总额度之间。平台确认目标所有来源派发完成后调用 truncate；回放端以目标总额度复核阈值，普通 stop 保持已发请求自然收尾。
+
+报告新增 `source_inputs`，每项保存 gateway_id、recording_id 与该来源的 input_digest。逐来源摘要不包含目标或本地目录，组合按来源排序，使同机／跨机发送和录制选择顺序不影响平台分组。已有 input_digest 证据继续保留。升级范围仅 aigate-replay，固定请求门禁不由普通本地测试触发。

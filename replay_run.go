@@ -400,24 +400,31 @@ func (r *replayRun) sendTimed(ctx context.Context, plan *replayPlan) {
 }
 
 func (r *replayRun) sendConcurrent(ctx context.Context, plan *replayPlan) {
-	next := atomic.Int64{}
+	sources := map[string][]replayPlanItem{}
+	for _, item := range plan.items {
+		key := item.GatewayID + "/" + item.RecordingID
+		sources[key] = append(sources[key], item)
+	}
 	var wg sync.WaitGroup
-	for i := 0; i < r.req.Concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for ctx.Err() == nil {
-				n := int(next.Add(1)) - 1
-				if n >= len(plan.items) {
-					return
+	for _, items := range sources {
+		next := &atomic.Int64{}
+		for i := 0; i < r.req.Concurrency; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for ctx.Err() == nil {
+					n := int(next.Add(1)) - 1
+					if n >= len(items) {
+						return
+					}
+					charge := replayBodyCharge(items[n])
+					if !r.svc.bodyMemory.acquire(ctx, charge) {
+						return
+					}
+					r.send(ctx, items[n], time.Now(), charge)
 				}
-				charge := replayBodyCharge(plan.items[n])
-				if !r.svc.bodyMemory.acquire(ctx, charge) {
-					return
-				}
-				r.send(ctx, plan.items[n], time.Now(), charge)
-			}
-		}()
+			}()
+		}
 	}
 	wg.Wait()
 }
