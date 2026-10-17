@@ -24,6 +24,8 @@
 
 ## 构建与启动
 
+新模型接入必须通过[两个固定长上下文请求的门禁](docs/MODEL_ADMISSION.md)，使用 `scripts/model_admission.py` 经目标功能服务验证并保存报告；两项全部通过后才可继续绑定、开放准入或宣告接入成功。模型直连、简单问答或单项成功不能替代。
+
 仅使用 Go 标准库，根包 `aigate` 供三个命令导入。构建与测试显式使用 vendor 模式和本机已安装工具链：
 
 ```sh
@@ -63,7 +65,7 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/
   --forward-timeout 62m --shutdown-timeout 62m
 ```
 
-`--id` 可由 `AIGATE_ID` 提供。控制端口仅提供鉴权 `/control/v3/*` 和旧固定执行镜像所需的有限 v2 接口；功能服务不提供切流控制。收到退出信号后先停止新业务并优雅收尾，默认上限 62 分钟。systemd 模板和逐实例目录约定见 [packaging](packaging/README.md)。
+`--id` 可由 `AIGATE_ID` 提供。控制端口仅提供鉴权 `/control/v3/*` 和旧固定执行镜像所需的有限 v2 接口；功能服务不提供切流控制。收到退出信号后先停止新业务并优雅收尾，默认上限 62 分钟。systemd 模板和逐实例目录约定见 [packaging](packaging/README.md)；PPU / A3 的 namespace、生命周期与维护入口见[容器维护](packaging/CONTAINERS.md)。
 
 ## 单元测试覆盖率
 

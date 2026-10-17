@@ -87,7 +87,8 @@ func validateControlledRuntime(parent context.Context, g *Gateway, cfg WarmupPol
 				toolMessages = []any{map[string]any{"role": "user", "content": "Call aigate_echo once with value " + marker + ". After receiving the tool result, reply with that value."}}
 				body["messages"] = toolMessages
 				body["tools"] = []any{tool}
-				body["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": "aigate_echo"}}
+				// Match client traffic: advertise the tool and ask for it in the
+				// prompt without requiring the named-tool-choice API extension.
 			}
 			if kind == "tool_result" {
 				body["messages"] = toolMessages

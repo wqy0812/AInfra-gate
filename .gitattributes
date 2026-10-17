@@ -1,0 +1,2 @@
+# Admission fixtures are hashed and sent byte-for-byte, including original CRLF.
+testdata/model-admission/*.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

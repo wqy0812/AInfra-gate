@@ -103,16 +103,17 @@ type recordingFixture struct {
 
 var testMarkKey = []byte(strings.Repeat("m", 32))
 
-func newRecordingFixture(t *testing.T, maxBytes int64) *recordingFixture {
+func newRecordingFixture(t *testing.T, maxBytes int64, extraMarkKeys ...[]byte) *recordingFixture {
 	t.Helper()
 	f := &recordingFixture{router: newTokenRouter(t), root: t.TempDir()}
 	f.p, f.proxy = splitProxyFixture(t, "r1", f.router.server.URL, `{}`)
-	f.p.markKey = testMarkKey
+	markKeys := append([][]byte{testMarkKey}, extraMarkKeys...)
+	f.p.markKeys = markKeys
 	c, err := newSwitchGateway("g1", strings.Repeat("k", 32), []string{"127.0.0.1/32"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = c.enableRecording(f.root, maxBytes, testMarkKey); err != nil {
+	if err = c.enableRecording(f.root, maxBytes, markKeys); err != nil {
 		t.Fatal(err)
 	}
 	f.c = c
@@ -232,7 +233,8 @@ func postChat(t *testing.T, url, body string, header map[string]string) (int, st
 }
 
 func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
-	f := newRecordingFixture(t, recordingDefaultMaxBytes)
+	secondKey := []byte(strings.Repeat("n", 32))
+	f := newRecordingFixture(t, recordingDefaultMaxBytes, secondKey)
 	now := time.Now()
 	startRecording(t, f.c, "rec-1", halfHour(now), halfHour(now).Add(time.Hour), map[string]any{"schedule_id": "rule-1"})
 	streamBody := `{"model":"token-model","messages":[{"role":"user","content":"hello recording"}],"stream":true,"max_tokens":4}`
@@ -246,6 +248,9 @@ func TestRecordingSwitchProxyEndToEnd(t *testing.T) {
 	}
 	// A verified replay mark is never recorded; a forged one is ordinary traffic.
 	if code, body := postChat(t, f.switch_.URL, `{"messages":[{"role":"user","content":"replayed"}],"stream":true}`, map[string]string{headerReplay: replayMarkValue(testMarkKey, "run-1", 1)}); code != 200 {
+		t.Fatal(code, body)
+	}
+	if code, body := postChat(t, f.switch_.URL, plainBody, map[string]string{headerReplay: replayMarkValue(secondKey, "run-2", 1)}); code != 200 {
 		t.Fatal(code, body)
 	}
 	if code, body := postChat(t, f.switch_.URL, `{"messages":[{"role":"user","content":"forged"}],"stream":true}`, map[string]string{headerReplay: "run-1/1/" + strings.Repeat("0", 64)}); code != 200 {
@@ -660,15 +665,15 @@ func TestRecordingDirectoryIsExclusive(t *testing.T) {
 
 func TestReplayMarkVerification(t *testing.T) {
 	value := replayMarkValue(testMarkKey, "run-1", 7)
-	if !verifyReplayMark(testMarkKey, value) {
+	if !verifyReplayMark([][]byte{testMarkKey}, value) {
 		t.Fatal("valid mark rejected")
 	}
 	for _, bad := range []string{"", "run-1/7", "run-1/8/" + strings.Split(value, "/")[2], "run 1/7/" + strings.Split(value, "/")[2], value + "0"} {
-		if verifyReplayMark(testMarkKey, bad) {
+		if verifyReplayMark([][]byte{testMarkKey}, bad) {
 			t.Fatal("accepted", bad)
 		}
 	}
-	if verifyReplayMark(nil, value) || verifyReplayMark([]byte(strings.Repeat("n", 32)), value) {
+	if verifyReplayMark(nil, value) || verifyReplayMark([][]byte{[]byte(strings.Repeat("n", 32))}, value) {
 		t.Fatal("accepted with wrong key")
 	}
 }
@@ -676,9 +681,12 @@ func TestReplayMarkVerification(t *testing.T) {
 func TestProxyLabelsOnlyVerifiedReplayTraffic(t *testing.T) {
 	router := newTokenRouter(t)
 	p, s := splitProxyFixture(t, "r9", router.server.URL, `{"profile":{"enabled":true}}`)
-	p.markKey = testMarkKey
+	secondKey := []byte(strings.Repeat("n", 32))
+	p.markKeys = [][]byte{testMarkKey, secondKey}
 	body := `{"messages":[{"role":"user","content":"hi"}],"stream":true}`
 	postChat(t, s.URL, body, map[string]string{headerReplay: replayMarkValue(testMarkKey, "run-9", 1)})
+	postChat(t, s.URL, body, map[string]string{headerReplay: replayMarkValue(secondKey, "run-9", 3)})
+	postChat(t, s.URL, body, map[string]string{headerReplay: replayMarkValue([]byte(strings.Repeat("u", 32)), "run-9", 4)})
 	postChat(t, s.URL, body, map[string]string{headerReplay: "run-9/2/" + strings.Repeat("a", 64)})
 	postChat(t, s.URL, body, nil)
 	response, err := http.Get(s.URL + "/metrics")
@@ -693,10 +701,10 @@ func TestProxyLabelsOnlyVerifiedReplayTraffic(t *testing.T) {
 			}
 		}
 	}
-	if !strings.HasSuffix(replay, "} 1") || !strings.HasSuffix(business, "} 2") {
+	if !strings.HasSuffix(replay, "} 2") || !strings.HasSuffix(business, "} 3") {
 		t.Fatalf("replay=%q business=%q\n%s", replay, business, metrics)
 	}
-	if router.posts.Load() != 3 {
+	if router.posts.Load() != 5 {
 		t.Fatal("replay label changed forwarding")
 	}
 	// Every event of the verified replay, including start, carries the label.
@@ -712,8 +720,17 @@ func TestProxyLabelsOnlyVerifiedReplayTraffic(t *testing.T) {
 			}
 		}
 	}
-	if labelled["start"] != 1 || labelled["input"] != 1 || labelled["end"] != 1 {
+	if labelled["start"] != 2 || labelled["input"] != 2 || labelled["end"] != 2 {
 		t.Fatalf("replay events %v", labelled)
+	}
+	p.quiesce()
+	for _, key := range p.markKeys {
+		if code, _ := postChat(t, s.URL, body, map[string]string{headerReplay: replayMarkValue(key, "run-9", 5)}); code != http.StatusServiceUnavailable {
+			t.Fatalf("replay mark bypassed admission: %d", code)
+		}
+	}
+	if router.posts.Load() != 5 {
+		t.Fatal("request forwarded after admission closed")
 	}
 }
 

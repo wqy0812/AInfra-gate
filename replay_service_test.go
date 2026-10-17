@@ -130,7 +130,7 @@ func TestReplayTimedReproducesRecordedRequests(t *testing.T) {
 		t.Fatalf("replayed bodies differ:\n%v\n%v", replayed, recordedBodies)
 	}
 	rec.router.mu.Lock()
-	marked := verifyReplayMark(testMarkKey, rec.router.headers[before].Get(headerReplay))
+	marked := verifyReplayMark([][]byte{testMarkKey}, rec.router.headers[before].Get(headerReplay))
 	rec.router.mu.Unlock()
 	if marked {
 		t.Fatal("proxy forwarded the replay mark upstream")

@@ -617,8 +617,8 @@ func (c *ControlledGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.forward.serve(w, r, meta, lease)
 }
 
-func (c *ControlledGateway) enableRecording(root string, maxBytes int64, markKey []byte) error {
-	r, err := newTrafficRecorder(root, c.id, c.boot, maxBytes, markKey, c.audit)
+func (c *ControlledGateway) enableRecording(root string, maxBytes int64, markKeys [][]byte) error {
+	r, err := newTrafficRecorder(root, c.id, c.boot, maxBytes, markKeys, c.audit)
 	if err != nil {
 		return err
 	}

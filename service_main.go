@@ -43,7 +43,7 @@ func RunSwitch(args []string, out, stderr io.Writer) error {
 	if f.NArg() != 0 || *shutdown <= 0 || *forwardTimeout <= 0 || *recordMax <= 0 {
 		return fmt.Errorf("invalid arguments; use platform control API for management")
 	}
-	markKey, err := replayMarkKeyFromEnv()
+	markKeys, err := replayMarkVerifyKeysFromEnv()
 	if err != nil {
 		return err
 	}
@@ -53,10 +53,11 @@ func RunSwitch(args []string, out, stderr io.Writer) error {
 	}
 	defer c.Close()
 	if *recordRoot != "" {
-		if err = c.enableRecording(*recordRoot, *recordMax, markKey); err != nil {
+		if err = c.enableRecording(*recordRoot, *recordMax, markKeys); err != nil {
 			return err
 		}
 	}
+	fmt.Fprintf(stderr, "replay_mark_verify_keys=%d\n", len(markKeys))
 	c.forwardTimeout = *forwardTimeout
 	servers := []*http.Server{businessHTTPServer(*listen, c), {Addr: *control, Handler: c.ControlHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}}
 	return serveProcess(servers, c.connections, func() { c.mu.Lock(); c.admission = false; c.retired = true; c.cancel(); c.mu.Unlock() }, *shutdown)
@@ -92,16 +93,17 @@ func RunProxy(args []string, out, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	markKeys, err := replayMarkVerifyKeysFromEnv()
+	if err != nil {
+		return err
+	}
 	if *checkOnly {
 		p, err := prepareProxyGateway(cfg, *root, stderr, true)
 		if err != nil {
 			return err
 		}
+		fmt.Fprintf(stderr, "replay_mark_verify_keys=%d\n", len(markKeys))
 		_, err = fmt.Fprintln(out, string(encodeJSON(p.status())))
-		return err
-	}
-	markKey, err := replayMarkKeyFromEnv()
-	if err != nil {
 		return err
 	}
 	p, err := newProxyGateway(cfg, *root, stderr)
@@ -109,7 +111,8 @@ func RunProxy(args []string, out, stderr io.Writer) error {
 		return err
 	}
 	defer p.Close()
-	p.markKey = markKey
+	p.markKeys = markKeys
+	fmt.Fprintf(stderr, "replay_mark_verify_keys=%d\n", len(markKeys))
 	servers := []*http.Server{businessHTTPServer(*listen, p)}
 	if *profile != "" {
 		servers = append(servers, &http.Server{Addr: *profile, Handler: p.ObservationHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second})

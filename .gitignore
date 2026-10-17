@@ -7,6 +7,7 @@ config.management.json
 routing.json
 *.log
 body-agent-ds4.json
+!/testdata/model-admission/body-agent-ds4.json
 
 /bin/
 /dist/

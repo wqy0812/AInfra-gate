@@ -56,7 +56,7 @@ func TestWarmupPolicyDefaultsAndRequestBudget(t *testing.T) {
 	policy = WarmupPolicy{Rounds: 2, StepSeconds: 1, TimeoutSeconds: 5, MaxTokens: 37}
 	// Keep the real protocol fixture, but inspect the payload that reaches HTTP.
 	original := g.client.Transport
-	var requests int
+	var requests, defaultToolRequests int
 	g.client.Transport = generationTransport(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost {
 			raw, err := io.ReadAll(r.Body)
@@ -70,13 +70,19 @@ func TestWarmupPolicyDefaultsAndRequestBudget(t *testing.T) {
 			if body["max_tokens"] != float64(37) || body["model"] != "local-protocol-model" {
 				t.Errorf("probe budget/model changed: %s", raw)
 			}
+			if body["stream"] == true && body["tools"] != nil {
+				if _, exists := body["tool_choice"]; exists {
+					return &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"error":"named tool choice unsupported"}`))}, nil
+				}
+				defaultToolRequests++
+			}
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			requests++
 		}
 		return original.RoundTrip(r)
 	})
 	report, err := validateControlledRuntime(context.Background(), g, policy)
-	if err != nil || !report.Passed || !report.Fresh || report.FinishedAt == nil || len(report.Steps) != 9 || requests != 8 || p.gets.Load() != 1 {
+	if err != nil || !report.Passed || !report.Fresh || report.FinishedAt == nil || len(report.Steps) != 9 || requests != 8 || defaultToolRequests != 2 || p.gets.Load() != 1 {
 		t.Fatalf("warmup failed: %+v %v requests=%d", report, err, requests)
 	}
 	if model, err := g.pool.discover(context.Background()); err != nil || model != report.Model || p.gets.Load() != 1 {

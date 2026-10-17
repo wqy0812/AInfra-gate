@@ -739,7 +739,7 @@ type recordingControlJob struct {
 type trafficRecorder struct {
 	root, gatewayID, boot string
 	maxBytes              int64
-	markKey               []byte
+	markKeys              [][]byte
 	audit                 *log.Logger
 	directory             *os.File
 	now                   func() time.Time
@@ -770,7 +770,7 @@ type trafficRecorder struct {
 	writeFile    func(path string, data []byte) error
 }
 
-func newTrafficRecorder(recordRoot, gatewayID, boot string, maxBytes int64, markKey []byte, audit io.Writer) (*trafficRecorder, error) {
+func newTrafficRecorder(recordRoot, gatewayID, boot string, maxBytes int64, markKeys [][]byte, audit io.Writer) (*trafficRecorder, error) {
 	if recordRoot == "" || !validOperationID(gatewayID) || maxBytes <= 0 {
 		return nil, fmt.Errorf("record root, gateway ID and a positive capacity are required")
 	}
@@ -796,7 +796,7 @@ func newTrafficRecorder(recordRoot, gatewayID, boot string, maxBytes int64, mark
 		directory.Close()
 		return nil, fmt.Errorf("record directory is in use: %w", err)
 	}
-	r := &trafficRecorder{root: root, gatewayID: gatewayID, boot: boot, maxBytes: maxBytes, markKey: markKey, audit: log.New(audit, "", 0),
+	r := &trafficRecorder{root: root, gatewayID: gatewayID, boot: boot, maxBytes: maxBytes, markKeys: markKeys, audit: log.New(audit, "", 0),
 		directory: directory, now: time.Now, queue: make(chan *recordingSnapshot, recordingQueue), control: make(chan recordingControlJob, 64),
 		stop: make(chan struct{}), done: make(chan struct{}), stored: map[string]*recordingStoredSegment{}, sessionBytes: map[string]int64{}, writeJSON: recordingAtomicJSON, writeFile: writeRecordingFile}
 	if err = r.recover(); err != nil {
@@ -990,7 +990,7 @@ func (r *trafficRecorder) begin(req *http.Request, id string, arrived time.Time)
 	// Exclude every test-marked request, including invalid/expired leases, so
 	// late evaluation requests cannot become business replay input. The marker
 	// is not authentication; admission independently validates the lease.
-	if r == nil || req.Header.Get("X-Code-Eval-Token") != "" || verifyReplayMark(r.markKey, req.Header.Get(headerReplay)) {
+	if r == nil || req.Header.Get("X-Code-Eval-Token") != "" || verifyReplayMark(r.markKeys, req.Header.Get(headerReplay)) {
 		return nil
 	}
 	r.mu.Lock()

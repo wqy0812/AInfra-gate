@@ -1,5 +1,63 @@
 # 当前部署身份
 
+## 2026-10-17 PPU 门禁通过并开放准入
+
+用户取消“后端必须支持强制指定工具名”的接入要求后，`warmup.go` 的工具调用探针不再发送 `tool_choice.function.name`；工具定义、提示、返回调用名称/ID/参数校验和工具结果续答仍保留。此次只更新 PPU 的 `ppu-aigate-switch`，不修改 proxy、replay 或模型服务，不更新其他环境。
+
+**PPU 已完成绑定并开放业务：`http://122.209.21.209:60010/v1`，模型 `Qwen3.6-Plus`，gateway `ppu`，Router `ppu-qwen36plus`，binding revision=1，admission=true。** 平台操作 `ppu-default-tools-bind-20261017` 为 completed、committed=true；Router 版本 2、runtime 版本 1，目标为 `http://122.209.21.209:60013`。入口 `/v1/models` HTTP 200，平台健康 ok，全局维护 false，资源锁为空。未创建录制计划或回放任务。
+
+固定请求门禁通过目标 proxy 原样发送两个样例，使用完整消息、工具和 `max_tokens=28000`，没有降参或请求重试：
+
+| 样例 | prompt / completion tokens | 请求总耗时 | 结果 |
+| --- | --- | --- | --- |
+| `body.json` | 62,284 / 631 | 12.578752 秒 | HTTP 200、完整 `[DONE]`、`finish_reason=tool_calls`，返回 `grep_code`、`search_file` |
+| `body-agent-ds4.json` | 127,305 / 201 | 5.045079 秒 | HTTP 200、完整 `[DONE]`、`finish_reason=tool_calls`，返回 `run_in_terminal` |
+
+脚本退出码 0，`report.json.passed=true`；仅验证响应结构，没有执行返回工具。proxy 的 boot_id `df96da1c978f5228aca680c0ea8412c1`、配置摘要 `f9c7e523067e9358ab62da73f0c3a3bcb28808de55a075a7f9101ba6a38123c9` 在门禁前后及绑定前后保持一致。固定门禁通过后才提交绑定；新绑定校验的 discovery 及两轮 JSON/SSE/默认工具调用/工具结果续答共 9 项全部通过。
+
+新 switch 镜像为 `local/aigate-switch:default-tools-20261017`，OCI manifest `sha256:1723323454b2033c078b84fbb961afcd869d711a07b9cdc5e74d49e7131d42cd`；进程二进制 SHA-256 `9d1323e3fcb05061cc1fe606a9b40ffcba4f2e92fb3c8ceaf5de13067b4eeb0b`。构建基于 `d5d43bfb3150e7413241ec499d27dff89eb3af18` 加当时未提交的本地补丁，**构建时 vcs.modified=true**；补丁 SHA-256 `afdd9a95ceb10b1c467dd67c1427fa82120c280b4d18876b56bd8b878f1d8ca3`。离线 vendor 构建、完整 Go 回归、vet、相关 race 回归和 5 项门禁脚本测试通过。实际进程环境、启动参数、资源限制、挂载与旧 switch 一致；旧实例已停止且禁止自动恢复，保留为证据。
+
+新增服务器目录：PPU `/bmcp_lvm_fs/aigate/releases/default-tools-20261017/` 及 `private/`；test1 `/data2/code-eval/releases/ppu-admission-20261017/`，含 `scripts/`、`testdata/model-admission/`、`private/`、`gate/`。原始响应留在 test1 的 `gate/`，不提交 Git。受限环境文件权限 0600。本地脱敏证据在 `deploy/ppu-admission-20261017/evidence/`（`admission-report.json`、`switch-verification.json`、`platform-verification.json`）。
+
+## 前次状态：2026-10-17 PPU 新部署与 A3 容器迁移
+
+PPU、A3 的三个 aigate 服务均已运行于 containerd namespace **`ai-gateway`**。PPU 首次绑定的工具调用验证失败，用户明确选择暂不修改兼容代码、保持暂停；**容器部署完成不等于 PPU 业务接入通过**。
+
+| 环境 | 容器 | 版本与准入 |
+| --- | --- | --- |
+| PPU | `ppu-aigate-switch`、`ppu-aigate-proxy`、`ppu-aigate-replay` | 源码 `d5d43bfb3150e7413241ec499d27dff89eb3af18`；未绑定，admission=false |
+| A3 | `a3-aigate`、`a3-aigate-proxy`、`a3-aigate-replay` | 程序与迁移前完全一致；原 A3 Router 维护、admission=false 保持，绑定 revision 由 39 恢复至 40 |
+
+PPU 镜像 `local/aigate:d5d43bf-20261017`，OCI manifest 为 `sha256:8275040f69aae87e964db5dd3ff76943a64b9fe04f19cdb1d8f9956ec83f3b93`。Go 1.27.1、linux/amd64、CGO_ENABLED=0，离线 vendor 构建，`vcs.modified=false`。实际进程二进制 SHA-256：
+
+| 二进制 | PPU | A3（保持原版） |
+| --- | --- | --- |
+| switch | `41677f7cfd6338370314a7b0f4b848ff74540f96df63a2335febd15883547f6a` | `d69e3c2c9ec6517e68eda2c757f198a57550be9fdbc7f92bd72f34dd738870d9` |
+| proxy | `bd42d8e962809ed1238d169d1cd4489de63211f944f7ff0083f0feb8cedd5a38` | `ec987fbe1e2ac6f8428e66b367a0111d48d95acf67a8e007422fb8aec918fa8b` |
+| replay | `1c476929b5c096f6826473156d286bd70a525567d2afdde99383746912056ade` | `01dce22c25f5eab35250d29c846d7126c81e6a326bd7ede3238f2bd7a16a6213` |
+
+PPU 仅连接本机 `8008` 的 `Qwen3.6-Plus`；平台 gateway 为 `ppu`、Router 为 `ppu-qwen36plus`、环境类型为 `unmanaged`。最终业务入口 `http://122.209.21.209:60010/v1`，控制/观测/proxy/replay 分别使用 60011/60012/60013/60014。最初 60000 与 `ahm-web` 的既有 CNI 映射冲突，用户随后指定整体改用 60010–60014；旧管理服务、模型容器及防火墙规则保持。端口检查必须覆盖容器 NAT 映射，不能只检查监听 socket。
+
+平台没有修改独立网关登记地址的 API。本次地址修正通过维护窗口内的显式数据迁移完成：保存 SQLite 一致性备份，只迁移 PPU 当前地址并追加 Router 版本 2，原版本 1 和失败操作记录保留；engine 使用原容器和镜像重启载入登记。Web/engine/database/executors 健康为 ok，全局维护恢复 false，PPU 准入保持 false。初次未固定 WAL 读快照的备份被主动终止，未进入停机和数据修改阶段，文件标记为 `.incomplete`；最终固定读快照备份成功并核对原地址/版本，不能使用未完成备份恢复。
+
+首次绑定操作 `ppu-initial-bind-20261017` 已明确失败且未提交：模型发现、JSON 和 SSE 成功，工具调用名称、ID 或参数校验失败。直接向上游发送同类合成请求复现：`[{"name":"aigate_echo","parameters":{...}}]` 被放进普通 `content`，没有标准 `tool_calls`。没有跳过校验、改写响应、修改模型容器或重发绑定；不创建录制计划和回放任务。60010 业务查询返回 `503 gateway_not_accepting`。
+
+A3 从 `a3-delivery` 迁移三个容器，实际程序摘要、进程环境、配置摘要、持久挂载、资源限制和 replay 白名单核对一致。`a3-aigate.service`、`a3-aigate-proxy.service` 已禁用并移除，查询为 `not-found`；`aigate-split-access.service` 保持 enabled/active，原访问控制链保留。旧容器停止并关闭自动重启，仅保留作证据。
+
+生命周期有现场版本差异：A3 使用 `unless-stopped`；PPU 定制运行时只支持 `always`，维护停止需同时设置 restart policy=no 和 restart.status=stopped。两台均已用临时容器验证进程异常退出自动恢复、人工停止后保持停止，测试资源已清理；未执行主机或 containerd 重启。详见[容器维护](../packaging/CONTAINERS.md)。
+
+源码 Go 回归与 vet 通过；容器摘要、权限、访问控制和状态验收通过。PPU 真实模型验收仅达到上述边界，不进行负载测试。PPU 主机时钟现场比 test1/A3 快约 29 分钟，本轮未调整时钟；启用未来同步录放前需处理时钟一致性。
+
+本轮新增服务器目录：
+
+- PPU：`/bmcp_lvm_fs/aigate`，含 `config`、`proxy`、`recordings`、`replay`、`releases/container-unification-20261017/private`；proxy 运行产生画像子目录。
+- A3：`/var/lib/ai-gate/releases/container-unification-20261017` 及 `private`；原数据目录不迁移。
+- test1：`/data2/code-eval/releases/aigate-containers-20261017` 及 `private`，保存登记、失败验证、地址迁移及受限数据库备份。
+
+本地脱敏证据：`aigate/deploy/container-unification-20261017/evidence/{ppu,a3,platform}`。私有快照和密钥不进入 Git。
+
+## 前次发布：回放性能报告
+
 2026-10-17 17:04（北京时间）完成回放性能报告发布。通过 SSH MCP 更新 A3-gate、xpu1、dcu1 的 **aigate-replay** 至源码 `23cbcf7e60227f1f240e158a63ed22c83e84d48b`。Go 1.27.1、linux/amd64、CGO_ENABLED=0，离线 vendor 构建，`vcs.modified=false`；三台实际运行进程的二进制 SHA-256 均为 `01dce22c25f5eab35250d29c846d7126c81e6a326bd7ede3238f2bd7a16a6213`。
 
 | 节点 | replay 部署方式 | 本轮发布目录 |

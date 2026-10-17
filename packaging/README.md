@@ -12,9 +12,37 @@
 
 安装文件采用以下明确权限：`/etc/aigate` 为 `root:aigate-proxy`、0751，其他服务账号可以进入目录但不能列出内容，能否读取由各文件自己的属主和权限决定（回放服务以 `aigate-switch` 运行，需要进入该目录读取目标白名单）；`proxy-r1.json` 为 `root:aigate-proxy`、0640；所有实例 `.env` 文件为 `root:root`、0600，由 systemd 以 root 读取后注入环境。切流进程无需直接读取环境文件。二进制为 `root:root`、0755，服务文件为 `root:root`、0644。`StateDirectory` 由 systemd 创建并归属功能服务账号，权限 0700；不要复用旧入口观测目录。
 
-切流实例环境文件提供 `AIGATE_CONTROL_KEY`（至少 32 字节）、`AIGATE_ALLOWED_CIDRS`，以及需要覆盖的 `AIGATE_SWITCH_LISTEN`、`AIGATE_CONTROL_LISTEN`。启用录制时再设置 `AIGATE_RECORD_ROOT=/var/lib/aigate-record`、可选 `AIGATE_RECORD_MAX_BYTES`，以及与功能服务、回放服务相同的 `AIGATE_REPLAY_MARK_KEY`；为空时不录制。回放服务环境文件提供 `AIGATE_REPLAY_CONTROL_KEY`、`AIGATE_REPLAY_MARK_KEY`（均至少 32 字节），目标白名单文件为 `{"targets":{"r1":"http://127.0.0.1:18084"}}`，名字必须等于该功能服务的 `router_id`（平台按此名字锁定 Router，回放服务开始前核对），权限 `root:aigate-switch`、0640；部署后用 `sudo -u aigate-switch test -r /etc/aigate/replay-targets.json` 确认可读。回放服务与切流使用同一账号读取录制文件，录制目录只读挂载。功能服务环境文件配置同一 `AIGATE_REPLAY_MARK_KEY` 后才会为回放请求标 `traffic=replay`。环境文件权限使用 0600，不把密钥写入命令行或日志。功能实例环境文件只需覆盖监听地址或注入本地配置引用的上游环境变量；没有入站业务或观测密钥。一个主机启动多个同类实例时，各实例必须使用不同端口和独立数据根目录。
+切流实例环境文件提供 `AIGATE_CONTROL_KEY`（至少 32 字节）、`AIGATE_ALLOWED_CIDRS`，以及需要覆盖的 `AIGATE_SWITCH_LISTEN`、`AIGATE_CONTROL_LISTEN`。启用录制时再设置 `AIGATE_RECORD_ROOT=/var/lib/aigate-record`、可选 `AIGATE_RECORD_MAX_BYTES`；录制目录参数为空时不录制。功能实例环境文件可覆盖监听地址、注入本地配置引用的上游环境变量，以及配置下述回放验签密钥；没有入站业务或观测密钥。一个主机启动多个同类实例时，各实例必须使用不同端口和独立数据根目录。
 
-功能配置参考 [proxy.example.json](../examples/proxy.example.json)。部署前在与正式实例相同的上游环境变量下运行：
+回放服务环境文件提供 `AIGATE_REPLAY_CONTROL_KEY`、`AIGATE_REPLAY_MARK_KEY`（均至少 32 字节），目标白名单文件为 `{"targets":{"r1":"http://127.0.0.1:18084"}}`，名字必须等于该功能服务的 `router_id`（平台按此名字锁定 Router，回放服务开始前核对），权限 `root:aigate-switch`、0640；部署后用 `sudo -u aigate-switch test -r /etc/aigate/replay-targets.json` 确认可读。回放服务与切流使用同一账号读取录制文件，录制目录只读挂载。
+
+## 回放标记与多密钥验签
+
+这是当前源码能力，是否已部署以现场二进制和进程环境为准。回放请求头仍为 `X-Aigate-Replay: <run_id>/<seq>/<hmac>`，使用 HMAC-SHA256，不新增 key ID 或改变旧签名格式。
+
+| 环境变量 | switch / proxy 接收端 | replay 发送端 |
+| --- | --- | --- |
+| `AIGATE_REPLAY_MARK_KEY` | 默认信任密钥，兼容原单密钥配置 | 唯一签名密钥，仍为必填 |
+| `AIGATE_REPLAY_MARK_VERIFY_KEYS` | 可选 JSON 字符串数组，增加信任密钥 | 不读取，不用它选择签名密钥 |
+
+接收端取两项配置的并集，按原始字节去重，最多 8 把不同密钥；每把至少 32 字节，不裁剪空白。数组可以为空，也可以在不配置旧变量时独立使用。未设置或空字符串表示没有附加密钥；`null`、非数组、非字符串成员、短密钥或超限均导致启动失败。两项都未提供密钥时保持旧行为：不识别回放标记，仍按普通流量处理；这不会禁用业务录制。
+
+任一可信密钥验签通过，proxy 即标记 `traffic="replay"`，switch 即排除该请求的业务录制。未知密钥、错误签名或畸形标记均按普通流量处理。验签不改变准入、路由、租约或在途计数规则。
+
+例如在 systemd 的受限 `EnvironmentFile` 中配置以下结构；占位符须替换为真实密钥，不能直接使用：
+
+```ini
+AIGATE_REPLAY_MARK_KEY='<existing-key-at-least-32-bytes>'
+AIGATE_REPLAY_MARK_VERIFY_KEYS='["<additional-key-at-least-32-bytes>"]'
+```
+
+systemd 会去掉值外层的单引号；其他容器环境注入方式应传入原始 JSON 数组，不把外层 shell 引号作为值的一部分。环境文件权限为 0600，密钥只通过受保护通道分发，不写入 Git、命令行、日志或普通证据文件。配置检查与 switch/proxy 启动日志仅在 stderr 输出 `replay_mark_verify_keys=<有效数量>`，不输出密钥或摘要；配置在进程启动时加载，更新文件后需重启受影响进程。
+
+对于使用两组签名密钥的多个回放来源，让目标 switch/proxy 同时信任两组即可；每个 replay 保留自己的签名密钥及目标白名单。轮换顺序为：先部署接收端对新旧密钥的共同信任，再切换发送端签名密钥，确认旧签名请求排空且没有发送端继续使用旧密钥后，再从接收端配置中移除旧密钥。若旧密钥仍在 `AIGATE_REPLAY_MARK_KEY` 中，仅从数组移除它不会撤销信任。
+
+## 配置检查与维护
+
+功能配置参考 [proxy.example.json](../examples/proxy.example.json)。部署前在与正式实例相同的上游及回放验签环境变量下运行：
 
 ```sh
 /usr/local/bin/aigate-proxy --check-config --config /etc/aigate/proxy-r1.json

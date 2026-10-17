@@ -202,6 +202,29 @@ func TestSSEReadErrorAfterDoneIsRecordedWithoutEvent(t *testing.T) {
 	requireGenerationCount(t, g.profile, true, "error", "response_read_error", "200", 1)
 }
 
+// Admission validation may reject these responses, but business forwarding
+// must preserve the upstream bytes, including malformed tool arguments.
+func TestSSEAdmissionFailuresStillPassThrough(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"unterminated_done", completionEvent(0, map[string]any{"content": "hello"}, "stop") + "data: [DONE]"},
+		{"non_json_tool_arguments", completionEvent(0, map[string]any{"tool_calls": []any{
+			map[string]any{"index": 0, "id": "call-1", "type": "function", "function": map[string]any{
+				"name": "lookup", "arguments": `{"value":NaN}`,
+			}},
+		}}, "tool_calls") + "data: [DONE]\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := generationGateway(t, func(*http.Request) (*http.Response, error) {
+				return generationResponse(http.StatusOK, "text/event-stream", tc.body), nil
+			})
+			w := generationRequest(g, true)
+			if w.Code != http.StatusOK || w.Body.String() != tc.body {
+				t.Fatalf("business forwarding changed upstream response: status=%d body=%q", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 type encodingTestBody struct {
 	io.Reader
 	onClose func()
