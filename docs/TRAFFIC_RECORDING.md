@@ -57,7 +57,7 @@
 
 ## 回放标记
 
-`AIGATE_REPLAY_MARK_KEY`（至少 32 字节）配置在 switch、proxy 和回放服务。回放请求携带 `X-Aigate-Replay: <run_id>/<seq>/<HMAC-SHA256>`。签名有效时，switch 不录制该请求，proxy 在审计日志、画像事件、慢请求和流异常记录里标 `traffic=replay`，画像指标增加 `traffic="replay"` 标签以便监控排除；转发不变。签名无效或未配置密钥时按普通业务处理，不拒绝请求。
+回放服务使用自身的 `AIGATE_REPLAY_MARK_KEY`（至少 32 字节）签名，请求携带 `X-Aigate-Replay: <run_id>/<seq>/<HMAC-SHA256>`。switch/proxy 接收端信任自身该变量与 `AIGATE_REPLAY_MARK_VERIFY_KEYS` JSON 字符串数组的并集，原始字节去重后最多 8 把，每把至少 32 字节；回放服务不读取附加验证密钥。跨 gateway 回放时无需把所有签名端改成同一密钥，但接收端必须包含来源的签名密钥。完整格式和启动校验见[打包说明](../packaging/README.md)。签名有效时，switch 不录制该请求，proxy 在审计日志、画像事件、慢请求和流异常记录里标 `traffic=replay`，画像指标增加 `traffic="replay"` 标签以便监控排除；转发不变。签名无效或未配置密钥时按普通业务处理，不拒绝请求。目标白名单和控制认证独立保持。
 
 ## 回放（aigate-replay）
 
@@ -123,7 +123,9 @@
 本功能发布需更新 `aigate-replay`，并同步更新 code-eval engine 与 web。虽然响应观察器源码与 switch 录制共用，新增计时回调仅由 replay 启用，录制 schema 和控制协议未变；现有 switch 与 proxy 可继续配合新 replay 使用，无需为此功能替换。
 
 
-## 多目标批次（当前源码，待协调发布）
+## 多目标批次（2026-10-17 已协调发布）
+
+平台 Web/engine 及 DCU、XPU、A3、PPU 的 switch/proxy/replay 已更新，跨 gateway 多密钥互信和恢复准入校验通过。版本、白名单、现场证据与实际回放验收边界见[部署记录](DEPLOYMENT.md)。
 
 `recording-multi-target-v1` 支持同一批次的多个目标任务在同一回放服务中并行运行。平台分别提交单目标 `runs`，每个任务携带共同 `batch_id`、独立 `run_id`、`prepare_only=true` 和通过模型发现冻结的 `expected_target`。不同批次仍互斥，同一批次不能重复占用同一目标；没有批次字段的历史调用仍保持单任务互斥。
 

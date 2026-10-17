@@ -1,6 +1,44 @@
 # 当前部署身份
 
-## 2026-10-17 PPU 门禁通过并开放准入
+## 2026-10-17 23:38 多目标回放与跨 gateway 多密钥发布
+
+DCU、XPU、A3、PPU 的 switch、proxy、replay 共 12 个运行进程均更新至确定源码 `9cb5626dcd5a49be690b3bf86fd3bac421d285eb`。构建使用 Go 1.27.1、CGO_ENABLED=0、离线 vendor 模式，`vcs.modified=false`；A3 使用 linux/arm64，其他三处使用 linux/amd64。实际进程二进制摘要与构建产物逐项一致：
+
+| 二进制 | amd64 SHA-256 | arm64 SHA-256 |
+| --- | --- | --- |
+| switch | `3284d5bb98f67ce568882a8df068d0f29f820ef63aadb10f1693a54f8b086013` | `08a8ebc2506cc2b8710d7acac1f567ae469d1c115759a57e8cb10a835a020395` |
+| proxy | `7c63090662081c7db271868bb7f04aa2e83d1a49b28214a2be1628207ac8fe55` | `ab35d346c4a96abe141e3da1feab44d029d51962a9b4a738bf9ac0cd7f3130d0` |
+| replay | `86f343d0e78501036c7bbf4bc9062e27fe24e8b9a96729c0fee522d7de38649e` | `b272b1c92f3af6fba7a57e3af0b97992e31aaa9a2c79c65b4fa005b5fbe1ae12` |
+
+四处原有签名密钥共有两把不同值。replay 保留各自单把 `AIGATE_REPLAY_MARK_KEY`；八个 switch/proxy 接收进程配置两把密钥的信任并集，实际进程环境核验为两把，原签名密钥未改。现场分别向每个 proxy 发送两种有效签名和一种未知签名，共 12 个检查：审计日志中有效签名均为 `traffic=replay`，未知签名均不标记回放。请求以故意不匹配的 expected-model 在生成前返回 409，没有发送模型生成请求。switch 的多密钥录制排除语义由本地 race 回归覆盖，线上核验其二进制和实际配置；未为此新建录制会话。配置契约见[打包说明](../packaging/README.md#回放标记与多密钥验签)。
+
+| 环境 | 部署方式 | 恢复后的绑定 revision | 准入 |
+| --- | --- | --- | --- |
+| DCU / dcu1 | switch、proxy、replay 均为原 systemd 服务，新增末尾覆盖配置 | 52 | true |
+| XPU / xpu1 | switch/proxy 为原 `ai-gate` Kubernetes Deployment，replay 为 systemd | 33 | true |
+| A3 / hwA3-1 | `ai-gateway` namespace 的三个 nerdctl 容器 | 46 | true |
+| PPU / ppu | `ai-gateway` namespace 的三个 nerdctl 容器 | 4 | true |
+
+使用平台原生维护和恢复操作，等待已接收请求自然收尾后替换受影响组件。四个 `multi-key-restore-20261017-{dcu,xpu,a3,ppu}` 操作均 completed、committed=true；每处 discovery 及两轮 JSON/SSE/工具调用/工具续答共 9 项通过，总计 36 项。绑定目标保持原 Router，期望与观测 revision 一致，资源锁和候选绑定均为空；平台 `maintenance=false`、health=ok。这些恢复校验包含真实模型的小请求，但未新建实际多目标回放批次或进行负载验收。
+
+四处 replay 均公布 `recording-original-request-v1`、`recording-overlay-sync-v1` 和 `recording-multi-target-v1`，无活动回放。目标白名单保持原值：DCU/XPU 各允许 DCU、XPU、A3；A3 仅允许 A3；PPU 仅允许 PPU。多密钥互信不扩大目标访问权限。现有监听、CIDR、控制凭据、配置摘要和数据目录保持；A3/PPU 保留原基础镜像，通过只读二进制挂载运行新版本，不能用旧镜像标签推断运行源码。资源限制、UID/GID、只读根文件系统、capability 与挂载已核对。
+
+PPU 首次重建遇到旧 proxy 的 nerdctl 名称索引缺失；保存失败结果，确认旧容器已停止且禁止自动重启后，修正其保留名称并继续创建当前版本。DCU replay 启动后的首次即时进程校验碰到进程尚未就绪，随后实际摘要和健康检查通过。失败证据均保留，未回退，也未强制清理占用或删除旧数据。
+
+本轮新增服务器目录：
+
+| 节点 | 新增发布目录 |
+| --- | --- |
+| dcu1 | `/data4/aigate/releases/multi-target-replay-20261017/` |
+| xpu1 | `/var/lib/ai-gate/releases/multi-target-replay-20261017/` |
+| hwA3-1 | `/data/a3-standalone-20261017/aigate/releases/multi-target-replay-20261017/` |
+| ppu | `/bmcp_lvm_fs/aigate/releases/multi-target-replay-20261017/` |
+| test1 | `/data2/code-eval/releases/multi-target-replay-20261017/` |
+| test4 | `/data2/monitoring/releases/multi-target-replay-20261017/` |
+
+四个网关发布目录含 `bin/`、`private/`；dcu1、xpu1 另新增 `/etc/systemd/system/aigate-replay.service.d/`。XPU 新增 Secret `ai-gate/aigate-replay-verify-20261017`，Deployment 保持 Recreate 策略。受限目录 0700、凭据文件 0600，原容器和配置保留为证据。平台和 monitoring 的具体目录、镜像及验收见[平台发布记录](../../code-eval/deploy/releases/README.md)和[监控发布记录](../../monitoring/docs/releases/README.md)。本地脱敏收据为 `code-eval/deploy/evidence/multi-target-replay-20261017/public/`；私有密钥不进入 Git。
+
+## 前次状态：2026-10-17 PPU 门禁通过并开放准入
 
 用户取消“后端必须支持强制指定工具名”的接入要求后，`warmup.go` 的工具调用探针不再发送 `tool_choice.function.name`；工具定义、提示、返回调用名称/ID/参数校验和工具结果续答仍保留。此次只更新 PPU 的 `ppu-aigate-switch`，不修改 proxy、replay 或模型服务，不更新其他环境。
 
