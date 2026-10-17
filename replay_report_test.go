@@ -103,6 +103,15 @@ func TestReplayReportProductionFlow(t *testing.T) {
 			if r.State != "complete" || r.Stream.TTFT.Count != 2 || r.Stream.TPOT.Count != 2 || *r.Stream.TTFT.P50 < .01 {
 				t.Fatalf("%s", data)
 			}
+			path := "/control/replay/v1/runs/" + req.RunID + "/report"
+			if status, current := f.call(t, "GET", path, nil); status != 200 || current["version"] != float64(2) {
+				t.Fatal(status, current)
+			}
+			for _, query := range []string{"?version=1", "?version=2", "?version="} {
+				if status, _ := f.call(t, "GET", path+query, nil); status != 400 {
+					t.Fatal("version selection still available", status)
+				}
+			}
 			results := readReplayResults(t, f, req.RunID)
 			for _, v := range results {
 				if v.EndOffset == nil || v.FirstOutput == nil || *v.EndOffset < *v.LastOutput {
@@ -122,11 +131,11 @@ func TestReplayReportProductionFlow(t *testing.T) {
 	}
 }
 
-func TestReplayMinuteBucketsAndMissingSamples(t *testing.T) {
+func TestReplayThirtySecondBucketsAndMissingSamples(t *testing.T) {
 	dir := t.TempDir()
 	rows := []replayResult{
 		{TimingVersion: 1, Sequence: 1, SendOffset: fp(0), EndOffset: fp(60), FirstOutput: fp(1), LastOutput: fp(59), HTTPStatus: 200, Stream: true, ActualTokens: up(3), Observation: &responseObservation{ProtocolComplete: true}},
-		{TimingVersion: 1, Sequence: 2, SendOffset: fp(61), EndOffset: fp(121), HTTPStatus: 200},
+		{TimingVersion: 1, Sequence: 2, PlannedOffset: 61, SendOffset: fp(61), EndOffset: fp(121), HTTPStatus: 200},
 	}
 	var b strings.Builder
 	for _, r := range rows {
@@ -134,17 +143,17 @@ func TestReplayMinuteBucketsAndMissingSamples(t *testing.T) {
 		b.WriteByte('\n')
 	}
 	os.WriteFile(filepath.Join(dir, "results.jsonl"), []byte(b.String()), 0600)
-	r := buildReplayReportVersion(dir, replayRunView{State: "completed", Progress: replayProgress{Sent: 2}}, 1)
-	if len(r.Curve) != 3 || r.Curve[0].Width != 60 || r.Curve[1].Width != 60 || r.Curve[2].Width != 1 {
+	r := buildReplayReport(dir, replayRunView{State: "completed", Progress: replayProgress{Sent: 2}})
+	if len(r.Curve) != 5 || r.Curve[0].Width != 30 || r.Curve[1].Width != 30 || r.Curve[4].Width != 1 {
 		t.Fatal(r.Curve)
 	}
-	if r.Curve[0].Success != 1 || r.Curve[0].TTFT.Count != 1 || r.Curve[1].Success != 0 || r.Curve[1].TTFT.P50 != nil || r.Curve[2].E2ENonstream.Count != 1 {
+	if r.Curve[1].Success != 1 || r.Curve[0].TTFT.Count != 1 || r.Curve[3].Success != 0 || r.Curve[1].TTFT.P50 != nil || r.Curve[2].E2ENonstream.Count != 1 {
 		t.Fatal(r.Curve)
 	}
-	if r.Curve[0].OutputTokens != 3 || r.Curve[2].UsageKnown != 0 {
+	if r.Curve[1].OutputTokens != 3 || r.Curve[4].UsageKnown != 0 {
 		t.Fatal(r.Curve)
 	}
-	if math.Abs(r.Curve[1].InflightMean-59.0/60) > 1e-9 {
+	if math.Abs(r.Curve[2].InflightMean-29.0/30) > 1e-9 {
 		t.Fatal(r.Curve[1])
 	}
 }

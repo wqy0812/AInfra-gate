@@ -161,18 +161,12 @@ func (m *replayMetrics) add(v replayResult) {
 }
 func (m *replayMetrics) finish() { m.E2E.finish(); m.TTFT.finish(); m.TPOT.finish() }
 func buildReplayReport(dir string, view replayRunView) replayReport {
-	return buildReplayReportVersion(dir, view, 2)
-}
-func buildReplayReportVersion(dir string, view replayRunView, version int) replayReport {
 	width, limit := 30.0, 20160
 	basis := "planned_send"
 	if view.Request != nil && view.Request.Mode == "concurrency" {
 		basis = "actual_send"
 	}
-	if version == 1 {
-		width, limit, basis = 60, 10080, "completion"
-	}
-	r := replayReport{Version: version, BucketSeconds: int(width), LatencyBasis: basis, Truncation: view.Truncation, State: "complete", RunID: view.RunID, RunState: view.State, StartedAt: view.StartedAt, Target: view.Target, Request: view.Request, Progress: view.Progress, Errors: map[string]int{}, Curve: []replayCurve{}, HistogramRelativeError: .02}
+	r := replayReport{Version: replayReportVersion, BucketSeconds: int(width), LatencyBasis: basis, Truncation: view.Truncation, State: "complete", RunID: view.RunID, RunState: view.State, StartedAt: view.StartedAt, Target: view.Target, Request: view.Request, Progress: view.Progress, Errors: map[string]int{}, Curve: []replayCurve{}, HistogramRelativeError: .02}
 	if view.Plan != nil {
 		r.PlannedDuration = view.Plan.DurationSeconds
 		r.InputDigest = view.Plan.InputDigest
@@ -189,9 +183,7 @@ func buildReplayReportVersion(dir string, view replayRunView, version int) repla
 		return r
 	}
 	defer f.Close()
-	if version == 2 {
-		r.InputDigest, r.FilterPolicy, r.FilterEvidence = replayReportInput(dir, view)
-	}
+	r.InputDigest, r.FilterPolicy, r.FilterEvidence = replayReportInput(dir, view)
 	if view.State == "truncated" {
 		r.Reason = "tail_truncated"
 	}
@@ -249,9 +241,6 @@ func buildReplayReportVersion(dir string, view replayRunView, version int) repla
 			cohortAt = *v.SendOffset
 		}
 		cohort := max(0, int(math.Floor(cohortAt/width)))
-		if version == 1 {
-			cohort = completion
-		}
 		pointAt := func(index int) *replayCurve {
 			if index >= limit {
 				return nil
@@ -330,7 +319,7 @@ func buildReplayReportVersion(dir string, view replayRunView, version int) repla
 		return events[i].at < events[j].at
 	})
 	horizon := *r.LastEnd
-	if version == 2 && basis == "planned_send" {
+	if basis == "planned_send" {
 		horizon = max(horizon, r.PlannedDuration)
 	}
 	count := max(1, min(limit, int(math.Ceil(horizon/width))))
@@ -384,11 +373,7 @@ func (s *replayService) saveReport(view replayRunView) {
 		s.audit.Print("replay_report_write_failed run=" + view.RunID)
 	}
 }
-func (s *replayService) loadReport(id string, versions ...string) (any, bool) {
-	version := 2
-	if len(versions) > 0 && versions[0] == "1" {
-		version = 1
-	}
+func (s *replayService) loadReport(id string) (any, bool) {
 	s.mu.Lock()
 	view, ok := s.loadRunLocked(id)
 	if ok {
@@ -409,18 +394,18 @@ func (s *replayService) loadReport(id string, versions ...string) (any, bool) {
 		return nil, false
 	}
 	if view.EndedAt == nil {
-		return map[string]any{"version": version, "state": "generating", "run_id": id}, true
+		return map[string]any{"version": replayReportVersion, "state": "generating", "run_id": id}, true
 	}
 	data, err := os.ReadFile(filepath.Join(s.runDir(id), "report.json"))
 	var header struct {
 		Version int `json:"version"`
 	}
-	if err == nil && json.Unmarshal(data, &header) == nil && header.Version == version {
+	if err == nil && json.Unmarshal(data, &header) == nil && header.Version == replayReportVersion {
 		return json.RawMessage(data), true
 	}
 	// Read-only reconstruction allows retry after a report write failure. Legacy
 	// data is explicitly unavailable; reading a report never sends requests.
-	return buildReplayReportVersion(s.runDir(id), view, version), true
+	return buildReplayReport(s.runDir(id), view), true
 }
 
 func mergeReplayHistogram(to *replayHistogram, from replayHistogram) {

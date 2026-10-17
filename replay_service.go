@@ -515,11 +515,11 @@ func (s *replayService) Handler() http.Handler {
 				return
 			}
 			if r.Method == http.MethodGet && action == "report" {
-				if version := r.URL.Query().Get("version"); version != "" && version != "1" && version != "2" {
-					runtimeError(w, 400, "unsupported_report_version")
+				if r.URL.Query().Has("version") {
+					runtimeError(w, 400, "report_version_selection_removed")
 					return
 				}
-				if report, ok := s.loadReport(id, r.URL.Query().Get("version")); ok {
+				if report, ok := s.loadReport(id); ok {
 					replayJSON(w, 200, report)
 				} else {
 					runtimeError(w, 404, "run_not_found")
