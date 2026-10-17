@@ -1,5 +1,31 @@
 # 当前部署身份
 
+## 2026-10-18 05:11 双录制独立并发：仅更新 replay
+
+DCU、XPU、A3、PPU 的 aigate-replay 已部署 `0be523881cebe01292513e13a2f0da707a4d736c`，新增 `recording-concurrency-per-source-v1`。每份录制拥有独立并发额度，目标级收尾按总额度计算；报告提供逐录制 `source_inputs`。Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath 构建，二进制内嵌上述 Git revision 且 `vcs.modified=false`。
+
+| 环境 / SSH MCP target | 部署方式 | 实际运行二进制 SHA-256 |
+| --- | --- | --- |
+| DCU / dcu1 | 原 `aigate-replay.service`，linux/amd64 | `96baafd732a68c7f1f509ca10f4e9f248d1766e30f92e2fbdc9b222824e89512` |
+| XPU / xpu1 | 原 `aigate-replay.service`，linux/amd64 | `96baafd732a68c7f1f509ca10f4e9f248d1766e30f92e2fbdc9b222824e89512` |
+| A3 / hwA3-1 | `ai-gateway/a3-aigate-replay`，linux/arm64 | `b854ece67813174243dff838812716363f994910738db22f08d6ee68f56b53da` |
+| PPU / ppu | `ai-gateway/ppu-aigate-replay`，linux/amd64 | `96baafd732a68c7f1f509ca10f4e9f248d1766e30f92e2fbdc9b222824e89512` |
+
+四处 status 已核验新能力、schema=2、无活动回放及原目标白名单；未认证 status 为 403，不存在的报告返回 404。原启动参数、凭据、服务权限和限制保持，A3/PPU 的规范化 OCI 配置一致，旧 replay 容器停止并禁用自动重启。DCU/XPU 增加 `zzzzz-model-standards-20261018.conf`，其排序在此前覆盖文件之后。switch、proxy、模型服务未替换；四入口原绑定 revision 为 52/33/46/4，准入仍为 true。
+
+DCU 的 62,543 个录制文件（4,588,288,633 bytes）和 32 个回放文件（4,965,758 bytes）内容、元数据清单前后一致；其他三处空录制和回放目录保持，未清理历史数据。配套 engine/Web 与标准结果迁移已完成，平台于 05:11:34 恢复原 `maintenance=false`，详见 [平台发布记录](../../code-eval/deploy/releases/README.md#model-standards-20261018)。本次未创建真实回放负载；独立并发及自动截断的行为验证来自本地合成回归，线上验收覆盖部署身份、能力和数据保持。
+
+新增服务器发布目录如下，均含 `bin/`、`private/`、`checks/`；发布根目录 0711、二进制目录 0755、私有目录 0700，数据库和凭据未下载或进入 Git。
+
+| 节点 | 新增目录 |
+| --- | --- |
+| dcu1 | `/data4/aigate/releases/model-standards-20261018/` |
+| xpu1 | `/var/lib/ai-gate/releases/model-standards-20261018/` |
+| hwA3-1 | `/data/a3-standalone-20261017/aigate/releases/model-standards-20261018/` |
+| ppu | `/bmcp_lvm_fs/aigate/releases/model-standards-20261018/` |
+
+本地二进制位于 `code-eval/deploy/dist/model-standards-20261018-gate/`，四处脱敏验收收据位于 `code-eval/deploy/evidence/model-standards-20261018/checks/{dcu1,xpu1,a3,ppu}/verification.json`。未回退旧版本。
+
 ## 2026-10-18 02:59 单份报告收尾：仅更新 replay
 
 四处 aigate-replay 已更新至 `f519363f3ddd594438ad3343e4f6240efaf79d1d`，固定读取当前 v2 报告，`?version=1`、`?version=2` 和空 version 均拒绝为 400。源码来自该 commit 的 Git 归档，Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath、buildvcs=false 构建，归档身份与二进制摘要保存在本地 `deploy/replay-ui-final-20261018/manifest.json`。
