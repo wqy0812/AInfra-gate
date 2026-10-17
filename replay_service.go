@@ -143,6 +143,7 @@ func (s *replayService) recover() error {
 			if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 				return err
 			}
+			s.saveReport(view)
 		}
 	}
 	return s.pruneRuns(replayRunsKept)
@@ -471,6 +472,14 @@ func (s *replayService) Handler() http.Handler {
 			id, action, _ := strings.Cut(rest, "/")
 			if !validOperationID(id) {
 				runtimeError(w, 404, "run_not_found")
+				return
+			}
+			if r.Method == http.MethodGet && action == "report" {
+				if report, ok := s.loadReport(id); ok {
+					replayJSON(w, 200, report)
+				} else {
+					runtimeError(w, 404, "run_not_found")
+				}
 				return
 			}
 			if r.Method == http.MethodGet && action == "" {

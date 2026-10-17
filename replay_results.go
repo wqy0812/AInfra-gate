@@ -24,6 +24,12 @@ type replayOutputSummary struct {
 }
 
 type replayResult struct {
+	TimingVersion     int      `json:"timing_version,omitempty"`
+	EndOffset         *float64 `json:"end_offset_seconds,omitempty"`
+	FirstOutput       *float64 `json:"first_output_seconds,omitempty"`
+	LastOutput        *float64 `json:"last_output_seconds,omitempty"`
+	Stream            bool     `json:"stream"`
+	MultipleChoices   bool     `json:"multiple_choices,omitempty"`
 	GatewayID         string   `json:"gateway_id"`
 	RecordingID       string   `json:"recording_id"`
 	Segment           string   `json:"segment"`

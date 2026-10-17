@@ -6,6 +6,7 @@ package aigate
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -157,7 +158,6 @@ func (r *replayRun) finish(state, errText string) {
 	// Publish the terminal state and release the slot under the service lock.
 	// start/stop use the same service -> run lock order.
 	r.svc.mu.Lock()
-	defer r.svc.mu.Unlock()
 	r.mu.Lock()
 	// stop() acknowledges under this same lock. A successful stop cannot be
 	// overwritten by an already chosen completed transition.
@@ -187,6 +187,8 @@ func (r *replayRun) finish(state, errText string) {
 	if r.svc.active == r {
 		r.svc.active = nil
 	}
+	r.svc.saveReport(r.view())
+	r.svc.mu.Unlock()
 	close(r.done)
 }
 
@@ -394,6 +396,7 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	release := func() { releaseOnce.Do(func() { r.svc.bodyMemory.release(charge) }) }
 	defer release()
 	result := replayResult{GatewayID: item.GatewayID, RecordingID: item.RecordingID, Segment: item.Segment, Sequence: item.Sequence, OriginalRequestID: item.RequestID, RequestID: randomID(), PlannedOffset: item.OffsetSeconds, Rewritten: []string{}}
+	result.TimingVersion = 1
 	// Preparation failures and stop-before-send remain visible with null offsets.
 	defer func() {
 		r.saveResult(result)
@@ -414,6 +417,12 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 			}
 		}
 		r.mu.Unlock()
+	}()
+	defer func() {
+		if result.SendOffset != nil {
+			v := time.Since(r.begin).Seconds()
+			result.EndOffset = &v
+		}
 	}()
 	fail := func(detail string) {
 		result.Error = detail
@@ -437,6 +446,11 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		result.Rewritten = r.req.rewritten()
 	}
 	body = rewritten
+	var options struct {
+		N int `json:"n"`
+	}
+	_ = json.Unmarshal(body, &options)
+	result.MultipleChoices = options.N > 1
 	ctx, cancel := context.WithTimeout(r.svc.ctx, time.Duration(r.req.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	var traceMu sync.Mutex
@@ -508,6 +522,15 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	defer response.Body.Close()
 	result.HTTPStatus = response.StatusCode
 	observer := newResponseObserver(response.Header)
+	result.Stream = observer.sse
+	observer.onOutput = func(at time.Time) {
+		v := at.Sub(r.begin).Seconds()
+		if result.FirstOutput == nil {
+			first := v
+			result.FirstOutput = &first
+		}
+		result.LastOutput = &v
+	}
 	var destination io.Writer = observer
 	var errorPrefix replayErrorPrefix
 	if response.StatusCode < 200 || response.StatusCode > 299 {
@@ -519,6 +542,7 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		transport = replayErrorClass(err)
 	}
 	observed := observer.finish(transport)
+	result.MultipleChoices = result.MultipleChoices || observer.multipleChoices
 	result.Observation, result.ErrorSummary = &observed, observed.ErrorSummary
 	if result.ErrorSummary == "" {
 		result.ErrorSummary = string(errorPrefix.data[:errorPrefix.used])

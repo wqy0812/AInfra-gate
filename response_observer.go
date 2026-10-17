@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -28,6 +29,9 @@ type responseObservation struct {
 }
 
 type responseObserver struct {
+	onOutput                                        func(time.Time)
+	observedAt                                      time.Time
+	multipleChoices                                 bool
 	input                                           [responseObserverBuffer]byte
 	result                                          responseObservation
 	parser                                          responseJSONParser
@@ -59,6 +63,9 @@ func (o *responseObserver) fail(code string) {
 // Write always accepts all bytes. Observation errors must never affect forwarding.
 func (o *responseObserver) Write(p []byte) (int, error) {
 	n := len(p)
+	if o.onOutput != nil {
+		o.observedAt = time.Now()
+	}
 	if o.ended || o.result.ParseError != "" {
 		return n, nil
 	}
@@ -184,6 +191,10 @@ func (o *responseObserver) endEvent() {
 		o.parser.finish()
 		// Preserve a completed usage object even if the enclosing event broke.
 		o.mergeParser()
+		o.multipleChoices = o.multipleChoices || o.parser.multipleChoices
+		if o.parser.err == "" && o.parser.generated && o.onOutput != nil {
+			o.onOutput(o.observedAt)
+		}
 		if o.parser.err != "" {
 			o.fail(o.parser.err)
 		}
@@ -232,6 +243,10 @@ const (
 	jsonChoices
 	jsonChoice
 	jsonError
+	jsonDelta
+	jsonTools
+	jsonTool
+	jsonFunction
 )
 
 type responseJSONFrame struct {
@@ -243,22 +258,25 @@ type responseJSONFrame struct {
 }
 
 type responseJSONParser struct {
-	stack                   [responseObserverDepth]responseJSONFrame
-	depth                   int
-	started, complete       bool
-	lex                     byte
-	keyToken, keep, escaped bool
-	unicode                 int
-	token                   [responseErrorLimit + 2]byte
-	length                  int
-	overflow                bool
-	err                     string
-	usage                   map[string]uint64
-	reasons                 []string
-	errorSummary            string
-	responseError           bool
-	utf                     [utf8.UTFMax]byte
-	utfLen                  int
+	choiceCount                int
+	generated, multipleChoices bool
+	stringBytes                int
+	stack                      [responseObserverDepth]responseJSONFrame
+	depth                      int
+	started, complete          bool
+	lex                        byte
+	keyToken, keep, escaped    bool
+	unicode                    int
+	token                      [responseErrorLimit + 2]byte
+	length                     int
+	overflow                   bool
+	err                        string
+	usage                      map[string]uint64
+	reasons                    []string
+	errorSummary               string
+	responseError              bool
+	utf                        [utf8.UTFMax]byte
+	utfLen                     int
 }
 
 func jsonSpace(b byte) bool { return b == ' ' || b == '\t' || b == '\r' || b == '\n' }
@@ -297,7 +315,28 @@ func (p *responseJSONParser) valueRole() int {
 	if f.role == jsonChoices && f.kind == '[' {
 		return jsonChoice
 	}
+	if f.role == jsonChoice && f.key == "delta" {
+		return jsonDelta
+	}
+	if f.role == jsonDelta && f.key == "tool_calls" {
+		return jsonTools
+	}
+	if f.role == jsonTools && f.kind == '[' {
+		return jsonTool
+	}
+	if (f.role == jsonTool && f.key == "function") || (f.role == jsonDelta && f.key == "function_call") {
+		return jsonFunction
+	}
 	return jsonOther
+}
+
+func (p *responseJSONParser) outputScalar() bool {
+	if p.depth == 0 {
+		return false
+	}
+	f := p.top()
+	return (f.role == jsonDelta && (f.key == "content" || f.key == "reasoning_content" || f.key == "reasoning")) ||
+		(f.role == jsonFunction && (f.key == "name" || f.key == "arguments")) || (f.role == jsonChoice && f.key == "text")
 }
 
 func (p *responseJSONParser) wantsScalar() bool {
@@ -306,7 +345,7 @@ func (p *responseJSONParser) wantsScalar() bool {
 	}
 	f := p.top()
 	return (f.role == jsonUsage && (f.key == "prompt_tokens" || f.key == "completion_tokens" || f.key == "total_tokens")) ||
-		(f.role == jsonChoice && f.key == "finish_reason") || (f.role == jsonError && f.key == "message") ||
+		(f.role == jsonChoice && (f.key == "finish_reason" || f.key == "index")) || (f.role == jsonError && f.key == "message") ||
 		(f.role == jsonRoot && f.key == "error")
 }
 
@@ -324,6 +363,9 @@ func (p *responseJSONParser) valueDone() {
 }
 
 func (p *responseJSONParser) scalar() {
+	if !p.keyToken && p.outputScalar() && p.stringBytes > 2 {
+		p.generated = true
+	}
 	if p.keyToken {
 		if p.overflow || p.length > 256 {
 			p.top().key = ""
@@ -341,6 +383,12 @@ func (p *responseJSONParser) scalar() {
 	if p.keep && p.wantsScalar() {
 		f := p.top()
 		raw := p.token[:p.length]
+		if f.role == jsonChoice && f.key == "index" {
+			index, err := strconv.ParseUint(string(raw), 10, 64)
+			p.multipleChoices = p.multipleChoices || err != nil || index > 0
+			p.valueDone()
+			return
+		}
 		if f.role == jsonUsage {
 			n, err := strconv.ParseUint(string(raw), 10, 64)
 			if p.overflow || err != nil {
@@ -379,6 +427,9 @@ func (p *responseJSONParser) feed(b byte) {
 		return
 	}
 	if p.lex == 's' {
+		if p.stringBytes < 3 {
+			p.stringBytes++
+		}
 		p.add(b)
 		if b >= utf8.RuneSelf || p.utfLen != 0 {
 			p.utf[p.utfLen] = b
@@ -508,6 +559,10 @@ func (p *responseJSONParser) feed(b byte) {
 			return
 		}
 		role := p.valueRole()
+		if role == jsonChoice {
+			p.choiceCount++
+			p.multipleChoices = p.multipleChoices || p.choiceCount > 1
+		}
 		if (role == jsonUsage && b != '{') || (role == jsonChoices && b != '[') || (role == jsonChoice && b != '{') {
 			p.fail("invalid_response_shape")
 			return
@@ -522,7 +577,9 @@ func (p *responseJSONParser) feed(b byte) {
 		return
 	}
 	p.keyToken, p.keep, p.length, p.overflow = key, key || p.wantsScalar(), 0, false
+	p.stringBytes = 0
 	if b == '"' {
+		p.stringBytes = 1
 		p.lex = 's'
 		p.add(b)
 		return
