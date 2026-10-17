@@ -849,7 +849,7 @@
         "summary": "Replay service identity, target names and the active run",
         "responses": {
           "200": {
-            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-original-request-v1.",
+            "description": "Service status, boot_id, targets, active_run, active_runs, active_batch, recording_schema=2 and capabilities containing recording-original-request-v1.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1104,7 +1104,7 @@
             }
           }
         ],
-        "description": "Requires recording-overlay-sync-v1. Idempotent for the same start_at; changed start time conflicts. Rejects past or more than 30 seconds future starts. An armed scheduler tolerates up to 10 seconds of late wakeup, then fails without dispatch. Never resumes stopped or recovered runs.",
+        "description": "Requires recording-overlay-sync-v1. Idempotent for the same start_at; changed start time conflicts. Rejects past or more than 30 seconds future starts. An armed scheduler tolerates up to 60 seconds of late wakeup, then fails without dispatch. Never resumes stopped or recovered runs.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1221,7 +1221,7 @@
         "summary": "Authenticated clock sample",
         "responses": {
           "200": {
-            "description": "Service status, boot_id, targets, active_run, recording_schema=2 and capabilities containing recording-original-request-v1.",
+            "description": "Service status, boot_id, targets, active_run, active_runs, active_batch, recording_schema=2 and capabilities containing recording-original-request-v1.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2079,7 +2079,36 @@
           "prepare_only": {
             "type": "boolean",
             "default": false,
-            "description": "Timed only. Plan and lock recordings without sending. Requires start and 15-second renewable lease; unstarted preparation expires after 120 seconds."
+            "description": "Plan and lock recordings without sending. Single-source timed or concurrency; dual-source timed only. Requires start and a 15-second renewable lease; unstarted preparation expires after 120 seconds."
+          },
+          "batch_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,128}$",
+            "description": "Requires prepare_only=true and recording-multi-target-v1. Only runs of the same batch may overlap on one replay service; each target has independent dispatch and results."
+          },
+          "expected_target": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "router_id",
+              "service_id",
+              "config_digest"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "router_id": {
+                "type": "string"
+              },
+              "service_id": {
+                "type": "string"
+              },
+              "config_digest": {
+                "type": "string"
+              }
+            },
+            "description": "Identity captured with model discovery; preparation fails if the current target differs."
           }
         },
         "oneOf": [

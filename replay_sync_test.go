@@ -200,7 +200,7 @@ func TestReplayOverlayLeaseStopLateStartAndRecovery(t *testing.T) {
 				restored := openRecoveredReplay(t, root, data)
 				defer restored.Close()
 				view, _ := restored.loadRun(req.RunID)
-				if view.State != "end_unknown" || restored.active != nil {
+				if view.State != "end_unknown" || len(restored.active) != 0 {
 					t.Fatal(view)
 				}
 			}
@@ -296,7 +296,7 @@ func TestReplayOverlayFatalFailureIsVisibleBeforeDrain(t *testing.T) {
 }
 
 func TestReplayOverlayWakeupTolerance(t *testing.T) {
-	for _, late := range []time.Duration{2 * time.Second, 11 * time.Second} {
+	for _, late := range []time.Duration{2 * time.Second, 59 * time.Second, 61 * time.Second} {
 		t.Run(late.String(), func(t *testing.T) {
 			root, req := syntheticReplay(t, 1, 0, `{}`)
 			req.PrepareOnly = true
@@ -316,7 +316,7 @@ func TestReplayOverlayWakeupTolerance(t *testing.T) {
 			r.mu.Unlock()
 			close(r.startSignal)
 			view := f.wait(t, req.RunID)
-			if late < 10*time.Second {
+			if late < replayStartTolerance {
 				if view.State != "completed" || received.Load() != 1 {
 					t.Fatalf("valid relaxed start rejected: %+v", view)
 				}

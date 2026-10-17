@@ -72,10 +72,12 @@ type replayService struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
-	mu     sync.Mutex
-	active *replayRun
-	runs   map[string]*replayRun
-	wg     sync.WaitGroup
+	mu        sync.Mutex
+	active    map[string]*replayRun
+	reporting map[string]bool
+	segments  map[string]*replaySegmentLease
+	runs      map[string]*replayRun
+	wg        sync.WaitGroup
 }
 
 func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot string, targets map[string]string, markKey []byte, audit io.Writer) (*replayService, error) {
@@ -103,7 +105,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
 		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, openResults: func(path string) (replayResultFile, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{},
+		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{}, active: map[string]*replayRun{}, reporting: map[string]bool{}, segments: map[string]*replaySegmentLease{},
 		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err = s.recover(); err != nil {
 		s.Close()
@@ -163,11 +165,17 @@ func (s *replayService) pruneRuns(keep int) error {
 		at   time.Time
 	}
 	var all []kept
+	activeBatches := map[string]bool{}
+	for _, run := range s.active {
+		if run.req.BatchID != "" {
+			activeBatches[run.req.BatchID] = true
+		}
+	}
 	for _, entry := range entries {
 		if !entry.IsDir() || !validOperationID(entry.Name()) {
 			continue
 		}
-		if s.active != nil && entry.Name() == s.active.req.RunID {
+		if s.active[entry.Name()] != nil || s.reporting[entry.Name()] {
 			keep--
 			continue
 		}
@@ -177,10 +185,14 @@ func (s *replayService) pruneRuns(keep int) error {
 			all = append(all, kept{entry.Name(), time.Time{}})
 			continue
 		}
+		if view.Request != nil && activeBatches[view.Request.BatchID] {
+			keep--
+			continue
+		}
 		all = append(all, kept{entry.Name(), view.CreatedAt})
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
-	for len(all) > keep {
+	for len(all) > max(keep, 0) {
 		_ = os.RemoveAll(filepath.Join(root, all[0].name))
 		delete(s.runs, all[0].name)
 		all = all[1:]
@@ -191,12 +203,15 @@ func (s *replayService) pruneRuns(keep int) error {
 func (s *replayService) Close() {
 	s.cancel()
 	s.mu.Lock()
-	active := s.active
+	active := make([]*replayRun, 0, len(s.active))
+	for _, r := range s.active {
+		active = append(active, r)
+	}
 	s.mu.Unlock()
-	if active != nil {
-		active.stopped.Store(true)
-		active.cancel()
-		<-active.done
+	for _, r := range active {
+		r.stopped.Store(true)
+		r.cancel()
+		<-r.done
 	}
 	s.wg.Wait()
 	unlockState(s.directory)
@@ -280,8 +295,10 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 	if s.ctx.Err() != nil {
 		return replayRunView{}, 409, "service_stopping"
 	}
-	if s.active != nil {
-		return replayRunView{}, 409, "run_active"
+	for _, active := range s.active {
+		if req.BatchID == "" || active.req.BatchID != req.BatchID || active.req.Target == req.Target {
+			return replayRunView{}, 409, "run_active"
+		}
 	}
 	_ = s.pruneRuns(replayRunsKept - 1)
 	dir := s.runDir(req.RunID)
@@ -300,11 +317,11 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 		_ = os.RemoveAll(dir)
 		return replayRunView{}, 500, "storage_failed"
 	}
-	s.active = r
+	s.active[req.RunID] = r
 	s.runs[req.RunID] = r
 	if len(s.runs) > 32 {
 		for id, old := range s.runs {
-			if old != r && old != s.active && old.view().EndedAt != nil {
+			if old != r && s.active[id] == nil && old.view().EndedAt != nil {
 				delete(s.runs, id)
 			}
 		}
@@ -416,8 +433,15 @@ func (s *replayService) Handler() http.Handler {
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"status":
 			s.mu.Lock()
 			var active any
-			if s.active != nil {
-				active = s.active.req.RunID
+			ids := make([]string, 0, len(s.active))
+			batch := ""
+			for id, run := range s.active {
+				ids = append(ids, id)
+				batch = run.req.BatchID
+			}
+			sort.Strings(ids)
+			if len(ids) > 0 {
+				active = ids[0]
 			}
 			s.mu.Unlock()
 			names := []string{}
@@ -425,7 +449,7 @@ func (s *replayService) Handler() http.Handler {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "capabilities": []string{replayProtocolCapability, replayOverlayCapability}, "recording_schema": recordingSchema})
+			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "active_runs": ids, "active_batch": batch, "capabilities": []string{replayProtocolCapability, replayOverlayCapability, replayMultiTargetCapability}, "recording_schema": recordingSchema})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"recordings":
 			gateway := r.URL.Query().Get("gateway_id")
 			if !validOperationID(gateway) {

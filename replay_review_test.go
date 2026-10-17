@@ -78,7 +78,7 @@ func TestReplayStateWriteFailuresDoNotPublishSuccess(t *testing.T) {
 			req := normalizedReplayRequest(t, "state", "rec-state", summary.Segments[0].Segment, "r1")
 			_, code, detail := f.svc.start(req)
 			if phase == "planning" {
-				if code != 500 || detail != "storage_failed" || f.svc.active != nil {
+				if code != 500 || detail != "storage_failed" || len(f.svc.active) != 0 {
 					t.Fatal(code, detail)
 				}
 				if _, err := os.Stat(f.svc.runDir(req.RunID)); !os.IsNotExist(err) {
@@ -217,7 +217,7 @@ func TestReplayStopBeforeStartSurvivesRestart(t *testing.T) {
 			t.Fatal(code, view)
 		}
 	}
-	if rec.router.posts.Load() != before || f.svc.active != nil {
+	if rec.router.posts.Load() != before || len(f.svc.active) != 0 {
 		t.Fatal("cancelled start sent traffic")
 	}
 }
@@ -232,7 +232,7 @@ func TestReplayAcknowledgedStopWinsChosenCompletion(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r := &replayRun{svc: f.svc, req: replayRequest{RunID: "finishing"}, dir: dir, cancel: cancel, done: make(chan struct{}), state: "running", created: time.Now().UTC()}
-	f.svc.runs[r.req.RunID], f.svc.active = r, r
+	f.svc.runs[r.req.RunID], f.svc.active[r.req.RunID] = r, r
 	view, status, _ := f.svc.stop(r.req.RunID)
 	if status != 200 || view.State != "stopping" {
 		t.Fatal(status, view)

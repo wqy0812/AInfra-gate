@@ -71,7 +71,7 @@ func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
 	reopened := openRecoveredReplay(t, root, restartRoot)
 	defer reopened.Close()
 	again, _ := reopened.loadRun(req.RunID)
-	if !bytes.Equal(encodeJSON(view), encodeJSON(again)) || reopened.active != nil {
+	if !bytes.Equal(encodeJSON(view), encodeJSON(again)) || len(reopened.active) != 0 {
 		t.Fatal("recovery was not idempotent")
 	}
 }

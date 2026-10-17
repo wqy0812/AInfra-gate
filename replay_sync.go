@@ -6,10 +6,11 @@ import (
 )
 
 const replayOverlayCapability = "recording-overlay-sync-v1"
+const replayMultiTargetCapability = "recording-multi-target-v1"
 
 // Overlay comparisons use the middle of a run; second-level startup jitter
 // does not invalidate that workload. Keep this in sync with the platform.
-const replayStartTolerance = 10 * time.Second
+const replayStartTolerance = 60 * time.Second
 
 type replaySyncCommand struct {
 	StartAt *time.Time `json:"start_at,omitempty"`

@@ -180,14 +180,17 @@ func (r *replayRun) finish(state, errText string) {
 		r.mu.Unlock()
 	}
 	for _, f := range r.segmentFiles {
-		unlockState(f)
-		f.Close()
+		r.svc.releaseSegmentLocked(f)
 	}
 	r.segmentFiles = nil
-	if r.svc.active == r {
-		r.svc.active = nil
-	}
+	delete(r.svc.active, r.req.RunID)
+	r.svc.reporting[r.req.RunID] = true
+	r.svc.mu.Unlock()
+	// Report reduction can read a large result log. Keep this run protected from
+	// pruning, but never hold the service mutex and delay peers' lease renewals.
 	r.svc.saveReport(r.view())
+	r.svc.mu.Lock()
+	delete(r.svc.reporting, r.req.RunID)
 	r.svc.mu.Unlock()
 	close(r.done)
 }
@@ -198,14 +201,9 @@ func (r *replayRun) execute(ctx context.Context) {
 	// nonblocking directory lock as capacity eviction. No source files change.
 	for _, ref := range r.req.sources() {
 		for _, name := range ref.Segments {
-			f, err := os.Open(filepath.Join(r.svc.recordRoot, ref.GatewayID, ref.RecordingID, name))
+			f, err := r.svc.acquireSegment(filepath.Join(r.svc.recordRoot, ref.GatewayID, ref.RecordingID, name))
 			if err != nil {
-				r.finish("failed", "segment_not_found")
-				return
-			}
-			if err := lockState(f); err != nil {
-				f.Close()
-				r.finish("failed", "segment_busy")
+				r.finish("failed", err.Error())
 				return
 			}
 			r.segmentFiles = append(r.segmentFiles, f)
@@ -216,6 +214,7 @@ func (r *replayRun) execute(ctx context.Context) {
 		r.finish("failed", err.Error())
 		return
 	}
+	plan.InputDigest = runtimeDigest(plan.items)
 	r.mu.Lock()
 	r.plan = plan
 	r.progress.Planned = plan.Planned
@@ -240,6 +239,10 @@ func (r *replayRun) execute(ctx context.Context) {
 	}
 	if err != nil {
 		r.finish("failed", err.Error())
+		return
+	}
+	if expected := r.req.ExpectedTarget; expected != nil && (expected.RouterID != target.RouterID || expected.ServiceID != target.ServiceID || expected.ConfigDigest != target.ConfigDigest) {
+		r.finish("failed", "replay_target_mismatch")
 		return
 	}
 	if r.req.PrepareOnly {

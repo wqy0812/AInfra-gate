@@ -37,6 +37,8 @@ type replayFilter struct {
 // --option names with hyphens replaced by underscores.
 type replayRequest struct {
 	RunID                 string               `json:"run_id"`
+	BatchID               string               `json:"batch_id,omitempty"`
+	ExpectedTarget        *replayTargetState   `json:"expected_target,omitempty"`
 	Recording             replayRecordingRef   `json:"recording"`
 	Recordings            []replayRecordingRef `json:"recordings,omitempty"`
 	PrepareOnly           bool                 `json:"prepare_only,omitempty"`
@@ -69,6 +71,9 @@ func (r replayRequest) sources() []replayRecordingRef {
 }
 
 func (r *replayRequest) normalize() error {
+	if r.BatchID != "" && (!validOperationID(r.BatchID) || !r.PrepareOnly) {
+		return fmt.Errorf("invalid_batch")
+	}
 	if len(r.Recordings) > 0 {
 		if len(r.Recordings) > 2 || r.Recording.GatewayID != "" || r.Recording.RecordingID != "" || len(r.Recording.Segments) != 0 {
 			return fmt.Errorf("invalid_recordings")
@@ -104,10 +109,6 @@ func (r *replayRequest) normalize() error {
 		r.Filter, r.Mode, r.RequestTimeoutSeconds = one.Filter, one.Mode, one.RequestTimeoutSeconds
 		return nil
 	}
-	if r.PrepareOnly && r.Mode != "" && r.Mode != "timed" {
-		return fmt.Errorf("overlay_timed_required")
-	}
-
 	if !validOperationID(r.RunID) || !validOperationID(r.Recording.GatewayID) || !validOperationID(r.Recording.RecordingID) {
 		return fmt.Errorf("invalid_identity")
 	}
@@ -197,6 +198,7 @@ type replayPlanSegment struct {
 }
 
 type replayPlan struct {
+	InputDigest     string              `json:"input_digest"`
 	Schema          int                 `json:"schema_version"`
 	RunID           string              `json:"run_id"`
 	GatewayID       string              `json:"gateway_id"`
