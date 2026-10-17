@@ -1,6 +1,38 @@
 # 当前部署身份
 
-## 2026-10-17 23:38 多目标回放与跨 gateway 多密钥发布
+## 2026-10-18 回放性能 v2：仅更新 replay
+
+DCU、XPU、A3、PPU 的 **aigate-replay** 已更新至确定源码 `23ebe2c374924a5c435016c064994848e1ef4ea0`。四处 **switch、proxy 仍保持前次源码 `9cb5626dcd5a49be690b3bf86fd3bac421d285eb`**，本轮没有替换这些组件或模型服务。构建使用 Go 1.27.1、CGO_ENABLED=0、离线 vendor 模式和 trimpath，`vcs.modified=false`；实际运行进程二进制 SHA-256 与对应构建产物一致：
+
+| 环境 / SSH MCP target | replay 部署方式 | 架构 | 实际进程 SHA-256 |
+| --- | --- | --- | --- |
+| DCU / `dcu1` | 原 `aigate-replay.service` | linux/amd64 | `f5cd614222a3dc070481b39e9ef283b0d8b6bc71ac587c5e2f4c27ec1513233f` |
+| XPU / `xpu1` | 原 `aigate-replay.service` | linux/amd64 | `f5cd614222a3dc070481b39e9ef283b0d8b6bc71ac587c5e2f4c27ec1513233f` |
+| A3 / `hwA3-1` | namespace `ai-gateway`，`a3-aigate-replay` | linux/arm64 | `5980f303c223fcffa0ef82e544c734332634103e318190311b12c25186b35fe6` |
+| PPU / `ppu` | namespace `ai-gateway`，`ppu-aigate-replay` | linux/amd64 | `f5cd614222a3dc070481b39e9ef283b0d8b6bc71ac587c5e2f4c27ec1513233f` |
+
+A3 当前宿主为 `hwA3-1`；旧 `A3-gate` 上已停止的容器仅保留作迁移证据，本轮未操作其服务。
+
+四处 authenticated status 均正常，capabilities 保留 `recording-original-request-v1`、`recording-overlay-sync-v1`、`recording-multi-target-v1`，并新增 **`replay-performance-v2`**。替换前及启动后均确认 `active_run=null`、`active_runs=[]`、`active_batch=""`。目标白名单保持原值：DCU/XPU 各允许 DCU、XPU、A3；A3 仅允许 A3；PPU 仅允许 PPU。未认证 status 均返回 403；对专用不存在编号的只读 report 查询均返回 404 / `run_not_found`，没有创建回放任务。
+
+DCU/XPU 仅为原 replay unit 新增 `zzzz-replay-performance-v2-20261018.conf`，覆盖 ExecStart 的二进制路径；原启动参数、配置、业务环境变量及凭据保持。systemd 自动生成的 `INVOCATION_ID`、`JOURNAL_STREAM` 随服务重启变化，已与业务环境分别核验。A3/PPU 保留原镜像，仅更换 `/opt/aigate` 的只读二进制挂载来源；进程环境、UID/GID、资源限制、安全限制、namespace 及数据挂载的规范化 OCI 比较通过。两处旧 replay 容器已停止并同时禁用 restart policy 和目标运行状态，保留为 `*-before-replay-performance-v2-20261018`；新容器分别恢复 A3 `unless-stopped`、PPU `always`。容器候选准备期间的挂载比较失败及修正证据保留在 `private/`，最终激活通过，未执行回退。
+
+本轮保留原录制、回放结果和配置。DCU 录制目录 62,543 文件、4,588,288,633 字节，回放目录 32 文件、4,965,758 字节，发布前后逐文件内容与元数据清单一致，并保留原回放结果归档；XPU、A3、PPU 当前录制和回放数据目录均为 0 文件，前后清单一致。A3/PPU 配置文件内容摘要、switch/proxy 的容器 ID、PID、启动时间、程序摘要、环境和 boot_id 均保持；A3 binding revision=46、admission=true，PPU revision=4、admission=true。没有清理原始录制或结果，也没有修改业务准入。
+
+**本次验收覆盖部署身份、能力接口、访问控制以及配置和数据保持，未发送真实模型请求，未进行真实回放负载验收。** 配套 code-eval engine/Web 已完成增量建表、四份历史报告的 30 秒重算及桌面/手机触控模拟验收，于 2026-10-18 01:31（北京时间）恢复原 `maintenance=false`；平台最终源码、镜像和报告核验结果见[平台发布记录](../../code-eval/deploy/releases/README.md)。
+
+本轮 replay 发布新增服务器目录：
+
+| 节点 | 新增发布目录 |
+| --- | --- |
+| `dcu1` | `/data4/aigate/releases/replay-performance-v2-20261018/` |
+| `xpu1` | `/var/lib/ai-gate/releases/replay-performance-v2-20261018/` |
+| `hwA3-1` | `/data/a3-standalone-20261017/aigate/releases/replay-performance-v2-20261018/` |
+| `ppu` | `/bmcp_lvm_fs/aigate/releases/replay-performance-v2-20261018/` |
+
+四处均含 `bin/`、`private/`；`private/` 权限为 0700，私有快照和环境文件为 0600。各服务器发布目录保存 `verification.json`。本地脱敏收据位于 `code-eval/deploy/evidence/replay-performance-v2-20261018/replay-systemd/{dcu1,xpu1}-verification.json` 和 `replay-containers/{a3,ppu}-verification.json`；私有配置和密钥不进入 Git。
+
+## 前次发布：2026-10-17 23:38 多目标回放与跨 gateway 多密钥发布
 
 DCU、XPU、A3、PPU 的 switch、proxy、replay 共 12 个运行进程均更新至确定源码 `9cb5626dcd5a49be690b3bf86fd3bac421d285eb`。构建使用 Go 1.27.1、CGO_ENABLED=0、离线 vendor 模式，`vcs.modified=false`；A3 使用 linux/arm64，其他三处使用 linux/amd64。实际进程二进制摘要与构建产物逐项一致：
 
