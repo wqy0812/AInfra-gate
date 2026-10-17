@@ -1,5 +1,24 @@
 # 当前部署身份
 
+## 2026-10-18 02:59 单份报告收尾：仅更新 replay
+
+四处 aigate-replay 已更新至 `f519363f3ddd594438ad3343e4f6240efaf79d1d`，固定读取当前 v2 报告，`?version=1`、`?version=2` 和空 version 均拒绝为 400。源码来自该 commit 的 Git 归档，Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath、buildvcs=false 构建，归档身份与二进制摘要保存在本地 `deploy/replay-ui-final-20261018/manifest.json`。
+
+| 环境 / target | 部署方式 | 运行二进制 SHA-256 |
+| --- | --- | --- |
+| DCU / dcu1 | `aigate-replay.service`，linux/amd64 | `8d53ac066de582a4f9bf4f70b0b9ce484778bbd164b93cd241cc05c5545940fb` |
+| XPU / xpu1 | `aigate-replay.service`，linux/amd64 | `8d53ac066de582a4f9bf4f70b0b9ce484778bbd164b93cd241cc05c5545940fb` |
+| A3 / hwA3-1 | `ai-gateway/a3-aigate-replay`，linux/arm64 | `a6f0b1e972e75b6fc28da2effa0ed2c69927a3d81a4c265eaf6c703525b0c250` |
+| PPU / ppu | `ai-gateway/ppu-aigate-replay`，linux/amd64 | `8d53ac066de582a4f9bf4f70b0b9ce484778bbd164b93cd241cc05c5545940fb` |
+
+四处认证 status 正常、无活动回放，原 capabilities 和目标白名单保持；未认证访问返回 403，不存在报告返回 404。DCU/XPU 保持 unit、参数、用户及业务环境，仅新增 `zzzz-replay-ui-final-20261018.conf` 指向新二进制。A3/PPU 保持镜像、规范化 OCI 配置、环境和数据挂载，只替换 `/opt/aigate` 的二进制挂载源；旧 replay 容器停止且禁用自动重启。switch、proxy 和模型服务未替换。
+
+XPU 首次启动报 203/EXEC：本轮发布父目录为 0700，而 service User/Group=65532。保留失败日志后将该目录改为 0711，private 仍为 0700，启动同一新二进制并完成全部核验；未回退。DCU 62,543 个录制文件（4,588,288,633 bytes）和 32 个回放文件（4,965,758 bytes）的完整内容/元数据摘要保持，其他三处空数据目录保持。四入口 Router、binding revision=52/33/46/4、admission=true 均保持。
+
+配套平台于北京时间 02:54:22 开启维护，02:59:27 恢复 `maintenance=false`，窗口用时 304.65 秒。平台健康、当前报告读取、版本参数拒绝、数据保护、桌面 Chrome 与 iPhone 竖屏触控模拟验收通过；未创建真实新回放或发送模型生成请求。平台源码、镜像与备份见[本轮发布记录](../../code-eval/deploy/releases/README.md#replay-ui-final-20261018)。
+
+新增发布根目录分别为 dcu1 `/data4/aigate/releases/replay-ui-final-20261018/`、xpu1 `/var/lib/ai-gate/releases/replay-ui-final-20261018/`、hwA3-1 `/data/a3-standalone-20261017/aigate/releases/replay-ui-final-20261018/`、ppu `/bmcp_lvm_fs/aigate/releases/replay-ui-final-20261018/`，均含 bin/ 与 private/。核验收据位于各根目录 `verification.json`；本地副本在 `code-eval/deploy/evidence/replay-ui-final-20261018/checks/{dcu1,xpu1,a3,ppu}/`，受限配置及失败日志保留在服务器 private/。
+
 ## 2026-10-18 回放性能 v2：仅更新 replay
 
 DCU、XPU、A3、PPU 的 **aigate-replay** 已更新至确定源码 `23ebe2c374924a5c435016c064994848e1ef4ea0`。四处 **switch、proxy 仍保持前次源码 `9cb5626dcd5a49be690b3bf86fd3bac421d285eb`**，本轮没有替换这些组件或模型服务。构建使用 Go 1.27.1、CGO_ENABLED=0、离线 vendor 模式和 trimpath，`vcs.modified=false`；实际运行进程二进制 SHA-256 与对应构建产物一致：
