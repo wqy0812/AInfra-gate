@@ -134,7 +134,7 @@ func TestReplayMinuteBucketsAndMissingSamples(t *testing.T) {
 		b.WriteByte('\n')
 	}
 	os.WriteFile(filepath.Join(dir, "results.jsonl"), []byte(b.String()), 0600)
-	r := buildReplayReport(dir, replayRunView{State: "completed", Progress: replayProgress{Sent: 2}})
+	r := buildReplayReportVersion(dir, replayRunView{State: "completed", Progress: replayProgress{Sent: 2}}, 1)
 	if len(r.Curve) != 3 || r.Curve[0].Width != 60 || r.Curve[1].Width != 60 || r.Curve[2].Width != 1 {
 		t.Fatal(r.Curve)
 	}

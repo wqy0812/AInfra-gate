@@ -36,6 +36,9 @@ func syntheticReplay(t *testing.T, n int, interval float64, body string) (string
 	if _, err := recordingAtomicJSON(dir, "segment.json", seg); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "pinned"), []byte("retained"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	var index bytes.Buffer
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("request-%d", i)
@@ -102,7 +105,7 @@ func readReplayResults(t *testing.T, f *replayFixture, id string) []replayResult
 }
 
 func TestReplayTimedExceeds512WhileResponsesBlocked(t *testing.T) {
-	root, req := syntheticReplay(t, 530, .004, `{"messages":[],"max_tokens":9}`)
+	root, req := syntheticReplay(t, 530, .004, `{"messages":[],"max_tokens":9,"stream":true}`)
 	gate := make(chan struct{})
 	var once sync.Once
 	defer once.Do(func() { close(gate) })
@@ -145,7 +148,7 @@ func TestReplayTimedExceeds512WhileResponsesBlocked(t *testing.T) {
 }
 
 func TestReplayTimedKeepsSparseOffsetsAndFilterGaps(t *testing.T) {
-	root, req := syntheticReplay(t, 3, .3, `{}`)
+	root, req := syntheticReplay(t, 3, .3, `{"stream":true}`)
 	dir := filepath.Join(root, "g1", "synthetic", req.Recording.Segments[0])
 	lines := readIndex(t, filepath.Join(dir, "index.jsonl"))
 	lines[0].Status = 400
@@ -176,7 +179,7 @@ func TestReplayTimedKeepsSparseOffsetsAndFilterGaps(t *testing.T) {
 }
 
 func TestReplayConcurrencyUsesExactlyNAndStopDrains(t *testing.T) {
-	root, req := syntheticReplay(t, 12, 10, `{}`)
+	root, req := syntheticReplay(t, 12, 10, `{"stream":true}`)
 	req.Mode, req.Concurrency = "concurrency", 3
 	arrived, release, drain := make(chan struct{}, 12), make(chan struct{}, 12), make(chan struct{})
 	var once sync.Once
@@ -223,7 +226,7 @@ func TestReplayConcurrencyUsesExactlyNAndStopDrains(t *testing.T) {
 }
 
 func TestReplayTimedResourceExhaustionNeverWaits(t *testing.T) {
-	root, req := syntheticReplay(t, 2, .1, `{}`)
+	root, req := syntheticReplay(t, 2, .1, `{"stream":true}`)
 	var requests atomic.Int64
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) { requests.Add(1) })
 	f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
@@ -243,7 +246,7 @@ func (failedReplayResults) Sync() error               { return nil }
 func (failedReplayResults) Close() error              { return nil }
 
 func TestReplayResultFailureStopsNewSends(t *testing.T) {
-	root, req := syntheticReplay(t, 4, .3, `{}`)
+	root, req := syntheticReplay(t, 4, .3, `{"stream":true}`)
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"usage":{"completion_tokens":800}}`)
@@ -350,7 +353,7 @@ func (fn replayRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { r
 func TestReplayWriteTimingUnknownAndDelayed(t *testing.T) {
 	for _, success := range []bool{false, true} {
 		t.Run(fmt.Sprint(success), func(t *testing.T) {
-			root, req := syntheticReplay(t, 1, 0, `{}`)
+			root, req := syntheticReplay(t, 1, 0, `{"stream":true}`)
 			f := newReplayFixture(t, root, map[string]string{"r1": "http://synthetic.invalid"})
 			f.svc.client.Transport = replayRoundTrip(func(r *http.Request) (*http.Response, error) {
 				if r.URL.Path == "/runtime/v1/status" {
@@ -407,7 +410,7 @@ func TestReplayPlanRequiresSchemaAndRequestIntegrity(t *testing.T) {
 }
 
 func TestReplayInvalidStructuredUsageDoesNotReadTail(t *testing.T) {
-	root, req := syntheticReplay(t, 1, 0, `{}`)
+	root, req := syntheticReplay(t, 1, 0, `{"stream":true}`)
 	dir := filepath.Join(root, "g1", "synthetic", req.Recording.Segments[0], "r-000000")
 	raw, _ := os.ReadFile(filepath.Join(dir, "meta.json"))
 	raw = bytes.Replace(raw, []byte(`"completion_tokens":800`), []byte(`"completion_tokens":-1`), 1)
@@ -418,7 +421,7 @@ func TestReplayInvalidStructuredUsageDoesNotReadTail(t *testing.T) {
 	}
 }
 
-func TestReplayMalformedRequestsAreSentUnchanged(t *testing.T) {
+func TestReplayUnclassifiableRequestsAreExcluded(t *testing.T) {
 	for _, body := range []string{`{"broken":`, `null`, `[1,2]`} {
 		t.Run(body, func(t *testing.T) {
 			root, req := syntheticReplay(t, 1, 0, body)
@@ -436,9 +439,8 @@ func TestReplayMalformedRequestsAreSentUnchanged(t *testing.T) {
 			f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
 			f.svc.start(req)
 			view := f.wait(t, req.RunID)
-			result := readReplayResults(t, f, req.RunID)[0]
-			if calls.Load() != 1 || view.Progress.Sent != 1 || view.Progress.Failed != 1 || result.Error != "http_400" || len(result.Rewritten) != 0 {
-				t.Fatalf("failure not replayed faithfully: %+v %+v", view, result)
+			if calls.Load() != 0 || view.Progress.Sent != 0 || view.State != "failed" || view.Error != "plan_empty" {
+				t.Fatalf("unclassifiable request sent: %+v", view)
 			}
 		})
 	}

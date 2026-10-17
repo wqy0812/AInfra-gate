@@ -25,6 +25,7 @@ type replayProgress struct {
 	Sent        int64   `json:"sent"`
 	Completed   int64   `json:"completed"`
 	Failed      int64   `json:"failed"`
+	Truncated   int64   `json:"truncated"`
 	Inflight    int64   `json:"inflight"`
 	Unsent      int64   `json:"unsent"`
 	Unconfirmed int64   `json:"unconfirmed"`
@@ -83,29 +84,35 @@ type replayRun struct {
 	output                            replayOutputSummary
 	resultMu                          sync.Mutex
 	results                           replayResultFile
+	requestContext                    context.Context
+	truncateCancel                    context.CancelFunc
+	truncated                         atomic.Int64
+	truncation                        *replayTruncation
 }
 
 type replayRunView struct {
-	Sources        []replaySourceProgress `json:"sources,omitempty"`
-	ScheduledAt    *time.Time             `json:"scheduled_at,omitempty"`
-	Plan           *replayPlan            `json:"plan,omitempty"`
-	RunID          string                 `json:"run_id"`
-	State          string                 `json:"state"`
-	Error          string                 `json:"error,omitempty"`
-	CreatedAt      time.Time              `json:"created_at"`
-	StartedAt      *time.Time             `json:"started_at,omitempty"`
-	EndedAt        *time.Time             `json:"ended_at,omitempty"`
-	Request        *replayRequest         `json:"request,omitempty"`
-	Target         replayTargetState      `json:"target"`
-	Progress       replayProgress         `json:"progress"`
-	LastError      string                 `json:"last_error,omitempty"`
-	MaxSendDelay   float64                `json:"max_send_delay_seconds"`
-	MaxWriteDelay  *float64               `json:"max_write_delay_seconds"`
-	Output         replayOutputSummary    `json:"output_verification"`
-	Excluded       map[string]int         `json:"excluded,omitempty"`
-	Rewritten      []string               `json:"rewritten"`
-	EndReason      string                 `json:"end_reason,omitempty"`
-	StartCancelled bool                   `json:"start_cancelled,omitempty"`
+	Sources          []replaySourceProgress `json:"sources,omitempty"`
+	ScheduledAt      *time.Time             `json:"scheduled_at,omitempty"`
+	Plan             *replayPlan            `json:"plan,omitempty"`
+	RunID            string                 `json:"run_id"`
+	State            string                 `json:"state"`
+	Error            string                 `json:"error,omitempty"`
+	CreatedAt        time.Time              `json:"created_at"`
+	StartedAt        *time.Time             `json:"started_at,omitempty"`
+	EndedAt          *time.Time             `json:"ended_at,omitempty"`
+	Request          *replayRequest         `json:"request,omitempty"`
+	Target           replayTargetState      `json:"target"`
+	Progress         replayProgress         `json:"progress"`
+	LastError        string                 `json:"last_error,omitempty"`
+	MaxSendDelay     float64                `json:"max_send_delay_seconds"`
+	MaxWriteDelay    *float64               `json:"max_write_delay_seconds"`
+	Output           replayOutputSummary    `json:"output_verification"`
+	Excluded         map[string]int         `json:"excluded,omitempty"`
+	Rewritten        []string               `json:"rewritten"`
+	EndReason        string                 `json:"end_reason,omitempty"`
+	StartCancelled   bool                   `json:"start_cancelled,omitempty"`
+	DispatchComplete bool                   `json:"dispatch_complete"`
+	Truncation       *replayTruncation      `json:"truncation,omitempty"`
 }
 
 func (r *replayRun) viewLocked() replayRunView {
@@ -115,6 +122,7 @@ func (r *replayRun) viewLocked() replayRunView {
 		progress.Elapsed = time.Since(r.begin).Seconds()
 	}
 	progress.Unsent = max(0, int64(progress.Planned)-progress.Sent)
+	progress.Truncated = r.truncated.Load()
 	var excluded map[string]int
 	if r.plan != nil {
 		excluded = r.plan.Excluded
@@ -128,10 +136,13 @@ func (r *replayRun) viewLocked() replayRunView {
 		sources[i].State = r.state
 		if !r.begin.IsZero() && sources[i].Progress.Sent == int64(sources[i].Progress.Planned) && sources[i].Progress.Inflight == 0 {
 			sources[i].State = "completed"
+			if sources[i].Progress.Truncated > 0 {
+				sources[i].State = "truncated"
+			}
 		}
 		sources[i].Progress.Unsent = max(0, int64(sources[i].Progress.Planned)-sources[i].Progress.Sent)
 	}
-	return replayRunView{Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
+	return replayRunView{DispatchComplete: progress.Planned > 0 && progress.Sent == int64(progress.Planned), Truncation: r.truncation, Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
 		Request: &r.req, Target: r.target, Progress: progress, LastError: r.lastError, MaxSendDelay: r.maxSendDelay}
 }
 
@@ -164,6 +175,9 @@ func (r *replayRun) finish(state, errText string) {
 	if r.fatalError != "" {
 		state, errText = "failed", r.fatalError
 	}
+	if state == "completed" && r.truncation != nil && r.truncated.Load() > 0 {
+		state = "truncated"
+	}
 	if state == "completed" && r.stopped.Load() {
 		state = "stopped"
 	}
@@ -184,13 +198,16 @@ func (r *replayRun) finish(state, errText string) {
 	}
 	r.segmentFiles = nil
 	delete(r.svc.active, r.req.RunID)
-	r.svc.reporting[r.req.RunID] = true
+	r.svc.reporting[r.req.RunID]++
 	r.svc.mu.Unlock()
 	// Report reduction can read a large result log. Keep this run protected from
 	// pruning, but never hold the service mutex and delay peers' lease renewals.
 	r.svc.saveReport(r.view())
 	r.svc.mu.Lock()
-	delete(r.svc.reporting, r.req.RunID)
+	r.svc.reporting[r.req.RunID]--
+	if r.svc.reporting[r.req.RunID] == 0 {
+		delete(r.svc.reporting, r.req.RunID)
+	}
 	r.svc.mu.Unlock()
 	close(r.done)
 }
@@ -211,10 +228,16 @@ func (r *replayRun) execute(ctx context.Context) {
 	}
 	plan, err := buildReplayPlan(r.svc.recordRoot, r.req)
 	if err != nil {
+		if plan != nil {
+			r.mu.Lock()
+			r.plan = plan
+			r.mu.Unlock()
+		}
 		r.finish("failed", err.Error())
 		return
 	}
 	plan.InputDigest = runtimeDigest(plan.items)
+	plan.FilterPolicy = "stream_only_v1"
 	r.mu.Lock()
 	r.plan = plan
 	r.progress.Planned = plan.Planned
@@ -305,6 +328,15 @@ func (r *replayRun) execute(ctx context.Context) {
 		return
 	}
 	r.results = results
+	r.mu.Lock()
+	r.requestContext, r.truncateCancel = context.WithCancel(r.svc.ctx)
+	r.mu.Unlock()
+	defer r.truncateCancel()
+	tailDone := make(chan struct{})
+	if r.req.AutoTruncate && !r.req.CoordinatedTruncation {
+		go r.watchTail(tailDone)
+	}
+	defer close(tailDone)
 	if r.req.Mode == "timed" {
 		r.sendTimed(ctx, plan)
 	} else {
@@ -412,7 +444,9 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 			if result.SendOffset != nil {
 				source.Progress.Inflight--
 			}
-			if result.Error != "" && result.Error != "not_sent" {
+			if result.Error == "tail_truncated" {
+				source.Progress.Truncated++
+			} else if result.Error != "" && result.Error != "not_sent" {
 				source.Progress.Failed++
 				source.LastError = result.Error
 			} else if result.SendOffset != nil {
@@ -428,6 +462,16 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 		}
 	}()
 	fail := func(detail string) {
+		if r.requestContext != nil && r.requestContext.Err() != nil && (detail == "cancelled" || detail == "connection_error" || detail == "unexpected_eof") {
+			r.mu.Lock()
+			cut := r.truncation != nil
+			r.mu.Unlock()
+			if cut {
+				result.Error = "tail_truncated"
+				r.truncated.Add(1)
+				return
+			}
+		}
 		result.Error = detail
 		r.failed.Add(1)
 		r.mu.Lock()
@@ -454,7 +498,9 @@ func (r *replayRun) send(runCtx context.Context, item replayPlanItem, due time.T
 	}
 	_ = json.Unmarshal(body, &options)
 	result.MultipleChoices = options.N > 1
-	ctx, cancel := context.WithTimeout(r.svc.ctx, time.Duration(r.req.RequestTimeoutSeconds)*time.Second)
+	requestStream := replayStreamExclusion(body) == ""
+	result.RequestStream = &requestStream
+	ctx, cancel := context.WithTimeout(r.requestContext, time.Duration(r.req.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	var traceMu sync.Mutex
 	var written *float64

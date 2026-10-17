@@ -23,7 +23,7 @@ func openRecoveredReplay(t *testing.T, recordRoot, dataRoot string) *replayServi
 }
 
 func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
-	root, req := syntheticReplay(t, 2, 30, `{}`)
+	root, req := syntheticReplay(t, 2, 30, `{"stream":true}`)
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
 		io.WriteString(w, `{"usage":{"completion_tokens":800}}`)

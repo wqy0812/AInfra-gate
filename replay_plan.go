@@ -48,6 +48,8 @@ type replayRequest struct {
 	Concurrency           int                  `json:"concurrency,omitempty"`
 	SetModel              string               `json:"set_model,omitempty"`
 	RequestTimeoutSeconds int                  `json:"request_timeout_seconds,omitempty"`
+	AutoTruncate          bool                 `json:"auto_truncate,omitempty"`
+	CoordinatedTruncation bool                 `json:"coordinated_truncation,omitempty"`
 }
 
 // Omit the legacy selector from multi-source state as well as wire requests.
@@ -199,6 +201,7 @@ type replayPlanSegment struct {
 
 type replayPlan struct {
 	InputDigest     string              `json:"input_digest"`
+	FilterPolicy    string              `json:"filter_policy,omitempty"`
 	Schema          int                 `json:"schema_version"`
 	RunID           string              `json:"run_id"`
 	GatewayID       string              `json:"gateway_id"`
@@ -312,6 +315,9 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		if status.State != "sealed" {
 			return nil, fmt.Errorf("segment_not_sealed")
 		}
+		if !status.Pinned {
+			return nil, fmt.Errorf("segment_not_retained")
+		}
 		segments = append(segments, status)
 	}
 	sort.Slice(segments, func(i, j int) bool { return segments[i].Start.Before(segments[j].Start) })
@@ -342,7 +348,7 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 	}
 	plan.Planned = len(plan.items)
 	if plan.Planned == 0 {
-		return nil, fmt.Errorf("plan_empty")
+		return plan, fmt.Errorf("plan_empty")
 	}
 	return plan, nil
 }
@@ -397,9 +403,13 @@ func planSegment(dir string, seg replaySegmentStatus, base float64, req replayRe
 		if item.OffsetSeconds < base {
 			item.OffsetSeconds = base
 		}
-		_, err = readReplayBody(item)
+		body, err := readReplayBody(item)
 		if err != nil {
 			return nil, err
+		}
+		if reason := replayStreamExclusion(body); reason != "" {
+			plan.Excluded[reason]++
+			continue
 		}
 		items = append(items, item)
 	}
@@ -443,4 +453,23 @@ func readReplayBody(item replayPlanItem) ([]byte, error) {
 		return nil, fmt.Errorf("record_changed")
 	}
 	return body, nil
+}
+
+// Eligibility depends on the request, not its recorded response status.
+func replayStreamExclusion(body []byte) string {
+	var object map[string]json.RawMessage
+	if json.Unmarshal(body, &object) != nil || object == nil {
+		return "stream_unclassifiable"
+	}
+	value, ok := object["stream"]
+	if !ok {
+		return "stream_unspecified"
+	}
+	if strings.TrimSpace(string(value)) == "true" {
+		return ""
+	}
+	if strings.TrimSpace(string(value)) == "false" {
+		return "nonstream"
+	}
+	return "stream_unclassifiable"
 }

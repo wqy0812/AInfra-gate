@@ -128,6 +128,7 @@ func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
 	}
 	f.svc.stop(req.RunID)
 	f.wait(t, req.RunID)
+	recordingCommand(t, rec.c, "record-unpin", map[string]any{"recording_id": "rec-evict", "segment": summary.Segments[0].Segment})
 	recorder.flush()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("finished replay still prevented eviction", err)

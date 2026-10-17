@@ -13,7 +13,7 @@ import (
 	"sort"
 )
 
-const replayReportVersion = 1
+const replayReportVersion = 2
 
 type replayHistogram struct {
 	Count int         `json:"count"`
@@ -70,6 +70,7 @@ type replayMetrics struct {
 	Sent         int             `json:"sent"`
 	Success      int             `json:"success"`
 	Failed       int             `json:"failed"`
+	Truncated    int             `json:"truncated"`
 	UsageKnown   int             `json:"usage_known"`
 	OutputTokens uint64          `json:"output_tokens"`
 	E2E          replayHistogram `json:"e2e"`
@@ -77,6 +78,7 @@ type replayMetrics struct {
 	TPOT         replayHistogram `json:"tpot"`
 }
 type replayCurve struct {
+	Cohort       replayMetrics   `json:"cohort"`
 	E2EStream    replayHistogram `json:"e2e_stream"`
 	E2ENonstream replayHistogram `json:"e2e_nonstream"`
 	TTFT         replayHistogram `json:"ttft"`
@@ -90,6 +92,12 @@ type replayCurve struct {
 	Success      int             `json:"success"`
 }
 type replayReport struct {
+	BucketSeconds          int               `json:"bucket_seconds"`
+	LatencyBasis           string            `json:"latency_basis"`
+	InputDigest            string            `json:"input_digest"`
+	FilterPolicy           string            `json:"filter_policy"`
+	FilterEvidence         string            `json:"filter_evidence"`
+	Truncation             *replayTruncation `json:"truncation,omitempty"`
 	Version                int               `json:"version"`
 	State                  string            `json:"state"`
 	Reason                 string            `json:"reason,omitempty"`
@@ -127,6 +135,10 @@ type replayTimingEvent struct {
 
 func (m *replayMetrics) add(v replayResult) {
 	m.Sent++
+	if v.Error == "tail_truncated" {
+		m.Truncated++
+		return
+	}
 	if v.Error != "" || v.HTTPStatus < 200 || v.HTTPStatus >= 300 {
 		m.Failed++
 		return
@@ -149,9 +161,22 @@ func (m *replayMetrics) add(v replayResult) {
 }
 func (m *replayMetrics) finish() { m.E2E.finish(); m.TTFT.finish(); m.TPOT.finish() }
 func buildReplayReport(dir string, view replayRunView) replayReport {
-	r := replayReport{Version: 1, State: "complete", RunID: view.RunID, RunState: view.State, StartedAt: view.StartedAt, Target: view.Target, Request: view.Request, Progress: view.Progress, Errors: map[string]int{}, Curve: []replayCurve{}, HistogramRelativeError: .02}
+	return buildReplayReportVersion(dir, view, 2)
+}
+func buildReplayReportVersion(dir string, view replayRunView, version int) replayReport {
+	width, limit := 30.0, 20160
+	basis := "planned_send"
+	if view.Request != nil && view.Request.Mode == "concurrency" {
+		basis = "actual_send"
+	}
+	if version == 1 {
+		width, limit, basis = 60, 10080, "completion"
+	}
+	r := replayReport{Version: version, BucketSeconds: int(width), LatencyBasis: basis, Truncation: view.Truncation, State: "complete", RunID: view.RunID, RunState: view.State, StartedAt: view.StartedAt, Target: view.Target, Request: view.Request, Progress: view.Progress, Errors: map[string]int{}, Curve: []replayCurve{}, HistogramRelativeError: .02}
 	if view.Plan != nil {
 		r.PlannedDuration = view.Plan.DurationSeconds
+		r.InputDigest = view.Plan.InputDigest
+		r.FilterPolicy = view.Plan.FilterPolicy
 	}
 	if view.State != "completed" || view.Output.ResultsFailed || view.Output.Incomplete {
 		r.State = "partial"
@@ -164,6 +189,12 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 		return r
 	}
 	defer f.Close()
+	if version == 2 {
+		r.InputDigest, r.FilterPolicy, r.FilterEvidence = replayReportInput(dir, view)
+	}
+	if view.State == "truncated" {
+		r.Reason = "tail_truncated"
+	}
 	events := make([]replayTimingEvent, 0)
 	minutes := map[int]*replayCurve{}
 	seen := map[int]bool{}
@@ -211,36 +242,44 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 			r.LastEnd = &x
 		}
 		r.Metrics.add(v)
-		minute := max(0, int(math.Ceil(*v.EndOffset/60))-1)
-		if minute < 10080 {
-			point := minutes[minute]
-			if point == nil {
-				point = &replayCurve{}
-				minutes[minute] = point
+
+		completion := max(0, int(math.Ceil(*v.EndOffset/width))-1)
+		cohortAt := v.PlannedOffset
+		if basis == "actual_send" {
+			cohortAt = *v.SendOffset
+		}
+		cohort := max(0, int(math.Floor(cohortAt/width)))
+		if version == 1 {
+			cohort = completion
+		}
+		pointAt := func(index int) *replayCurve {
+			if index >= limit {
+				return nil
 			}
-			var m replayMetrics
-			m.add(v)
+			if minutes[index] == nil {
+				minutes[index] = &replayCurve{}
+			}
+			return minutes[index]
+		}
+		var m replayMetrics
+		m.add(v)
+		if point := pointAt(completion); point != nil {
 			point.Success += m.Success
 			point.UsageKnown += m.UsageKnown
 			point.OutputTokens += m.OutputTokens
-			merge := func(to *replayHistogram, from replayHistogram) {
-				for k, n := range from.Bins {
-					if to.Bins == nil {
-						to.Bins = map[int]int{}
-					}
-					to.Bins[k] += n
-					to.Count += n
-				}
-			}
-			if v.Stream {
-				merge(&point.E2EStream, m.E2E)
-			} else {
-				merge(&point.E2ENonstream, m.E2E)
-			}
-			merge(&point.TTFT, m.TTFT)
-			merge(&point.TPOT, m.TPOT)
 		}
-		if v.Stream {
+		if point := pointAt(cohort); point != nil {
+			point.Cohort.add(v)
+			if v.Stream {
+				mergeReplayHistogram(&point.E2EStream, m.E2E)
+			} else {
+				mergeReplayHistogram(&point.E2ENonstream, m.E2E)
+			}
+			mergeReplayHistogram(&point.TTFT, m.TTFT)
+			mergeReplayHistogram(&point.TPOT, m.TPOT)
+		}
+
+		if v.Stream || (v.RequestStream != nil && *v.RequestStream) {
 			r.Stream.add(v)
 		} else {
 			r.Nonstream.add(v)
@@ -248,7 +287,7 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 		delay := max(0, *v.SendOffset-v.PlannedOffset)
 		r.SendDelay.add(delay)
 		r.MaxSendDelay = max(r.MaxSendDelay, delay)
-		if v.Error != "" {
+		if v.Error != "" && v.Error != "tail_truncated" {
 			r.Errors[v.Error]++
 		}
 		events = append(events, replayTimingEvent{*v.SendOffset, 1, false}, replayTimingEvent{*v.EndOffset, -1, v.Error == "" && v.HTTPStatus >= 200 && v.HTTPStatus < 300})
@@ -290,16 +329,20 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 		}
 		return events[i].at < events[j].at
 	})
-	width := 60.0
-	count := max(1, min(10080, int(math.Ceil(*r.LastEnd/width))))
-	r.CurveTruncated = *r.LastEnd > 10080*width
+	horizon := *r.LastEnd
+	if version == 2 && basis == "planned_send" {
+		horizon = max(horizon, r.PlannedDuration)
+	}
+	count := max(1, min(limit, int(math.Ceil(horizon/width))))
+	r.CurveTruncated = horizon > float64(limit)*width
 	r.Curve = make([]replayCurve, count)
 	for i := range r.Curve {
 		if point := minutes[i]; point != nil {
 			r.Curve[i] = *point
 		}
 		r.Curve[i].Offset = float64(i) * width
-		r.Curve[i].Width = math.Max(1e-9, math.Min(width, *r.LastEnd-float64(i)*width))
+		r.Curve[i].Width = math.Max(1e-9, math.Min(width, horizon-float64(i)*width))
+		r.Curve[i].Cohort.finish()
 		r.Curve[i].E2EStream.finish()
 		r.Curve[i].E2ENonstream.finish()
 		r.Curve[i].TTFT.finish()
@@ -341,19 +384,96 @@ func (s *replayService) saveReport(view replayRunView) {
 		s.audit.Print("replay_report_write_failed run=" + view.RunID)
 	}
 }
-func (s *replayService) loadReport(id string) (any, bool) {
-	view, ok := s.loadRun(id)
+func (s *replayService) loadReport(id string, versions ...string) (any, bool) {
+	version := 2
+	if len(versions) > 0 && versions[0] == "1" {
+		version = 1
+	}
+	s.mu.Lock()
+	view, ok := s.loadRunLocked(id)
+	if ok {
+		s.reporting[id]++
+	}
+	s.mu.Unlock()
+	if ok {
+		defer func() {
+			s.mu.Lock()
+			s.reporting[id]--
+			if s.reporting[id] == 0 {
+				delete(s.reporting, id)
+			}
+			s.mu.Unlock()
+		}()
+	}
 	if !ok {
 		return nil, false
 	}
 	if view.EndedAt == nil {
-		return map[string]any{"version": 1, "state": "generating", "run_id": id}, true
+		return map[string]any{"version": version, "state": "generating", "run_id": id}, true
 	}
 	data, err := os.ReadFile(filepath.Join(s.runDir(id), "report.json"))
-	if err == nil && json.Valid(data) {
+	var header struct {
+		Version int `json:"version"`
+	}
+	if err == nil && json.Unmarshal(data, &header) == nil && header.Version == version {
 		return json.RawMessage(data), true
 	}
 	// Read-only reconstruction allows retry after a report write failure. Legacy
 	// data is explicitly unavailable; reading a report never sends requests.
-	return buildReplayReport(s.runDir(id), view), true
+	return buildReplayReportVersion(s.runDir(id), view, version), true
+}
+
+func mergeReplayHistogram(to *replayHistogram, from replayHistogram) {
+	if to.Bins == nil {
+		to.Bins = map[int]int{}
+	}
+	for key, count := range from.Bins {
+		to.Bins[key] += count
+		to.Count += count
+	}
+}
+
+// The fingerprint excludes local paths and run/target identity. Historical
+// stream eligibility is only certified from hash-verified original requests.
+func replayReportInput(dir string, view replayRunView) (string, string, string) {
+	file, err := os.Open(filepath.Join(dir, "plan.jsonl"))
+	if err != nil {
+		return "", "legacy_unverified", "missing_plan"
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 65536), 1<<20)
+	type identity struct {
+		Gateway   string
+		Recording string
+		Segment   string
+		Request   string
+		SHA       string
+		Offset    float64
+	}
+	items := []identity{}
+	verified := true
+	for scanner.Scan() {
+		var item replayPlanItem
+		if json.Unmarshal(scanner.Bytes(), &item) != nil || len(items) >= replayMaxPlanItems {
+			return "", "legacy_unverified", "invalid_plan"
+		}
+		items = append(items, identity{item.GatewayID, item.RecordingID, item.Segment, item.RequestID, item.RequestSHA256, item.OffsetSeconds})
+		if view.Plan == nil || view.Plan.FilterPolicy != "stream_only_v1" {
+			body, err := readReplayBody(item)
+			if err != nil || replayStreamExclusion(body) != "" {
+				verified = false
+			}
+		}
+	}
+	if scanner.Err() != nil || len(items) == 0 {
+		return "", "legacy_unverified", "invalid_plan"
+	}
+	if view.Plan != nil && view.Plan.FilterPolicy == "stream_only_v1" {
+		return runtimeDigest(items), "stream_only_v1", "execution_plan"
+	}
+	if verified {
+		return runtimeDigest(items), "stream_only_v1", "historical_request_bodies"
+	}
+	return runtimeDigest(items), "legacy_unverified", "requests_unavailable_or_mixed"
 }

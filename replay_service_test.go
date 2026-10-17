@@ -88,7 +88,11 @@ func recordSample(t *testing.T, f *recordingFixture, id string, n int) recording
 		time.Sleep(20 * time.Millisecond)
 	}
 	recordingCommand(t, f.c, "record-stop", map[string]any{"recording_id": id})
-	return waitRecordingEnded(t, f.c, id)
+	summary := waitRecordingEnded(t, f.c, id)
+	for _, segment := range summary.Segments {
+		recordingCommand(t, f.c, "record-pin", map[string]any{"recording_id": id, "segment": segment.Segment})
+	}
+	return summary
 }
 
 func routerBodies(r *tokenRouter, from int) []string {

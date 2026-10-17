@@ -30,7 +30,7 @@ func waitPrepared(t *testing.T, f *replayFixture, id string) replayRunView {
 
 func overlayFixture(t *testing.T) (string, replayRequest) {
 	t.Helper()
-	root, req := syntheticReplay(t, 2, .08, `{}`)
+	root, req := syntheticReplay(t, 2, .08, `{"stream":true}`)
 	source := filepath.Join(root, "g1", "synthetic")
 	dest := filepath.Join(root, "g2", "other")
 	if err := os.MkdirAll(dest, 0700); err != nil {
@@ -150,7 +150,7 @@ func TestReplayOverlayTwoServicesShareStart(t *testing.T) {
 	services := []*replayFixture{}
 	requests := []replayRequest{}
 	for i := 0; i < 2; i++ {
-		root, req := syntheticReplay(t, i+1, .08, `{}`)
+		root, req := syntheticReplay(t, i+1, .08, `{"stream":true}`)
 		req.PrepareOnly = true
 		f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
 		f.svc.start(req)
@@ -173,7 +173,7 @@ func TestReplayOverlayTwoServicesShareStart(t *testing.T) {
 func TestReplayOverlayLeaseStopLateStartAndRecovery(t *testing.T) {
 	for _, mode := range []string{"lease", "stop", "late", "restart", "stop-before-prepare"} {
 		t.Run(mode, func(t *testing.T) {
-			root, req := syntheticReplay(t, 1, 0, `{}`)
+			root, req := syntheticReplay(t, 1, 0, `{"stream":true}`)
 			req.PrepareOnly = true
 			var received atomic.Int64
 			target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) { received.Add(1) })
@@ -230,7 +230,7 @@ func TestReplayOverlayLeaseStopLateStartAndRecovery(t *testing.T) {
 }
 
 func TestReplayOverlayFatalFailureIsVisibleBeforeDrain(t *testing.T) {
-	root, req := syntheticReplay(t, 2, .4, `{}`)
+	root, req := syntheticReplay(t, 2, .4, `{"stream":true}`)
 	req.PrepareOnly = true
 	arrived, drain := make(chan struct{}), make(chan struct{})
 	target := replayTarget(t, func(w http.ResponseWriter, q *http.Request) {
@@ -298,7 +298,7 @@ func TestReplayOverlayFatalFailureIsVisibleBeforeDrain(t *testing.T) {
 func TestReplayOverlayWakeupTolerance(t *testing.T) {
 	for _, late := range []time.Duration{2 * time.Second, 59 * time.Second, 61 * time.Second} {
 		t.Run(late.String(), func(t *testing.T) {
-			root, req := syntheticReplay(t, 1, 0, `{}`)
+			root, req := syntheticReplay(t, 1, 0, `{"stream":true}`)
 			req.PrepareOnly = true
 			var received atomic.Int64
 			target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) { received.Add(1) })

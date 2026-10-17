@@ -29,6 +29,7 @@ type replayResult struct {
 	FirstOutput       *float64 `json:"first_output_seconds,omitempty"`
 	LastOutput        *float64 `json:"last_output_seconds,omitempty"`
 	Stream            bool     `json:"stream"`
+	RequestStream     *bool    `json:"request_stream,omitempty"`
 	MultipleChoices   bool     `json:"multiple_choices,omitempty"`
 	GatewayID         string   `json:"gateway_id"`
 	RecordingID       string   `json:"recording_id"`
@@ -150,7 +151,7 @@ func recoverReplayResults(dir string, view *replayRunView) (err error) {
 		view.Sources[i].Progress = replayProgress{Planned: view.Sources[i].Progress.Planned}
 	}
 	view.Progress.Sent, view.Progress.Completed, view.Progress.Failed = 0, 0, 0
-	view.Progress.Inflight, view.Progress.Unsent = 0, 0
+	view.Progress.Inflight, view.Progress.Unsent, view.Progress.Truncated = 0, 0, 0
 	view.Output = replayOutputSummary{ResultsFailed: view.Output.ResultsFailed}
 	defer func() {
 		view.Progress.Unconfirmed = max(0, int64(view.Progress.Planned)-int64(len(seen)))
@@ -204,7 +205,9 @@ func recoverReplayResults(dir string, view *replayRunView) (err error) {
 			} else {
 				source.Progress.Unsent++
 			}
-			if result.Error != "" && result.Error != "not_sent" {
+			if result.Error == "tail_truncated" {
+				source.Progress.Truncated++
+			} else if result.Error != "" && result.Error != "not_sent" {
 				source.Progress.Failed++
 			} else if result.SendOffset != nil {
 				source.Progress.Completed++
@@ -215,7 +218,9 @@ func recoverReplayResults(dir string, view *replayRunView) (err error) {
 		} else {
 			view.Progress.Unsent++
 		}
-		if result.Error != "" && result.Error != "not_sent" {
+		if result.Error == "tail_truncated" {
+			view.Progress.Truncated++
+		} else if result.Error != "" && result.Error != "not_sent" {
 			view.Progress.Failed++
 			view.LastError = result.Error
 		} else if result.SendOffset != nil && result.Error == "" {

@@ -74,7 +74,7 @@ type replayService struct {
 
 	mu        sync.Mutex
 	active    map[string]*replayRun
-	reporting map[string]bool
+	reporting map[string]int
 	segments  map[string]*replaySegmentLease
 	runs      map[string]*replayRun
 	wg        sync.WaitGroup
@@ -105,7 +105,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
 		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, openResults: func(path string) (replayResultFile, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{}, active: map[string]*replayRun{}, reporting: map[string]bool{}, segments: map[string]*replaySegmentLease{},
+		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{}, active: map[string]*replayRun{}, reporting: map[string]int{}, segments: map[string]*replaySegmentLease{},
 		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	if err = s.recover(); err != nil {
 		s.Close()
@@ -175,7 +175,7 @@ func (s *replayService) pruneRuns(keep int) error {
 		if !entry.IsDir() || !validOperationID(entry.Name()) {
 			continue
 		}
-		if s.active[entry.Name()] != nil || s.reporting[entry.Name()] {
+		if s.active[entry.Name()] != nil || s.reporting[entry.Name()] > 0 {
 			keep--
 			continue
 		}
@@ -449,7 +449,7 @@ func (s *replayService) Handler() http.Handler {
 				names = append(names, name)
 			}
 			sort.Strings(names)
-			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "active_runs": ids, "active_batch": batch, "capabilities": []string{replayProtocolCapability, replayOverlayCapability, replayMultiTargetCapability}, "recording_schema": recordingSchema})
+			replayJSON(w, 200, map[string]any{"service": "aigate-replay", "boot_id": s.boot, "targets": names, "active_run": active, "active_runs": ids, "active_batch": batch, "capabilities": []string{replayProtocolCapability, replayOverlayCapability, replayMultiTargetCapability, replayPerformanceCapability}, "recording_schema": recordingSchema})
 		case r.Method == http.MethodGet && r.URL.Path == prefix+"recordings":
 			gateway := r.URL.Query().Get("gateway_id")
 			if !validOperationID(gateway) {
@@ -498,8 +498,28 @@ func (s *replayService) Handler() http.Handler {
 				runtimeError(w, 404, "run_not_found")
 				return
 			}
+			if r.Method == http.MethodPost && action == "truncate" {
+				s.mu.Lock()
+				run := s.runs[id]
+				s.mu.Unlock()
+				if run == nil {
+					runtimeError(w, 404, "run_not_found")
+					return
+				}
+				view, status, code := run.truncateTail(true)
+				if code != "" {
+					runtimeError(w, status, code)
+				} else {
+					replayJSON(w, status, view)
+				}
+				return
+			}
 			if r.Method == http.MethodGet && action == "report" {
-				if report, ok := s.loadReport(id); ok {
+				if version := r.URL.Query().Get("version"); version != "" && version != "1" && version != "2" {
+					runtimeError(w, 400, "unsupported_report_version")
+					return
+				}
+				if report, ok := s.loadReport(id, r.URL.Query().Get("version")); ok {
 					replayJSON(w, 200, report)
 				} else {
 					runtimeError(w, 404, "run_not_found")

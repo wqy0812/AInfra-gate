@@ -30,7 +30,7 @@ func batchTarget(t *testing.T, id string, send http.HandlerFunc) *httptest.Serve
 func TestReplayBatchIndependentTargetsAndSharedLocks(t *testing.T) {
 	for _, mode := range []string{"timed", "concurrency", "overlay"} {
 		t.Run(mode, func(t *testing.T) {
-			root, req := syntheticReplay(t, 6, .01, `{}`)
+			root, req := syntheticReplay(t, 6, .01, `{"stream":true}`)
 			want := int64(6)
 			if mode == "overlay" {
 				root, req = overlayFixture(t)
@@ -135,7 +135,7 @@ func TestReplayBatchIndependentTargetsAndSharedLocks(t *testing.T) {
 }
 
 func TestReplayBatchOneTargetFailureDoesNotStopPeer(t *testing.T) {
-	root, req := syntheticReplay(t, 2, 0, `{}`)
+	root, req := syntheticReplay(t, 2, 0, `{"stream":true}`)
 	target := batchTarget(t, "r1", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, `{}`) })
 	other := batchTarget(t, "r2", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, `{}`) })
 	f := newReplayFixture(t, root, map[string]string{"r1": target.URL, "r2": other.URL})

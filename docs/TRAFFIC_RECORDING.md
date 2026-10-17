@@ -108,20 +108,19 @@
 
 `POST runs/{id}/lease` 接收 `{boot_id}`，续期 15 秒；租约过期停止新发送并收尾，不允许复活过期或终态任务。准备总时限 120 秒。内存预算耗尽、结果写入失败等致命故障立即公布 `stopping` 与 `error`，平台据此停止另一侧新发送；已发请求继续收尾，故障侧最终为 `failed`。普通单条请求失败只累计失败数，不触发整组停止。`stop` 保留先停后启的取消屏障；prepared/scheduled 状态重启也恢复为 end_unknown，不自动发送。跨服务由平台约定同步起点并聚合进度，同服务仍只占用一个活动 run；平台等待所有子任务确认终态后才释放 Router 锁。两侧服务均需能访问相同目标，原始录制文件始终留在本机；新能力无需 switch、proxy 或模型改动。
 
-## 性能报告（2026-10-17 已发布）
+## 性能报告与收尾 v2（当前源码，待部署）
 
-`GET /control/replay/v1/runs/{id}/report` 沿用控制密钥和来源 CIDR，返回 version=1 及 complete / partial / unavailable / generating。运行结束写入同目录 `report.json`；写入失败时只读查询可以从完整结果行重建，不重发请求。回放状态和报告归档结果相互独立。平台保留最终脱敏报告副本，回放端继续按既有规则保留最近 200 个运行目录。
+新增能力 `replay-performance-v2`。新回放计划要求片段已封尾且保留；只接收请求体明确的 `stream: true`，分开统计 `nonstream`、`stream_unspecified`、`stream_unclassifiable`。结果增加 `request_stream`，与响应类型 `stream` 分开记录，失败响应不会改变请求资格。
 
-`results.jsonl` 新增 timing_version、end_offset_seconds、first_output_seconds、last_output_seconds、stream、multiple_choices。时间为相对本轮起点的单调时间，结束时间不包含结果落盘及报告生成。响应观察继续有界解析；同一次读取中的 SSE 事件共用接收时间，不把解析开销计作输出间隔，不保留生成正文。
+`auto_truncate` 控制收尾截断，平台默认启用。`coordinated_truncation=true` 时由平台对同一目标各来源的总在途判断并调用 `POST runs/{id}/truncate`。全部计划请求实际派发后：原速须超过计划时长且在途为 1–5；固定并发须严格低于设定并发的 50%。普通 `stop` 只取消派发，`truncate` 使用独立请求取消上下文终止残余在途。自然完成的结果不覆盖；截断结果记 `tail_truncated`，单列 `progress.truncated`，终态 `truncated`。
 
-报告含目标/请求快照、计划时长、请求计数、错误分类、usage 覆盖、成功输出量、整轮吞吐、E2E/TTFT/TPOT 的分布及每分钟曲线。E2E 按实际响应类型分组；TTFT 排除角色/空增量/usage；TPOT 只统计 usage 已知且存在首末输出间隔的单生成序列。非流式 TTFT/TPOT 不适用。缺失 usage 不用零填充，不修改录制请求以强制返回用量。
+`GET /control/replay/v1/runs/{id}/report` 默认返回 version=2，可显式选择 version=1。查询只读原结果，不发送模型请求；读取期间保护结果目录不被轮转删除。旧缓存版本不符时从结果重新聚合，原始结果缺失则不可用，平台保留已归档旧版。
 
-成功 req/s 和 token/s 分母是首条发送至最后已发送请求结束。每分钟统计按请求完成时刻归组，末分钟使用实际时长；无样本的延迟分位数为 null。在途平均值按时间积分，峰值按发送/结束事件扫描。token/s 曲线是该分钟完成请求的输出量，不是逐 token 到达速率。直方图相对桶宽 2%，最小分辨率 1 微秒；曲线固定每分钟一点，超过前 7 天标记 curve_truncated，整轮汇总不截断。报告计算最多读取既有计划上限 200,000 条结果和两倍计时事件。
+v2 固定 30 秒桶，曲线仍最多七天。原速延迟按计划发送时间、固定并发按实际发送时间归组；同请求晚完成的延迟保留在发送桶。完成计数与已知成功输出 token 按完成桶归组；并发按实际发送/结束积分。直方图相对桶宽 2%，分位数按合并直方图计算；截断不伪造成完成延迟，缺少 usage 不补零。
 
-旧结果没有 timing_version 时返回 unavailable；中断或结果丢失返回 partial 并保留待确认计数。`progress.sent` 保留运行记录的已发送数，`metrics.sent` 仅统计具备有效结果与计时的请求；两者差额加入报告的待确认数，不改写执行状态。原始录制仍可用于新的回放，新回放不能补回历史运行的性能。
+报告包含 `bucket_seconds`、`latency_basis`、路径无关的 `input_digest`、`filter_policy`、`filter_evidence`、`truncation` 和每桶 `cohort`。历史流式资格只在 hash 核验的原始请求可读时确认，不用 SSE 响应推断原请求；无法确认则标 `legacy_unverified`。平台同时归档 v1/v2，重算不改写执行状态或结果文件。
 
-本功能发布需更新 `aigate-replay`，并同步更新 code-eval engine 与 web。虽然响应观察器源码与 switch 录制共用，新增计时回调仅由 replay 启用，录制 schema 和控制协议未变；现有 switch 与 proxy 可继续配合新 replay 使用，无需为此功能替换。
-
+发布仅需新版 aigate-replay 与 code-eval engine/Web；现有录制器、switch/proxy 协议和实时监控不变。平台必须在目标侧可观测在途归零、身份一致后才释放截断任务占用。
 
 ## 多目标批次（2026-10-17 已协调发布）
 
