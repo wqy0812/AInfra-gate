@@ -1,5 +1,24 @@
 # 当前部署身份
 
+## 2026-10-19 00:46 回放器重启中断不再生成报告
+
+DCU、XPU、A3、PPU 的 aigate-replay 已部署 `0de4f2a2fd0189d1f46ce528bdedd203614c776f`。重启恢复保留状态与原始结果，不生成性能报告；报告读取也不返回旧缓存或重建报告。普通失败、主动停止和重启前已完成的任务保持原有规则。配套 code-eval engine/Web 发布 `a0ff6eb5c05251c6d97d23fad1af10ad1f74a491`，同时上线重启确认、安全收尾及报告隐藏。
+
+| 环境 / SSH MCP target | 部署方式 | 实际运行二进制 SHA-256 |
+| --- | --- | --- |
+| DCU / dcu1 | 原 `aigate-replay.service`，linux/amd64 | `caa2bdf030ab99470bc83cb7444f7067a4b455076b8ce4e7c70c9942fe5c019f` |
+| XPU / xpu1 | 原 `aigate-replay.service`，linux/amd64 | `caa2bdf030ab99470bc83cb7444f7067a4b455076b8ce4e7c70c9942fe5c019f` |
+| A3 / hwA3-1 | `ai-gateway/a3-aigate-replay`，linux/arm64 | `f55afafa7a8c816768a425e69fcd8285231bd3e41625f8a1e1917d10de620e54` |
+| PPU / ppu | `ai-gateway/ppu-aigate-replay`，linux/amd64 | `caa2bdf030ab99470bc83cb7444f7067a4b455076b8ce4e7c70c9942fe5c019f` |
+
+二进制从已推送提交使用 Go 1.27.1、CGO_ENABLED=0、离线显式 vendor 和 trimpath 构建，内嵌 revision 匹配且 `vcs.modified=false`。四处启动参数、凭据、权限、限制、白名单和已有能力保持，认证 status 正常、活动回放为空，未认证 status 返回 403。systemd 只新增本轮 ExecStart 覆盖文件；A3/PPU 保留原镜像，替换只读二进制挂载来源，规范化 OCI 配置一致，旧容器已停止并禁止自动恢复。
+
+DCU 的历史重启任务 `batch-ppu-proxy4g-20261018-r1` 在回放器报告接口和平台报告接口均返回 404，平台正常/已删除列表及模型画像均不再显示；其原始文件和已归档正文保留。DCU/XPU 的录制、结果文件内容与元数据核验保持；A3/PPU 的配置及数据核验保持。A3/PPU switch/proxy 身份与窗口前一致；四项网关绑定未改，DCU/XPU revision=53/34、admission=true，A3/PPU revision=48/8、admission=false。
+
+平台于北京时间 00:42:46 开启维护，00:46:13 恢复原 `maintenance=false`，窗口 206.84 秒。engine/Web healthy、restart_count=0，平台 health=ok。线上 Chrome 1280×720 和 iPhone 390×844 竖屏触控模拟通过报告隐藏与正常报告查看检查，页面脚本错误、API 失败和写请求均为零。没有新建回放、发送模型请求或人为制造重启中断；重启后收尾状态机由本地回归验证。
+
+本轮新增服务器发布目录：dcu1 `/data4/aigate/releases/replay-restart-20261019/`；xpu1 `/var/lib/ai-gate/releases/replay-restart-20261019/`；hwA3-1 `/data/a3-standalone-20261017/aigate/releases/replay-restart-20261019/`；ppu `/bmcp_lvm_fs/aigate/releases/replay-restart-20261019/`。各含 `bin/` 和 `private/`，私有目录 0700；平台目录见[平台发布记录](../../code-eval/deploy/releases/README.md#replay-restart-20261019)。本地脱敏证据在 `code-eval/deploy/evidence/replay-restart-20261019/` 的四份 `*-verification.json` 与 `replay-verification.json`，私有配置和密钥未下载。
+
 ## 2026-10-18 05:11 双录制独立并发：仅更新 replay
 
 DCU、XPU、A3、PPU 的 aigate-replay 已部署 `0be523881cebe01292513e13a2f0da707a4d736c`，新增 `recording-concurrency-per-source-v1`。每份录制拥有独立并发额度，目标级收尾按总额度计算；报告提供逐录制 `source_inputs`。Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath 构建，二进制内嵌上述 Git revision 且 `vcs.modified=false`。
