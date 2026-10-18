@@ -43,7 +43,9 @@ PPU 使用 host 网络，仅接入 `127.0.0.1:8008` 的 Qwen3.6-Plus：
 
 60000 已被现有 `ahm-web` 的 CNI 映射占用（转发至容器 7001）；不能只看 `ss` 判断端口空闲。新部署同时核查监听、各 namespace 的容器映射、NAT 规则和实际 HTTP 响应。60010–60014 已加入持久化临时端口保留项 `/etc/sysctl.d/90-aigate-ports.conf`。
 
-PPU 配置和数据在 `/bmcp_lvm_fs/aigate/{config,proxy,recordings,replay}`，发布证据在 `releases/container-unification-20261017`。配置及密钥受限，程序和配置只读挂载；镜像不含模型、PPU 设备或控制密钥。三个进程以 UID/GID 65532 运行。switch/proxy 各 2 CPU、512 MiB；replay 2 CPU、1 GiB、128 进程。
+PPU 配置和数据在 `/bmcp_lvm_fs/aigate/{config,proxy,recordings,replay}`，发布证据在 `releases/container-unification-20261017`。配置及密钥受限，程序和配置只读挂载；镜像不含模型、PPU 设备或控制密钥。三个进程以 UID/GID 65532 运行。switch 为 2 CPU、512 MiB；proxy 为 2 CPU、4 GiB；replay 为 2 CPU、1 GiB、128 进程。
+
+2026-10-18 的 PPU 回放中，proxy 的原 512 MiB 限制触发 5 次容器 OOM。按用户要求使用 `nerdctl -n ai-gateway update --memory 4g --memory-swap 4g ppu-aigate-proxy` 调整为 4 GiB；实时 cgroup 与 containerd 保存的 OCI Spec 均已核验，PID、镜像和其余配置保持不变。后续重建 proxy 也应使用此限制，不能照搬历史部署脚本中的 512 MiB。原失败报告保留，扩大上限后的相同录制回放另行记录，资源更新本身不代表性能验收通过。
 
 A3 保留迁移前的端口、环境、程序摘要、资源限制和原数据路径。旧 namespace 中停止的容器仅作证据，禁止与新容器同时启动或共享写入数据目录。
 
