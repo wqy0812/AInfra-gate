@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -73,6 +74,27 @@ func TestReplayRecoveryRetainsSyncedVerification(t *testing.T) {
 	again, _ := reopened.loadRun(req.RunID)
 	if !bytes.Equal(encodeJSON(view), encodeJSON(again)) || len(reopened.active) != 0 {
 		t.Fatal("recovery was not idempotent")
+	}
+	// Recovery and explicit save attempts retain evidence but create no report.
+	reportPath := filepath.Join(reopened.runDir(req.RunID), "report.json")
+	reopened.saveReport(again)
+	if _, err := os.Stat(reportPath); !os.IsNotExist(err) {
+		t.Fatal("restart-interrupted run generated a report", err)
+	}
+	if _, ok := reopened.loadReport(req.RunID); ok {
+		t.Fatal("restart-interrupted report was reconstructed")
+	}
+	// Cached reports from an earlier version must not bypass the restart rule.
+	if err := os.WriteFile(reportPath, []byte(`{"version":2,"state":"partial"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/control/replay/v1/runs/"+req.RunID+"/report", nil)
+	request.RemoteAddr = "127.0.0.1:12345"
+	request.Header.Set("Authorization", "Bearer "+strings.Repeat("r", 32))
+	response := httptest.NewRecorder()
+	reopened.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatal("cached restart report was exposed", response.Code, response.Body.String())
 	}
 }
 

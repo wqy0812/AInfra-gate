@@ -145,7 +145,6 @@ func (s *replayService) recover() error {
 			if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
 				return err
 			}
-			s.saveReport(view)
 		}
 	}
 	return s.pruneRuns(replayRunsKept)

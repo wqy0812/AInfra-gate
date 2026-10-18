@@ -374,7 +374,14 @@ func buildReplayReport(dir string, view replayRunView) replayReport {
 	}
 	return r
 }
+func replayReportSuppressed(view replayRunView) bool {
+	return view.Error == "service_restarted" || view.EndReason == "service_restarted"
+}
+
 func (s *replayService) saveReport(view replayRunView) {
+	if replayReportSuppressed(view) {
+		return
+	}
 	report := buildReplayReport(s.runDir(view.RunID), view)
 	if _, err := recordingAtomicJSON(s.runDir(view.RunID), "report.json", report); err != nil {
 		s.audit.Print("replay_report_write_failed run=" + view.RunID)
@@ -397,7 +404,7 @@ func (s *replayService) loadReport(id string) (any, bool) {
 			s.mu.Unlock()
 		}()
 	}
-	if !ok {
+	if !ok || replayReportSuppressed(view) {
 		return nil, false
 	}
 	if view.EndedAt == nil {
