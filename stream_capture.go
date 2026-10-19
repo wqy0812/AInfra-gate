@@ -12,7 +12,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -108,6 +107,7 @@ type streamCaptureMeta struct {
 	BootID                       string     `json:"boot_id"`
 	StartedAt                    time.Time  `json:"started_at"`
 	EndedAt                      *time.Time `json:"ended_at,omitempty"`
+	StorageClosedAt              *time.Time `json:"storage_closed_at,omitempty"`
 	Retained                     bool       `json:"retained"`
 	FirstIncidentID              string     `json:"first_incident_id,omitempty"`
 	LastIncidentID               string     `json:"last_incident_id,omitempty"`
@@ -230,7 +230,7 @@ type streamCaptureStore struct {
 	writePayload func(*os.File, []byte) (int, error)
 }
 
-func newStreamCaptureStore(root, serviceID, routerID, boot string, audit *log.Logger) (*streamCaptureStore, error) {
+func newStreamCaptureStore(root, serviceID, routerID, boot string, audit *log.Logger, limits ...int64) (*streamCaptureStore, error) {
 	if audit == nil {
 		audit = log.New(io.Discard, "", 0)
 	}
@@ -256,6 +256,9 @@ func newStreamCaptureStore(root, serviceID, routerID, boot string, audit *log.Lo
 		active: make(map[*streamCapture]bool), queue: make(chan captureJob, streamCaptureQueue), wake: make(chan struct{}, 1), done: make(chan struct{}),
 		maxMemory: streamCaptureMemory, maxHandles: streamCaptureHandles, maxQueue: streamCaptureQueue, maxDisk: streamCaptureDisk,
 		retention: streamCaptureRetention, stored: make(map[string]*captureStored), writePayload: func(f *os.File, p []byte) (int, error) { return f.Write(p) }}
+	if len(limits) > 0 && limits[0] > 0 {
+		s.maxDisk = limits[0]
+	}
 	if err = s.recoverStored(time.Now()); err != nil {
 		unlockState(directory)
 		directory.Close()
@@ -598,7 +601,7 @@ func (s *streamCaptureStore) reconcileAll(now time.Time, closing bool) {
 	for _, c := range active {
 		s.safeWork(c, func() error { return s.reconcile(c, now, closing) })
 	}
-	if now.Sub(s.lastCleanup) >= time.Minute {
+	if now.Sub(s.lastCleanup) >= archiveInterval {
 		if err := s.cleanup(now, 0); err != nil {
 			s.failures.Add(1)
 		}
@@ -733,7 +736,7 @@ func (s *streamCaptureStore) reconcile(c *streamCapture, now time.Time, closing 
 	if retained {
 		at = c.triggeredAt
 	}
-	expired := c.expired || (!at.IsZero() && !at.Add(s.retention).After(now))
+	expired := c.expired
 	if expired {
 		c.expired = true
 		c.freezeLocked("retention_expired", "truncated", 0)
@@ -991,89 +994,16 @@ func (s *streamCaptureStore) capacity(additional int64) error {
 }
 
 func (s *streamCaptureStore) cleanup(now time.Time, additional int64) error {
-	for {
-		directory, err := os.Open(s.root)
-		if err != nil {
-			return err
-		}
-		// Keep a bounded batch of the oldest safe records, not an index of all
-		// retained requests. A second pass is needed only for large evictions.
-		records := make([]captureStored, 0, streamCaptureHandles+64)
-		for {
-			entries, readErr := directory.ReadDir(64)
-			for _, entry := range entries {
-				if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
-					continue
-				}
-				id := strings.TrimPrefix(entry.Name(), "request-")
-				if id == entry.Name() {
-					id = strings.TrimPrefix(entry.Name(), ".pending-")
-				}
-				if !slowRequestID(id) {
-					continue
-				}
-				path := filepath.Join(s.root, entry.Name())
-				if live := s.stored[path]; live != nil && live.active {
-					continue
-				}
-				_, size, err := captureRecordFiles(path)
-				if err != nil {
-					continue
-				}
-				info, err := entry.Info()
-				if err != nil {
-					directory.Close()
-					return err
-				}
-				at := info.ModTime()
-				data, err := captureReadSmall(filepath.Join(path, "meta.json"), captureMetaLimit)
-				var meta streamCaptureMeta
-				if err == nil && len(data) <= captureMetaLimit && json.Unmarshal(data, &meta) == nil && meta.Schema == 1 && meta.RequestID == id {
-					if !meta.StartedAt.IsZero() {
-						at = meta.StartedAt
-					}
-					if meta.TriggeredAt != nil && !meta.TriggeredAt.IsZero() {
-						at = *meta.TriggeredAt
-					}
-				}
-				if !at.Add(s.retention).After(now) {
-					if err := s.removeRecord(path); err != nil {
-						directory.Close()
-						return err
-					}
-					continue
-				}
-				records = append(records, captureStored{path: path, at: at, bytes: size, safe: true})
-			}
-			if len(records) > streamCaptureHandles {
-				sort.Slice(records, func(i, j int) bool { return records[i].at.Before(records[j].at) })
-				records = records[:streamCaptureHandles]
-			}
-			if readErr == io.EOF {
-				break
-			}
-			if readErr != nil {
-				directory.Close()
-				return readErr
-			}
-		}
-		directory.Close()
-		if s.diskBytes+s.diskReserved+additional <= s.maxDisk {
-			return nil
-		}
-		if len(records) == 0 {
-			return errors.New("capture_disk_full")
-		}
-		sort.Slice(records, func(i, j int) bool { return records[i].at.Before(records[j].at) })
-		for _, record := range records {
-			if s.diskBytes+s.diskReserved+additional <= s.maxDisk {
-				return nil
-			}
-			if err := s.removeRecord(record.path); err != nil {
-				return err
-			}
-		}
+	// Writes use a soft quota. Housekeeping runs independently every five minutes.
+	if additional > 0 {
+		return nil
 	}
+	err := maintainDiagnosticArchives(s.root, now, s.maxDisk, func(path string) bool { v := s.stored[path]; return v != nil && v.active })
+	if err != nil {
+		return err
+	}
+	s.diskBytes, err = captureTreeBytes(s.root)
+	return err
 }
 
 func captureRecordFiles(path string) ([]os.DirEntry, int64, error) {
@@ -1088,7 +1018,7 @@ func captureRecordFiles(path string) ([]os.DirEntry, int64, error) {
 	var size int64
 	for _, entry := range entries {
 		switch entry.Name() {
-		case "request.json", "response.sse", "timeline.jsonl", "meta.json", "meta.json.tmp":
+		case "request.json", "response.sse", "timeline.jsonl", "meta.json", "meta.json.tmp", diagnosticRefName:
 		default:
 			return nil, size, errors.New("unknown capture file")
 		}
@@ -1212,7 +1142,7 @@ func (s *streamCaptureStore) recoverStored(now time.Time) error {
 			s.stored[final] = record
 			path = final
 		}
-		if valid && m.EndedAt != nil && m.CaptureState != "recording" {
+		if valid && (m.EndedAt != nil || m.StorageClosedAt != nil) && m.CaptureState != "recording" {
 			delete(s.stored, path)
 			continue
 		}
@@ -1220,6 +1150,10 @@ func (s *streamCaptureStore) recoverStored(now time.Time) error {
 			m = streamCaptureMeta{Schema: 1, RequestID: id, ServiceID: s.serviceID, RouterID: s.routerID, StartedAt: at}
 		}
 		m.Retained, m.CaptureState, m.FailureReason = true, "end_unknown", "process_end_unobserved"
+		if m.EndedAt == nil && m.StorageClosedAt == nil {
+			closed := now
+			m.StorageClosedAt = &closed
+		}
 		m.ResponseSavedBytes, m.ResponseSHA256, err = captureFileHash(filepath.Join(path, "response.sse"))
 		if err != nil && !os.IsNotExist(err) {
 			return err

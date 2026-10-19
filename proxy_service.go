@@ -137,7 +137,7 @@ func prepareProxyGateway(cfg ProxyConfig, dataRoot string, audit io.Writer, chec
 		}
 		// Detail capture has its own queue, lock and disk budget. Failure must not
 		// disable the existing summary store or refuse business admission.
-		g.captures, err = newStreamCaptureStore(filepath.Join(dataRoot, "stream-incidents", "requests"), p.id, p.router, p.boot, g.audit)
+		g.captures, err = newStreamCaptureStore(filepath.Join(dataRoot, "stream-incidents", "requests"), p.id, p.router, p.boot, g.audit, settings.StreamCaptureMaxDiskBytes)
 		if err != nil {
 			g.audit.Print(`{"event":"stream_capture_storage_unavailable"}`)
 		}
@@ -150,6 +150,7 @@ func (p *ProxyGateway) retain() {
 	defer close(p.done)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	var lastSlow time.Time
 	for {
 		protected := map[string]bool{}
 		if p.g.profile != nil {
@@ -165,11 +166,16 @@ func (p *ProxyGateway) retain() {
 			bytes int64
 		}{
 			{"request-profile", false, p.settings.Profile.RetentionHours, p.settings.Profile.MaxDiskBytes},
-			{"slow-requests", true, p.settings.SlowRequests.RetentionHours, p.settings.SlowRequests.MaxDiskBytes},
 		} {
 			if err := cleanObservationRoot(filepath.Join(p.dataRoot, item.dir), item.slow, time.Now(), item.hours, item.bytes, protected); err != nil {
 				p.g.audit.Print(string(encodeJSON(map[string]any{"event": "observation_retention_error", "error": err.Error()})))
 			}
+		}
+		if p.g.slow == nil && time.Since(lastSlow) >= archiveInterval {
+			if err := maintainSlowArchives(filepath.Join(p.dataRoot, "slow-requests"), time.Now(), p.settings.SlowRequests.MaxDiskBytes); err != nil {
+				p.g.audit.Printf("slow_archive_failed: %v", err)
+			}
+			lastSlow = time.Now()
 		}
 		select {
 		case <-p.stop:

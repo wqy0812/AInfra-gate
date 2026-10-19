@@ -335,7 +335,7 @@ func TestStreamCaptureCompletedRecordsLeaveNoMemoryIndex(t *testing.T) {
 	captureAssertReleased(t, s)
 }
 
-func TestStreamCaptureStartupRetentionKeepsRecentAndDeletesExpired(t *testing.T) {
+func TestStreamCaptureStartupCompressesOldAndKeepsRecent(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "requests")
 	oldID, recentID := randomID(), randomID()
 	old, recent := time.Now().Add(-73*time.Hour), time.Now().Add(-time.Hour)
@@ -346,8 +346,8 @@ func TestStreamCaptureStartupRetentionKeepsRecentAndDeletesExpired(t *testing.T)
 		t.Fatal(err)
 	}
 	s.close()
-	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
-		t.Fatalf("expired record remains: %v", err)
+	if _, err := diagnosticReference(oldPath); err != nil {
+		t.Fatalf("old record not archived: %v", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(recentPath, "response.sse")); err != nil || string(data) != "recent" {
 		t.Fatalf("recent record removed: %q %v", data, err)
@@ -485,55 +485,26 @@ func TestStreamCaptureUnknownFilesAndLinksNeverRemoved(t *testing.T) {
 	}
 }
 
-func TestStreamCaptureDiskLimitAndExpiredActiveInput(t *testing.T) {
-	t.Run("disk", func(t *testing.T) {
-		s := captureTestStore(t)
-		s.maxDisk = captureMetaReserve + 8
-		c := s.begin(randomID(), []byte("input"), time.Now())
-		c.response(time.Now(), 0, bytes.Repeat([]byte("x"), 100))
-		c.trigger("incident", "output_stall", time.Now())
-		c.finish(time.Now(), "success", true, true)
-		captureWaitReleased(t, c)
-		m := captureReadMeta(t, s, c.id)
-		if m.CaptureState != "truncated" || m.ResponseSavedBytes != 0 || m.FailureReason != "disk_budget_exhausted" {
-			t.Fatalf("disk limit not enforced: %+v", m)
-		}
-		if size, err := captureTreeBytes(s.root); err != nil || size > s.maxDisk {
-			t.Fatalf("disk cap exceeded: %d %v", size, err)
-		}
-		captureAssertReleased(t, s)
-	})
-	t.Run("active-expiry", func(t *testing.T) {
-		s := captureTestStore(t)
-		c := s.begin(randomID(), []byte("held original input"), time.Now().Add(-73*time.Hour))
-		c.event(captureEvent{Type: "read_return", At: time.Now()})
-		deadline := time.After(2 * time.Second)
-		for {
-			s.mu.Lock()
-			expired, raw, active := c.expired, c.raw, len(s.active)
-			s.mu.Unlock()
-			if expired {
-				if raw != nil || active != 1 {
-					t.Fatal("expiry did not release body into bounded tombstone")
-				}
-				break
-			}
-			select {
-			case <-deadline:
-				t.Fatal("active capture did not expire")
-			case <-time.After(time.Millisecond):
-			}
-		}
-		c.trigger("too-late", "output_stall", time.Now())
-		c.response(time.Now(), 0, []byte("ignored"))
-		c.finish(time.Now(), "success", true, true)
-		captureWaitReleased(t, c)
-		entries, _ := os.ReadDir(s.root)
-		if len(entries) != 0 {
-			t.Fatal("expired capture recreated files")
-		}
-		captureAssertReleased(t, s)
-	})
+func TestStreamCaptureSoftQuotaAndActiveAge(t *testing.T) {
+	s := captureTestStore(t)
+	c := s.begin(randomID(), []byte("input"), time.Now().Add(-73*time.Hour))
+	c.response(time.Now(), 0, bytes.Repeat([]byte("x"), 100))
+	c.trigger("incident", "output_stall", time.Now())
+	c.finish(time.Now(), "success", true, true)
+	captureWaitReleased(t, c)
+	m := captureReadMeta(t, s, c.id)
+	if m.CaptureState != "complete" || m.ResponseSavedBytes != 100 {
+		t.Fatalf("age/soft budget changed capture: %+v", m)
+	}
+	s.close()
+	s.maxDisk = 1
+	if err := s.cleanup(time.Now(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.root, "request-"+c.id)); !os.IsNotExist(err) {
+		t.Fatal("quota did not evict completed record")
+	}
+	captureAssertReleased(t, s)
 }
 
 func TestStreamCaptureNilMethodsAndBoundedEventFields(t *testing.T) {

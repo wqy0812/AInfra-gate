@@ -30,7 +30,7 @@ const (
 	recordingMemory          = int64(64 << 20)
 	recordingHandles         = 1024
 	recordingQueue           = 1024
-	recordingDefaultMaxBytes = int64(50 << 30)
+	recordingDefaultMaxBytes = int64(10 << 30)
 	recordingTimelineEvents  = 8192
 	recordingEventBlock      = 128
 	recordingEventCharge     = int64(64)
@@ -83,9 +83,6 @@ func (p *recordingParams) normalize(limit int64, now time.Time) error {
 	}
 	if p.SampleOneIn > recordingMaxSampleOneIn {
 		return fmt.Errorf("invalid_sample_rate")
-	}
-	if p.MaxBytes == 0 {
-		p.MaxBytes = limit
 	}
 	if p.MaxBytes < 0 || p.MaxBytes > limit {
 		return fmt.Errorf("invalid_max_bytes")
@@ -1077,9 +1074,6 @@ func (r *trafficRecorder) startLocked(p recordingParams, now time.Time, done fun
 			return fmt.Errorf("recording_active")
 		}
 	}
-	if r.pinnedBytes >= r.maxBytes {
-		return fmt.Errorf("capacity_reserved")
-	}
 	s := &recordingSession{params: p, created: now, segments: map[time.Time]*recordingSegmentState{}}
 	select {
 	case r.control <- recordingControlJob{create: s, done: done}:
@@ -1221,6 +1215,9 @@ func (r *trafficRecorder) run() {
 	defer close(r.done)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	storage := time.NewTicker(archiveInterval)
+	defer storage.Stop()
+	r.maintainStorage()
 	for {
 		select {
 		case snapshot := <-r.queue:
@@ -1228,11 +1225,16 @@ func (r *trafficRecorder) run() {
 		case job := <-r.control:
 			r.controlJob(job)
 		case <-ticker.C:
+		case <-storage.C:
+			r.maintainStorage()
 		case <-r.stop:
 			r.drain()
 			return
 		}
 		r.maintain(false)
+		if len(r.acks) > 0 {
+			r.maintainStorage()
+		}
 		for _, ack := range r.acks {
 			close(ack)
 		}
@@ -1504,11 +1506,10 @@ func (r *trafficRecorder) write(snapshot *recordingSnapshot) {
 		r.stored[key] = stored
 	}
 	stored.bytes += written
-	if s.bytes >= s.params.MaxBytes {
+	if s.params.MaxBytes > 0 && s.bytes >= s.params.MaxBytes {
 		r.stopSessionLocked(s, r.now(), "max_bytes")
 	}
 	r.mu.Unlock()
-	r.evict()
 }
 
 // evict removes whole sealed, unpinned segments, oldest first. The open
@@ -1570,14 +1571,6 @@ func (r *trafficRecorder) evict() {
 		r.mu.Unlock()
 		r.removeEmptySessions()
 		r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_segment_evicted", "segment": v.key, "bytes": v.bytes})))
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.diskBytes > r.maxBytes {
-		now := r.now()
-		for _, s := range r.sessions {
-			r.stopSessionLocked(s, now, "capacity")
-		}
 	}
 }
 
@@ -1738,7 +1731,6 @@ func (r *trafficRecorder) maintain(closing bool) {
 		}
 		r.mu.Unlock()
 	}
-	r.evict()
 }
 
 // flush waits until queued work and maintenance have run once (tests only).

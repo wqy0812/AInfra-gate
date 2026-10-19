@@ -232,7 +232,9 @@ type replayPlan struct {
 // replaySegmentStatus is the metadata the platform lists for each segment.
 type replaySegmentStatus struct {
 	recordingSegmentFile
-	Pinned bool `json:"pinned"`
+	Pinned      bool  `json:"pinned"`
+	Compressed  bool  `json:"compressed,omitempty"`
+	StoredBytes int64 `json:"stored_bytes,omitempty"`
 }
 
 func readRecordingSession(root, gateway, recording string) (recordingSessionFile, error) {
@@ -262,6 +264,10 @@ func readRecordingSegment(root, gateway, recording, name string) (replaySegmentS
 	}
 	_, pinErr := os.Stat(filepath.Join(dir, "pinned"))
 	out.Pinned = pinErr == nil
+	if m, e := readSegmentArchive(dir); e == nil {
+		out.Compressed = true
+		out.StoredBytes = m.Bytes
+	}
 	return out, nil
 }
 

@@ -115,13 +115,22 @@ func TestSlowRetentionAfterProxyRestartWithCaptureDisabled(t *testing.T) {
 	p := retentionProxy(t, root, `{"slow_requests":{"enabled":true,"retention_hours":72}}`)
 	store := p.g.slow
 	now := time.Now()
-	job := slowTestJob(1, now.Add(-2*time.Hour), "body")
+	job := slowTestJob(1, now.Add(-74*time.Hour), "body")
 	if err := store.writeRecord(job); err != nil {
 		t.Fatal(err)
 	}
 	p.Close()
 	retentionProxy(t, root, `{"slow_requests":{"enabled":false,"retention_hours":1}}`)
-	awaitRetention(t, filepath.Join(store.c.Directory, "request-"+job.meta.RequestID))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := diagnosticReference(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disabled capture historical record not archived")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func TestRetentionDoesNotFollowSymlinksOrDeleteForeignFiles(t *testing.T) {

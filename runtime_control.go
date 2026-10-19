@@ -262,6 +262,10 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 			runtimeError(w, 403, "unauthorized")
 			return
 		}
+		if version == 3 && (r.URL.Path == "/control/v3/recordings" || strings.HasPrefix(r.URL.Path, "/control/v3/recordings/")) {
+			c.recorder.archiveHTTP(w, r)
+			return
+		}
 		if r.Method == "GET" && path == "/control/v2/status" {
 			c.mu.Lock()
 			status := c.statusLocked()

@@ -340,7 +340,8 @@ func TestSlowRequestRetentionDiskLimitAndOwnership(t *testing.T) {
 	pending := filepath.Join(c.Directory, fmt.Sprintf(".pending-%032x", 9))
 	os.Mkdir(pending, 0700)
 	os.WriteFile(filepath.Join(pending, "request.json"), []byte("partial"), 0600)
-	if err := s.cleanup(now.Add(72*time.Hour), 0); err != nil {
+	s.c.MaxDiskBytes = 10 << 30
+	if err := s.cleanup(now.Add(74*time.Hour), 0); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{foreign, filepath.Join(bare, "keep"), filepath.Join(outside, "keep")} {
@@ -352,8 +353,8 @@ func TestSlowRequestRetentionDiskLimitAndOwnership(t *testing.T) {
 		t.Fatal("stale temporary directory not removed")
 	}
 	for _, id := range []int{1, 3} {
-		if _, err := os.Stat(filepath.Join(c.Directory, fmt.Sprintf("request-%032x", id))); !os.IsNotExist(err) {
-			t.Fatal("expired record retained")
+		if _, err := diagnosticReference(filepath.Join(c.Directory, fmt.Sprintf("request-%032x", id))); err != nil {
+			t.Fatal("old record not archived", err)
 		}
 	}
 	// Restart performs cleanup and reacquires the exclusive directory lock.

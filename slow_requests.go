@@ -10,7 +10,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -200,7 +199,7 @@ func (s *slowRequestStore) close() {
 }
 
 func (s *slowRequestStore) run() {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(archiveInterval)
 	defer func() {
 		ticker.Stop()
 		unlockState(s.directory)
@@ -253,6 +252,8 @@ func slowWriteFile(path string, data []byte) error {
 }
 
 func (s *slowRequestStore) writeRecord(job slowRequestJob) error {
+	diagnosticArchiveMu.RLock()
+	defer diagnosticArchiveMu.RUnlock()
 	if !slowRequestID(job.meta.RequestID) {
 		return fmt.Errorf("invalid request ID")
 	}
@@ -262,16 +263,9 @@ func (s *slowRequestStore) writeRecord(job slowRequestJob) error {
 	if len(meta) > 16<<10 {
 		return fmt.Errorf("metadata exceeds 16 KiB limit")
 	}
-	size := int64(len(job.body)) + int64(len(meta))
-	if size > s.c.MaxDiskBytes {
-		return fmt.Errorf("record exceeds disk limit")
-	}
 	final := filepath.Join(s.c.Directory, "request-"+job.meta.RequestID)
 	if _, err := os.Lstat(final); !os.IsNotExist(err) {
 		return fmt.Errorf("record already exists or cannot be inspected")
-	}
-	if err := s.cleanup(time.Now(), size); err != nil {
-		return err
 	}
 	tmp := filepath.Join(s.c.Directory, ".pending-"+job.meta.RequestID)
 	if err := os.Mkdir(tmp, 0700); err != nil {
@@ -313,7 +307,7 @@ func slowRecordFiles(path string) ([]os.DirEntry, int64, error) {
 	}
 	var size int64
 	for _, entry := range entries {
-		if entry.Name() != "meta.json" && entry.Name() != "request.json" {
+		if entry.Name() != "meta.json" && entry.Name() != "request.json" && entry.Name() != diagnosticRefName {
 			return nil, 0, fmt.Errorf("unexpected file in slow request directory")
 		}
 		info, err := entry.Info()
@@ -389,34 +383,27 @@ func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
 }
 
 func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
-	records, err := slowStoredRecords(s.c.Directory)
+	root := s.c.Directory
+	if observationPolicyDir(filepath.Base(root)) {
+		root = filepath.Dir(root)
+	}
+	return maintainSlowArchives(root, now, s.c.MaxDiskBytes)
+}
+
+func maintainSlowArchives(root string, now time.Time, budget int64) error {
+	diagnosticArchiveMu.Lock()
+	dirs, err := diagnosticFolders(root)
+	if err == nil {
+		for _, dir := range dirs {
+			_, err = slowStoredRecords(dir)
+			if err != nil {
+				break
+			}
+		}
+	}
+	diagnosticArchiveMu.Unlock()
 	if err != nil {
 		return err
 	}
-	var total int64
-	for _, record := range records {
-		total += record.bytes
-	}
-	sort.Slice(records, func(i, j int) bool {
-		if records[i].ended.Equal(records[j].ended) {
-			return records[i].path < records[j].path
-		}
-		return records[i].ended.Before(records[j].ended)
-	})
-	cutoff := now.Add(-time.Duration(s.c.RetentionHours) * time.Hour)
-	for _, record := range records {
-		if record.ended.After(cutoff) && total <= s.c.MaxDiskBytes-incoming {
-			break
-		}
-		// Rename before unlinking so a crash during deletion leaves a recoverable pending directory.
-		tmp := filepath.Join(s.c.Directory, ".pending-"+strings.TrimPrefix(filepath.Base(record.path), "request-"))
-		if err := os.Rename(record.path, tmp); err != nil {
-			return err
-		}
-		if err := slowRemoveFiles(tmp); err != nil {
-			return err
-		}
-		total -= record.bytes
-	}
-	return nil
+	return maintainDiagnosticArchives(root, now, budget, nil)
 }
