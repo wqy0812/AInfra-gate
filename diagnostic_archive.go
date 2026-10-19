@@ -1,8 +1,8 @@
 package aigate
 
 import (
+	"container/heap"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,52 +14,66 @@ import (
 
 var diagnosticMaintenanceMu sync.Mutex
 
+const diagnosticCandidateBatch = 4096
+
 type diagnosticItem struct {
 	path  string
 	at    time.Time
 	bytes int64
 }
 
+// Keep the newest selected item at the root, so a scan retains only the
+// oldest fixed-size batch. Path breaks ties within a half-hour bucket and
+// provides a cursor even when a protected item cannot be deleted.
+func (item diagnosticItem) before(other diagnosticItem) bool {
+	a, b := item.at.Truncate(recordingSegment), other.at.Truncate(recordingSegment)
+	if !a.Equal(b) {
+		return a.Before(b)
+	}
+	return item.path < other.path
+}
+
+type diagnosticHeap []diagnosticItem
+
+func (h diagnosticHeap) Len() int           { return len(h) }
+func (h diagnosticHeap) Less(i, j int) bool { return h[j].before(h[i]) }
+func (h diagnosticHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *diagnosticHeap) Push(value any)    { *h = append(*h, value.(diagnosticItem)) }
+func (h *diagnosticHeap) Pop() any {
+	last := len(*h) - 1
+	value := (*h)[last]
+	*h = (*h)[:last]
+	return value
+}
+
 func diagnosticFolders(root string) ([]string, error) {
 	dirs := []string{root}
-	entries, e := boundedDiagnosticEntries(root)
+	e := visitDiagnosticEntries(root, func(d os.DirEntry) error {
+		if d.IsDir() && observationPolicyDir(d.Name()) {
+			dirs = append(dirs, filepath.Join(root, d.Name()))
+		}
+		return nil
+	})
 	if os.IsNotExist(e) {
 		return nil, nil
 	}
 	if e != nil {
 		return nil, e
 	}
-	for _, d := range entries {
-		if d.IsDir() && observationPolicyDir(d.Name()) {
-			dirs = append(dirs, filepath.Join(root, d.Name()))
-		}
-	}
 	return dirs, nil
 }
-func maintainDiagnosticStorage(root string, now time.Time, budget int64, active func(string) bool) error {
-	diagnosticMaintenanceMu.Lock()
-	defer diagnosticMaintenanceMu.Unlock()
-	dirs, e := diagnosticFolders(root)
-	if e != nil {
-		return e
-	}
-	groups := map[time.Time][]diagnosticItem{}
+
+func diagnosticCandidates(dirs []string, active func(string) bool, after *diagnosticItem) ([]diagnosticItem, int64, error) {
+	candidates := &diagnosticHeap{}
 	var pending int64
 	for _, dir := range dirs {
-		if e = recoverStorageDeletes(dir); e != nil {
-			return e
-		}
-		entries, e := boundedDiagnosticEntries(dir)
-		if e != nil {
-			return e
-		}
-		for _, entry := range entries {
+		e := visitDiagnosticEntries(dir, func(entry os.DirEntry) error {
 			if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "request-") {
-				continue
+				return nil
 			}
 			path := filepath.Join(dir, entry.Name())
 			if active != nil && active(path) {
-				continue
+				return nil
 			}
 			var meta struct {
 				EndedAt         *time.Time `json:"ended_at"`
@@ -68,26 +82,62 @@ func maintainDiagnosticStorage(root string, now time.Time, budget int64, active 
 			}
 			data, e := captureReadSmall(filepath.Join(path, "meta.json"), captureMetaLimit)
 			if e != nil || json.Unmarshal(data, &meta) != nil || meta.CaptureState == "recording" {
-				continue
+				return nil
 			}
 			at := meta.EndedAt
 			if at == nil {
 				at = meta.StorageClosedAt
 			}
 			if at == nil {
-				continue
+				return nil
 			}
 			size, e := recordingTreeBytes(path)
 			if e != nil {
+				if os.IsNotExist(e) {
+					return nil
+				}
 				return e
 			}
 			if _, e = os.Stat(filepath.Join(path, deleteMarker)); e == nil {
 				pending += size
-				continue
+				return nil
 			}
-			bucket := at.Truncate(recordingSegment)
-			groups[bucket] = append(groups[bucket], diagnosticItem{path, *at, size})
+			item := diagnosticItem{path, *at, size}
+			if after != nil && !after.before(item) {
+				return nil
+			}
+			if candidates.Len() < diagnosticCandidateBatch {
+				heap.Push(candidates, item)
+			} else if item.before((*candidates)[0]) {
+				(*candidates)[0] = item
+				heap.Fix(candidates, 0)
+			}
+			return nil
+		})
+		if e != nil {
+			return nil, 0, e
 		}
+	}
+	items := []diagnosticItem(*candidates)
+	sort.Slice(items, func(i, j int) bool { return items[i].before(items[j]) })
+	return items, pending, nil
+}
+
+func maintainDiagnosticStorage(root string, now time.Time, budget int64, active func(string) bool) error {
+	diagnosticMaintenanceMu.Lock()
+	defer diagnosticMaintenanceMu.Unlock()
+	dirs, e := diagnosticFolders(root)
+	if e != nil {
+		return e
+	}
+	for _, dir := range dirs {
+		if e = recoverStorageDeletes(dir); e != nil {
+			return e
+		}
+	}
+	items, pending, e := diagnosticCandidates(dirs, active, nil)
+	if e != nil {
+		return e
 	}
 	total, e := recordingTreeBytes(root)
 	if os.IsNotExist(e) {
@@ -97,16 +147,18 @@ func maintainDiagnosticStorage(root string, now time.Time, budget int64, active 
 		return e
 	}
 	projected := total - pending
-	buckets := []time.Time{}
-	for b := range groups {
-		buckets = append(buckets, b)
+	if projected <= budget {
+		return nil
 	}
-	sort.Slice(buckets, func(i, j int) bool { return buckets[i].Before(buckets[j]) })
-	for _, b := range buckets {
-		if projected <= budget {
-			break
-		}
-		for _, item := range groups[b] {
+	var bucket time.Time
+	for len(items) > 0 {
+		for _, item := range items {
+			nextBucket := item.at.Truncate(recordingSegment)
+			// Preserve whole-half-hour cleanup even across batch boundaries.
+			if projected <= budget && !nextBucket.Equal(bucket) {
+				return nil
+			}
+			bucket = nextBucket
 			if e = markStorageDelete(item.path); e != nil {
 				continue
 			}
@@ -114,6 +166,15 @@ func maintainDiagnosticStorage(root string, now time.Time, budget int64, active 
 			if e = finishStorageDelete(item.path); e != nil {
 				return e
 			}
+		}
+		if len(items) < diagnosticCandidateBatch {
+			return nil
+		}
+		after := items[len(items)-1]
+		items = nil
+		items, _, e = diagnosticCandidates(dirs, active, &after)
+		if e != nil {
+			return e
 		}
 	}
 	return nil
@@ -154,26 +215,25 @@ func maintainInactiveDiagnostics(root string, now time.Time, budget int64, recov
 	return maintainDiagnosticStorage(root, now, budget, nil)
 }
 
-// Explicit candidate budget protects maintenance before it builds a manifest.
-// No original data is modified when a directory exceeds this safety budget.
-func boundedDiagnosticEntries(path string) ([]os.DirEntry, error) {
+// Directory size never limits cleanup. Only one small read batch is retained.
+func visitDiagnosticEntries(path string, visit func(os.DirEntry) error) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer f.Close()
-	entries := []os.DirEntry{}
 	for {
 		batch, err := f.ReadDir(128)
 		if err != nil && err != io.EOF {
-			return nil, err
+			return err
 		}
-		if len(entries)+len(batch) > archiveManifestMaxFiles {
-			return nil, fmt.Errorf("archive_metadata_limit")
+		for _, entry := range batch {
+			if err := visit(entry); err != nil {
+				return err
+			}
 		}
-		entries = append(entries, batch...)
 		if err == io.EOF {
-			return entries, nil
+			return nil
 		}
 	}
 }

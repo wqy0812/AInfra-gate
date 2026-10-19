@@ -107,25 +107,20 @@ func finishStorageDelete(path string) error {
 	return syncDirectory(filepath.Dir(trash))
 }
 func recoverStorageDeletes(root string) error {
-	entries, e := os.ReadDir(root)
-	if os.IsNotExist(e) {
-		return nil
-	}
-	if e != nil {
-		return e
-	}
-	for _, entry := range entries {
+	e := visitDiagnosticEntries(root, func(entry os.DirEntry) error {
 		if !entry.IsDir() {
-			continue
+			return nil
 		}
 		path := filepath.Join(root, entry.Name())
-		if _, e = os.Stat(filepath.Join(path, deleteMarker)); e == nil || strings.HasPrefix(entry.Name(), ".trash-") {
-			if e = finishStorageDelete(path); e != nil {
-				return e
-			}
+		if _, e := os.Stat(filepath.Join(path, deleteMarker)); e == nil || strings.HasPrefix(entry.Name(), ".trash-") {
+			return finishStorageDelete(path)
 		} else if !os.IsNotExist(e) {
 			return e
 		}
+		return nil
+	})
+	if os.IsNotExist(e) {
+		return nil
 	}
-	return nil
+	return e
 }

@@ -120,7 +120,7 @@ func newSlowRequestStore(c SlowRequestConfig, logger *log.Logger) (*slowRequestS
 		return nil, fmt.Errorf("slow_requests directory lock: %w", err)
 	}
 	s := &slowRequestStore{c: c, log: logger, directory: dir, queue: make(chan slowRequestJob, 1024), done: make(chan struct{})}
-	if _, err := slowStoredRecords(c.Directory); err != nil {
+	if err := visitSlowStoredRecords(c.Directory, nil); err != nil {
 		unlockState(dir)
 		dir.Close()
 		return nil, fmt.Errorf("slow_requests startup cleanup: %w", err)
@@ -336,56 +336,61 @@ func slowRemoveFiles(path string) error {
 }
 
 func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
-	if err := recoverStorageDeletes(directory); err != nil {
-		return nil, err
-	}
-	entries, err := boundedDiagnosticEntries(directory)
-	if err != nil {
-		return nil, err
-	}
 	var records []slowStoredRecord
-	for _, entry := range entries {
+	err := visitSlowStoredRecords(directory, func(record slowStoredRecord) {
+		records = append(records, record)
+	})
+	return records, err
+}
+
+func visitSlowStoredRecords(directory string, visit func(slowStoredRecord)) error {
+	if err := recoverStorageDeletes(directory); err != nil {
+		return err
+	}
+	return visitDiagnosticEntries(directory, func(entry os.DirEntry) error {
 		name := entry.Name()
 		pending := strings.HasPrefix(name, ".pending-")
 		if !pending && !strings.HasPrefix(name, "request-") {
-			continue
+			return nil
 		}
 		id := strings.TrimPrefix(name, "request-")
 		if pending {
 			id = strings.TrimPrefix(name, ".pending-")
 		}
 		if !entry.IsDir() || !slowRequestID(id) {
-			continue
+			return nil
 		}
 		path := filepath.Join(directory, name)
 		if _, err := os.Stat(filepath.Join(path, deleteMarker)); err == nil {
-			continue
+			return nil
 		}
 		files, size, err := slowRecordFiles(path)
 		if err != nil { // foreign content is protected, never recursively deleted
-			return nil, err
+			return err
 		}
 		if pending {
 			if err := slowRemoveFiles(path); err != nil {
-				return nil, err
+				return err
 			}
-			continue
+			return nil
 		}
 		if len(files) != 2 {
-			return nil, fmt.Errorf("incomplete slow request record: %s", name)
+			return fmt.Errorf("incomplete slow request record: %s", name)
 		}
 		info, err := os.Lstat(filepath.Join(path, "meta.json"))
 		if err != nil || info.Size() > 16<<10 {
-			return nil, fmt.Errorf("invalid slow request metadata: %s", name)
+			return fmt.Errorf("invalid slow request metadata: %s", name)
 		}
 		data, err := os.ReadFile(filepath.Join(path, "meta.json"))
 		var meta slowRequestMeta
 		if err != nil || decodeJSON(data, &meta) != nil || meta.Schema != slowRequestSchema || meta.RequestID != id || meta.EndedAt.IsZero() {
-			return nil, fmt.Errorf("invalid slow request metadata: %s", name)
+			return fmt.Errorf("invalid slow request metadata: %s", name)
 		}
-		records = append(records, slowStoredRecord{path, meta.EndedAt, size})
-	}
-	return records, nil
+		if visit != nil {
+			visit(slowStoredRecord{path, meta.EndedAt, size})
+		}
+		return nil
+	})
 }
 
 func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
@@ -415,7 +420,7 @@ func recoverSlowDirectories(root string, owned bool) error {
 				continue
 			}
 		}
-		_, err = slowStoredRecords(dir)
+		err = visitSlowStoredRecords(dir, nil)
 		if owner != nil {
 			unlockState(owner)
 			owner.Close()
