@@ -262,12 +262,13 @@ func readRecordingSegment(root, gateway, recording, name string) (replaySegmentS
 	if err != nil || json.Unmarshal(data, &out.recordingSegmentFile) != nil || out.Segment != name {
 		return out, fmt.Errorf("segment_invalid")
 	}
+	if _, err := os.Stat(filepath.Join(dir, deleteMarker)); err == nil {
+		out.State = "deleting"
+		return out, nil
+	}
 	_, pinErr := os.Stat(filepath.Join(dir, "pinned"))
 	out.Pinned = pinErr == nil
-	if m, e := readSegmentArchive(dir); e == nil {
-		out.Compressed = true
-		out.StoredBytes = m.Bytes
-	}
+
 	return out, nil
 }
 

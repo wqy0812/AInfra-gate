@@ -1,7 +1,6 @@
 package aigate
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,12 +19,7 @@ func (s *replayService) acquireSegment(path string) (*os.File, error) {
 		if err != nil || !s.taskInputs[filepath.ToSlash(relative)] {
 			return nil, fmt.Errorf("segment_not_saved")
 		}
-		// Only the task result directory is writable. The platform owns input retention.
-		lockRoot := filepath.Join(s.dataRoot, "input-locks")
-		if err := os.MkdirAll(lockRoot, 0700); err != nil {
-			return nil, err
-		}
-		path = filepath.Join(lockRoot, fmt.Sprintf("%x", sha256.Sum256([]byte(relative))))
+		return nil, nil // Immutable NAS inputs are protected by platform references.
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -35,11 +29,7 @@ func (s *replayService) acquireSegment(path string) (*os.File, error) {
 	}
 	var f *os.File
 	var err error
-	if s.taskMode {
-		f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	} else {
-		f, err = os.Open(path)
-	}
+	f, err = os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("segment_not_found")
 	}
@@ -52,6 +42,9 @@ func (s *replayService) acquireSegment(path string) (*os.File, error) {
 }
 
 func (s *replayService) releaseSegmentLocked(f *os.File) {
+	if f == nil {
+		return
+	}
 	lease := s.segments[f.Name()]
 	lease.refs--
 	if lease.refs == 0 {

@@ -524,7 +524,7 @@ func (s *streamCaptureStore) run() {
 	ticker := time.NewTicker(time.Second)
 	maintenanceStop := make(chan struct{})
 	maintenanceDone := dailyArchiveMaintenance(maintenanceStop, func(now time.Time) {
-		if err := maintainDiagnosticArchives(s.root, now, s.maxDisk, nil); err != nil {
+		if err := maintainDiagnosticStorage(s.root, now, s.maxDisk, nil); err != nil {
 			s.failures.Add(1)
 			s.audit.Printf("capture_archive_failed: %v", err)
 		}
@@ -1007,7 +1007,7 @@ func (s *streamCaptureStore) cleanup(now time.Time, additional int64) error {
 	if additional > 0 {
 		return nil
 	}
-	err := maintainDiagnosticArchives(s.root, now, s.maxDisk, func(path string) bool { v := s.stored[path]; return v != nil && v.active })
+	err := maintainDiagnosticStorage(s.root, now, s.maxDisk, func(path string) bool { v := s.stored[path]; return v != nil && v.active })
 	if err != nil {
 		return err
 	}
@@ -1027,7 +1027,7 @@ func captureRecordFiles(path string) ([]os.DirEntry, int64, error) {
 	var size int64
 	for _, entry := range entries {
 		switch entry.Name() {
-		case "request.json", "response.sse", "timeline.jsonl", "meta.json", "meta.json.tmp", diagnosticRefName:
+		case "request.json", "response.sse", "timeline.jsonl", "meta.json", "meta.json.tmp", deleteMarker:
 		default:
 			return nil, size, errors.New("unknown capture file")
 		}

@@ -353,8 +353,8 @@ func TestSlowRequestRetentionDiskLimitAndOwnership(t *testing.T) {
 		t.Fatal("stale temporary directory not removed")
 	}
 	for _, id := range []int{1, 3} {
-		if _, err := diagnosticReference(filepath.Join(c.Directory, fmt.Sprintf("request-%032x", id))); err != nil {
-			t.Fatal("old record not archived", err)
+		if _, err := os.Stat(filepath.Join(c.Directory, fmt.Sprintf("request-%032x", id), "request.json")); err != nil {
+			t.Fatal("old raw record not retained", err)
 		}
 	}
 	// Restart performs cleanup and reacquires the exclusive directory lock.

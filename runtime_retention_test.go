@@ -121,17 +121,17 @@ func TestSlowRetentionAfterProxyRestartWithCaptureDisabled(t *testing.T) {
 	}
 	p.Close()
 	inactive := retentionProxy(t, root, `{"slow_requests":{"enabled":false,"retention_hours":1}}`)
-	if _, err := diagnosticReference(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID, deleteMarker)); !os.IsNotExist(err) {
 		t.Fatal("startup performed maintenance")
 	}
 	inactive.maintainInactiveStorage(time.Now())
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if _, err := diagnosticReference(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); err == nil {
+		if _, err := os.Stat(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID, "request.json")); err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("disabled capture historical record not archived")
+			t.Fatal("disabled capture historical raw record missing")
 		}
 		time.Sleep(time.Millisecond)
 	}

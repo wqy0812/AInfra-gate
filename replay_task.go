@@ -1,56 +1,28 @@
 package aigate
 
-// One platform-owned task, with a filesystem command mailbox on shared NAS.
-// There is no listening socket or independently deployed replay daemon.
-// Production callers must use app.execution.replay_runtime, which verifies
-// expected content digests and every immutable NAS input before exec.
+// One immutable target task. The Python production entry verifies the complete
+// NAS manifest before calling this kernel. No command mailbox or HTTP handler.
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
 type replayTaskInput struct {
-	BootID  string            `json:"boot_id"`
-	Targets map[string]string `json:"targets"`
-	Digests map[string]string `json:"digests"`
-}
-type replayTaskCommand struct {
-	Method  string          `json:"method"`
-	Path    string          `json:"path"`
-	Payload json.RawMessage `json:"payload"`
-}
-type replayTaskResponse struct {
-	Status int             `json:"status"`
-	Body   json.RawMessage `json:"body"`
-}
-type taskHTTPWriter struct {
-	headers http.Header
-	code    int
-	body    bytes.Buffer
-}
-
-func (w *taskHTTPWriter) Header() http.Header  { return w.headers }
-func (w *taskHTTPWriter) WriteHeader(code int) { w.code = code }
-func (w *taskHTTPWriter) Write(b []byte) (int, error) {
-	if w.code == 0 {
-		w.code = 200
-	}
-	if w.body.Len()+len(b) > 64<<20 {
-		return 0, fmt.Errorf("task response too large")
-	}
-	return w.body.Write(b)
+	BootID    string            `json:"boot_id"`
+	Targets   map[string]string `json:"targets"`
+	Digests   map[string]string `json:"digests"`
+	Request   replayRequest     `json:"request"`
+	Execution map[string]any    `json:"execution"`
+	PlanID    string            `json:"plan_id"`
 }
 
 func RunReplayTask(args []string) error {
@@ -66,31 +38,36 @@ func RunReplayTask(args []string) error {
 	if e = json.Unmarshal(raw, &input); e != nil {
 		return e
 	}
-	if !validOperationID(input.BootID) {
-		return fmt.Errorf("invalid task boot identity")
+	if !validOperationID(input.BootID) || !validOperationID(input.PlanID) || len(input.Targets) != 1 || len(input.Digests) == 0 {
+		return fmt.Errorf("invalid task identity")
 	}
-	normalized := map[string]string{}
-	for name, raw := range input.Targets {
-		base, err := controlBase(raw)
-		if !validOperationID(name) || err != nil {
-			return fmt.Errorf("invalid replay target %q", name)
-		}
-		normalized[name] = base
+	if input.Request.PrepareOnly || input.Request.BatchID != "" || input.Request.CoordinatedTruncation {
+		return fmt.Errorf("task cannot use service coordination")
 	}
-	input.Targets = normalized
-	if len(input.Digests) == 0 {
-		return fmt.Errorf("saved task inputs missing")
+	if e = input.Request.normalize(); e != nil {
+		return e
 	}
+	rawTarget, ok := input.Targets[input.Request.Target]
+	if !ok {
+		return fmt.Errorf("task target missing")
+	}
+	base, e := controlBase(rawTarget)
+	if e != nil {
+		return e
+	}
+	input.Targets[input.Request.Target] = base
 	saved := map[string]bool{}
-	for identity, digest := range input.Digests {
-		parts := strings.Split(identity, "/")
-		if len(parts) != 3 || !validOperationID(parts[0]) || !validOperationID(parts[1]) || !validDigest(digest) {
-			return fmt.Errorf("invalid saved task input")
+	for _, ref := range input.Request.sources() {
+		for _, segment := range ref.Segments {
+			identity := ref.GatewayID + "/" + ref.RecordingID + "/" + segment
+			if !validDigest(input.Digests[identity]) {
+				return fmt.Errorf("saved task input missing")
+			}
+			saved[identity] = true
 		}
-		if _, ok := parseRecordingSegment(parts[2]); !ok {
-			return fmt.Errorf("invalid saved task segment")
-		}
-		saved[identity] = true
+	}
+	if len(saved) != len(input.Digests) {
+		return fmt.Errorf("unexpected saved task input")
 	}
 	key := os.Getenv("AIGATE_REPLAY_MARK_KEY")
 	if len(key) < replayMarkMinBytes {
@@ -100,6 +77,19 @@ func RunReplayTask(args []string) error {
 	if inputRoot == "" {
 		inputRoot = filepath.Join(root, "input")
 	}
+	// The marker survives crashes. An executor never sends a task a second time.
+	started, e := os.OpenFile(filepath.Join(root, "execution.started"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return fmt.Errorf("task already attempted: %w", e)
+	}
+	e = started.Sync()
+	started.Close()
+	if e != nil {
+		return e
+	}
+	if e = syncDirectory(root); e != nil {
+		return e
+	}
 	service, e := newReplayService(strings.Repeat("t", 32), []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, inputRoot, filepath.Join(root, "results"), input.Targets, []byte(key), os.Stderr, true)
 	if e != nil {
 		return e
@@ -107,130 +97,80 @@ func RunReplayTask(args []string) error {
 	defer service.Close()
 	service.taskInputs = saved
 	service.boot = input.BootID
-	for _, dir := range []string{"commands", "responses"} {
-		if e = os.MkdirAll(filepath.Join(root, dir), 0700); e != nil {
-			return e
-		}
-	}
-	if _, e = recordingAtomicJSON(root, "ready.json", map[string]any{"boot_id": input.BootID, "ready_at": time.Now().UTC()}); e != nil {
+	if _, e = os.Stat(filepath.Join(root, "stop.json")); e == nil {
+		view, _, _ := service.stop(input.Request.RunID)
+		view.Request = &input.Request
+		service.writeJSON(service.runDir(input.Request.RunID), "state.json", view)
+		service.saveReport(view)
+		return publishTaskReport(root, service.runDir(input.Request.RunID), input)
+	} else if !os.IsNotExist(e) {
 		return e
+	}
+	if _, status, reason := service.start(input.Request); status != 200 {
+		return fmt.Errorf("task start: %s", reason)
+	}
+	service.mu.Lock()
+	run := service.runs[input.Request.RunID]
+	service.mu.Unlock()
+	if run == nil {
+		return fmt.Errorf("task was not created")
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-
-	type completedCommand struct {
-		name   string
-		report bool
-		err    error
-	}
-	completed := make(chan completedCommand, 8)
-	inflight := map[string]bool{}
-	var workers sync.WaitGroup
-	defer workers.Wait()
-	reportBusy := false
-	lastCommand := time.Now()
-	finish := false
 	for {
 		select {
+		case <-run.done:
+			return publishTaskReport(root, run.dir, input)
 		case <-ctx.Done():
-			return nil
+			service.stop(input.Request.RunID)
+			<-run.done
+			return publishTaskReport(root, run.dir, input)
 		case <-ticker.C:
-		}
-	drain:
-		for {
-			select {
-			case result := <-completed:
-				delete(inflight, result.name)
-				if result.report {
-					reportBusy = false
-				}
-				if result.err != nil {
-					return result.err
-				}
-			default:
-				break drain
+			if _, e = os.Stat(filepath.Join(root, "stop.json")); e == nil {
+				service.stop(input.Request.RunID)
+			} else if !os.IsNotExist(e) {
+				service.stop(input.Request.RunID)
 			}
-		}
-		entries, e := os.ReadDir(filepath.Join(root, "commands"))
-		if e != nil {
-			return e
-		}
-		for _, entry := range entries {
-			name := entry.Name()
-			if entry.IsDir() || !strings.HasSuffix(name, ".json") || !validOperationID(strings.TrimSuffix(name, ".json")) || inflight[name] {
-				continue
-			}
-			responsePath := filepath.Join(root, "responses", name)
-			if _, e = os.Stat(responsePath); e == nil {
-				continue
-			}
-			raw, e := recordingReadSmall(filepath.Join(root, "commands", name))
-			if os.IsNotExist(e) {
-				continue
-			}
-			if e != nil {
-				return e
-			}
-			var command replayTaskCommand
-			if e = json.Unmarshal(raw, &command); e != nil {
-				return e
-			}
-			if command.Path == "finish" {
-				finish = true
-				continue
-			}
-			report := strings.HasSuffix(command.Path, "/report")
-			if len(inflight) >= 8 || (report && reportBusy) {
-				continue
-			}
-			lastCommand = time.Now()
-			inflight[name] = true
-			if report {
-				reportBusy = true
-			}
-			workers.Add(1)
-			go func() {
-				defer workers.Done()
-				err := service.executeTaskCommand(ctx, root, name, command)
-				completed <- completedCommand{name, report, err}
-			}()
-		}
-		service.mu.Lock()
-		idle := len(service.active) == 0
-		ids := make([]string, 0, len(service.runs))
-		for id := range service.runs {
-			ids = append(ids, id)
-		}
-		service.mu.Unlock()
-		if idle && len(inflight) == 0 && (finish || (len(ids) > 0 && time.Since(lastCommand) > time.Minute) || time.Since(lastCommand) > 15*time.Minute) {
-			for _, id := range ids {
-				service.loadReport(id)
-			}
-			return nil
 		}
 	}
-
 }
 
-var _ io.Writer = (*taskHTTPWriter)(nil)
-
-func (s *replayService) executeTaskCommand(ctx context.Context, root, name string, command replayTaskCommand) error {
-	req, e := http.NewRequestWithContext(ctx, command.Method, "http://localhost/control/replay/v1/"+command.Path, bytes.NewReader(command.Payload))
+func publishTaskReport(root, dir string, input replayTaskInput) error {
+	f, e := os.Open(filepath.Join(dir, "report.json"))
 	if e != nil {
 		return e
 	}
-	req.RemoteAddr = "127.0.0.1:1"
-	req.Header.Set("Authorization", "Bearer "+strings.Repeat("t", 32))
-	out := &taskHTTPWriter{headers: http.Header{}}
-	s.Handler().ServeHTTP(out, req)
-	if out.code == 0 {
-		out.code = 200
+	raw, e := io.ReadAll(io.LimitReader(f, 64<<20+1))
+	f.Close()
+	if e != nil {
+		return e
 	}
-	if !json.Valid(out.body.Bytes()) {
-		return fmt.Errorf("invalid task response")
+	if len(raw) > 64<<20 {
+		return fmt.Errorf("report_too_large")
 	}
-	_, e = recordingAtomicJSON(filepath.Join(root, "responses"), name, replayTaskResponse{out.code, out.body.Bytes()})
+	var value map[string]any
+	if e = json.Unmarshal(raw, &value); e != nil {
+		return e
+	}
+	execution := input.Execution
+	if execution == nil {
+		execution = map[string]any{}
+	}
+	if b, e := recordingReadSmall(filepath.Join(root, "environment.json")); e == nil {
+		var environment map[string]any
+		if json.Unmarshal(b, &environment) == nil {
+			execution["worker_observation"] = environment
+		} else {
+			execution["worker_observation_unknown"] = true
+		}
+	} else {
+		execution["worker_observation_unknown"] = true
+	}
+	value["execution"] = execution
+	value["plan_id"] = input.PlanID
+	value["input_digests"] = input.Digests
+	_, e = recordingAtomicJSON(dir, "report.json", value)
 	return e
 }

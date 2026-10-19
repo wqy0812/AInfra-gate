@@ -346,14 +346,14 @@ func TestStreamCaptureWaitsForScheduledMaintenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.close()
-	if _, err := diagnosticReference(oldPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(oldPath, deleteMarker)); !os.IsNotExist(err) {
 		t.Fatal("startup compressed before scheduled maintenance")
 	}
 	if err := s.cleanup(time.Now(), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := diagnosticReference(oldPath); err != nil {
-		t.Fatalf("old record not archived: %v", err)
+	if _, err := os.Stat(filepath.Join(oldPath, "response.sse")); err != nil {
+		t.Fatalf("old raw record not retained: %v", err)
 	}
 	if data, err := os.ReadFile(filepath.Join(recentPath, "response.sse")); err != nil || string(data) != "recent" {
 		t.Fatalf("recent record removed: %q %v", data, err)

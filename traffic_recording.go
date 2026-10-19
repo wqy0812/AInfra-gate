@@ -761,12 +761,11 @@ type trafficRecorder struct {
 	stopOnce sync.Once
 
 	// Stored accounting is protected by mu; session metadata belongs to the writer.
-	stored         map[string]*recordingStoredSegment
-	sessionBytes   map[string]int64
-	writeJSON      func(string, string, any) (int64, error)
-	acks           []chan struct{}
-	writeFile      func(path string, data []byte) error
-	archiveSegment func(string, map[string]bool) error
+	stored       map[string]*recordingStoredSegment
+	sessionBytes map[string]int64
+	writeJSON    func(string, string, any) (int64, error)
+	acks         []chan struct{}
+	writeFile    func(path string, data []byte) error
 }
 
 func newTrafficRecorder(recordRoot, gatewayID, boot string, maxBytes int64, markKeys [][]byte, audit io.Writer) (*trafficRecorder, error) {
@@ -898,6 +897,9 @@ func (r *trafficRecorder) recover() error {
 		if data, err := recordingReadSmall(filepath.Join(dir, "session.json")); err != nil || json.Unmarshal(data, &session) != nil || session.RecordingID != entry.Name() {
 			r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_recover_skipped", "recording_id": entry.Name()})))
 			continue
+		}
+		if err := recoverStorageDeletes(dir); err != nil {
+			return err
 		}
 		segments, err := os.ReadDir(dir)
 		if err != nil {
@@ -1336,6 +1338,11 @@ func (r *trafficRecorder) removeSessionLocked(s *recordingSession) {
 }
 
 func (r *trafficRecorder) pin(id, name string, pin bool) error {
+	storageLeaseMu.Lock()
+	defer storageLeaseMu.Unlock()
+	if _, e := os.Stat(filepath.Join(r.sessionDir(id), name, deleteMarker)); e == nil {
+		return errStorageDeleting
+	}
 	key := id + "/" + name
 	directory, err := os.Open(filepath.Join(r.sessionDir(id), name))
 	if err != nil {
@@ -1519,8 +1526,7 @@ func (r *trafficRecorder) write(snapshot *recordingSnapshot) {
 }
 
 // evict removes whole sealed, unpinned segments, oldest first. The open
-// segments of a live session are never removed; if they alone exceed the
-// capacity, sampling stops.
+// segments of a live session are never removed; the quota can remain exceeded.
 func (r *trafficRecorder) evict() {
 	defer r.removeEmptySessions()
 	r.mu.Lock()
@@ -1531,8 +1537,13 @@ func (r *trafficRecorder) evict() {
 	}
 	candidates := []*recordingStoredSegment{}
 	r.mu.Lock()
+	projected := r.diskBytes
 	for _, v := range r.stored {
 		if v.sealed && !v.pinned {
+			if _, err := os.Stat(filepath.Join(r.sessionDir(v.recording), v.name, deleteMarker)); err == nil {
+				projected -= v.bytes
+				continue
+			}
 			copy := *v
 			candidates = append(candidates, &copy)
 		}
@@ -1546,33 +1557,24 @@ func (r *trafficRecorder) evict() {
 	})
 	for _, v := range candidates {
 		r.mu.Lock()
-		over = r.diskBytes > r.maxBytes
+		over = projected > r.maxBytes
 		r.mu.Unlock()
 		if !over {
 			return
 		}
 		path := filepath.Join(r.sessionDir(v.recording), v.name)
-		directory, err := os.Open(path)
-		if err != nil {
+		if err := markStorageDelete(path); err != nil {
 			continue
 		}
-		if err := lockState(directory); err != nil {
-			directory.Close()
+		projected -= v.bytes
+		if err := finishStorageDelete(path); err != nil {
+			r.audit.Printf("recording_delete_failed: %v", err)
 			continue
 		}
-		// Recheck the persistent protection after acquiring the segment lock.
-		if _, err := os.Stat(filepath.Join(path, "pinned")); !os.IsNotExist(err) {
-			unlockState(directory)
-			directory.Close()
+		if _, err := os.Stat(path); err == nil {
 			continue
 		}
-		err = os.RemoveAll(path)
-		unlockState(directory)
-		directory.Close()
-		if err != nil {
-			r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_evict_failed", "segment": v.key, "error": err.Error()})))
-			continue
-		}
+
 		r.mu.Lock()
 		r.diskBytes -= v.bytes
 		delete(r.stored, v.key)

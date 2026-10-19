@@ -13,7 +13,6 @@ import (
 func (r *trafficRecorder) maintainStorage() {
 	r.maintenanceMu.Lock()
 	defer r.maintenanceMu.Unlock()
-	now := time.Now()
 	r.mu.Lock()
 	segments := make([]recordingStoredSegment, 0, len(r.stored))
 	for _, seg := range r.stored {
@@ -22,34 +21,16 @@ func (r *trafficRecorder) maintainStorage() {
 		}
 	}
 	r.mu.Unlock()
-	for _, seg := range segments {
-		if !seg.sealed || !now.After(seg.start.Add(recordingSegment+archiveAfter)) {
-			continue
-		}
-		dir := filepath.Join(r.sessionDir(seg.recording), seg.name)
-		f, e := os.Open(dir)
-		if e != nil {
-			continue
-		}
-		if e = lockState(f); e != nil {
-			f.Close()
-			continue
-		}
-		compact := r.archiveSegment
-		if compact == nil {
-			compact = compactSegmentArchive
-		}
-		e = compact(dir, map[string]bool{"segment.json": true})
-		unlockState(f)
-		f.Close()
-		if e != nil {
-			r.audit.Printf("recording_archive_failed segment=%s error=%v", seg.key, e)
-		}
-	}
 	// Include archives, manifests and temporary files, not logical body lengths.
 	for _, snapshot := range segments {
 		seg := &snapshot
 		n, e := recordingTreeBytes(filepath.Join(r.sessionDir(seg.recording), seg.name))
+		if os.IsNotExist(e) {
+			r.mu.Lock()
+			delete(r.stored, seg.key)
+			r.mu.Unlock()
+			continue
+		}
 		if e != nil {
 			continue
 		}
@@ -66,6 +47,14 @@ func (r *trafficRecorder) maintainStorage() {
 		seg.bytes = n
 		r.mu.Unlock()
 	}
+	total, e := recordingTreeBytes(r.root)
+	if e != nil {
+		r.audit.Printf("recording_account_failed: %v", e)
+		return
+	}
+	r.mu.Lock()
+	r.diskBytes = total
+	r.mu.Unlock()
 	r.evict()
 }
 
@@ -106,22 +95,12 @@ func (r *trafficRecorder) archiveHTTP(w http.ResponseWriter, req *http.Request) 
 		runtimeError(w, 404, "segment_not_found")
 		return
 	}
-	f, e := os.Open(dir)
+	lease, e := acquireStorageRead(dir)
 	if e != nil {
-		runtimeError(w, 404, "segment_not_found")
+		runtimeError(w, 410, "segment_deleting_or_unavailable")
 		return
 	}
-	defer f.Close()
-	if e = lockState(f); e != nil {
-		runtimeError(w, 409, "segment_busy")
-		return
-	}
-	defer unlockState(f)
-	// Revalidate after locking: eviction may have acquired the inode first.
-	if _, e = os.Stat(dir); e != nil {
-		runtimeError(w, 404, "segment_not_found")
-		return
-	}
+	defer lease.Close()
 	var seg recordingSegmentFile
 	data, e := recordingReadSmall(filepath.Join(dir, "segment.json"))
 	if e != nil || json.Unmarshal(data, &seg) != nil || seg.State != "sealed" {
@@ -140,14 +119,9 @@ func (r *trafficRecorder) archiveHTTP(w http.ResponseWriter, req *http.Request) 
 		replayJSON(w, 200, map[string]any{"gateway_id": r.gatewayID, "recording_id": parts[0], "segment": parts[2], "archive": m, "metadata": seg})
 		return
 	}
-	payload, e := os.Open(filepath.Join(dir, archivePayload))
-	if e != nil {
-		runtimeError(w, 500, "archive_missing")
-		return
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", parts[2]+".tar"))
+	if e = writeSegmentTar(w, dir, m); e != nil {
+		r.audit.Printf("recording_export_failed: %v", e)
 	}
-	defer payload.Close()
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("X-Archive-SHA256", m.SHA256)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", parts[2]+".tar.gz"))
-	http.ServeContent(w, req, archivePayload, time.Time{}, payload)
 }

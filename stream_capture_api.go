@@ -22,7 +22,6 @@ type captureFileSnapshot struct {
 	Bytes     int64  `json:"bytes"`
 	Inode     uint64 `json:"inode"`
 	Available bool   `json:"available"`
-	Archive   string `json:"archive,omitempty"`
 }
 type captureSnapshot struct {
 	RequestID string              `json:"request_id"`
@@ -91,23 +90,6 @@ func evidenceResponseBoundary(meta streamCaptureMeta) int64 {
 
 func (s *streamCaptureStore) fileSnapshot(id, name string, boundary int64) (captureFileSnapshot, error) {
 	var v captureFileSnapshot
-	if ref, err := diagnosticReference(filepath.Join(s.root, "request-"+id)); err == nil {
-		m, err := readSegmentArchive(filepath.Join(s.root, ref.Archive))
-		if err != nil {
-			return v, err
-		}
-		for _, entry := range m.Files {
-			if entry.Name == "request-"+id+"/"+name {
-				if boundary < 0 || boundary > entry.Bytes {
-					return v, errors.New("capture boundary unavailable")
-				}
-				return captureFileSnapshot{Bytes: boundary, Available: true, Archive: m.SHA256}, nil
-			}
-		}
-		return v, nil
-	} else if !os.IsNotExist(err) {
-		return v, err
-	}
 	f, err := s.openEvidence(id, name)
 	if os.IsNotExist(err) {
 		return v, nil
@@ -129,8 +111,6 @@ func (s *streamCaptureStore) fileSnapshot(id, name string, boundary int64) (capt
 	return v, nil
 }
 func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Request) {
-	diagnosticArchiveMu.RLock()
-	defer diagnosticArchiveMu.RUnlock()
 	w.Header().Set("Cache-Control", "no-store")
 	fail := func(status int, code string) { runtimeError(w, status, code) }
 	if r.Method != http.MethodGet {
@@ -143,6 +123,18 @@ func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Reques
 		fail(400, "invalid_capture_query")
 		return
 	}
+	lease, leaseErr := acquireStorageRead(filepath.Join(s.root, "request-"+id))
+	if leaseErr != nil {
+		if errors.Is(leaseErr, errStorageDeleting) {
+			fail(410, "capture_deleting")
+		} else if os.IsNotExist(leaseErr) {
+			fail(404, "capture_not_retained")
+		} else {
+			fail(503, "capture_unavailable")
+		}
+		return
+	}
+	defer lease.Close()
 	q := r.URL.Query()
 	part := q.Get("part")
 	if len(q.Get("snapshot")) > 4096 || (part != "" && part != "request" && part != "response") {
@@ -201,27 +193,6 @@ func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Reques
 	}
 	if target.Bytes < 0 || target.Bytes > current || offset > target.Bytes {
 		fail(400, "invalid_capture_query")
-		return
-	}
-	if target.Archive != "" {
-		stream, entry, digest, e := archivedDiagnosticRange(ctx, filepath.Join(s.root, "request-"+id), name, offset)
-		if e != nil {
-			fail(503, "capture_unavailable")
-			return
-		}
-		defer stream.Close()
-		if digest != target.Archive || entry.Bytes < target.Bytes {
-			fail(409, "capture_snapshot_changed")
-			return
-		}
-		size := min(int64(limit), target.Bytes-offset)
-		data := make([]byte, size)
-		_, e = io.ReadFull(stream, data)
-		if e != nil || ctx.Err() != nil {
-			fail(503, "capture_unavailable")
-			return
-		}
-		runtimeResponse(w, 200, map[string]any{"request_id": id, "part": part, "offset": offset, "next_offset": offset + size, "total_bytes": target.Bytes, "data": base64.StdEncoding.EncodeToString(data)})
 		return
 	}
 	f, err := s.openEvidence(id, name)

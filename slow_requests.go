@@ -307,7 +307,7 @@ func slowRecordFiles(path string) ([]os.DirEntry, int64, error) {
 	}
 	var size int64
 	for _, entry := range entries {
-		if entry.Name() != "meta.json" && entry.Name() != "request.json" && entry.Name() != diagnosticRefName {
+		if entry.Name() != "meta.json" && entry.Name() != "request.json" && entry.Name() != deleteMarker {
 			return nil, 0, fmt.Errorf("unexpected file in slow request directory")
 		}
 		info, err := entry.Info()
@@ -336,6 +336,9 @@ func slowRemoveFiles(path string) error {
 }
 
 func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
+	if err := recoverStorageDeletes(directory); err != nil {
+		return nil, err
+	}
 	entries, err := boundedDiagnosticEntries(directory)
 	if err != nil {
 		return nil, err
@@ -355,6 +358,9 @@ func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
 			continue
 		}
 		path := filepath.Join(directory, name)
+		if _, err := os.Stat(filepath.Join(path, deleteMarker)); err == nil {
+			continue
+		}
 		files, size, err := slowRecordFiles(path)
 		if err != nil { // foreign content is protected, never recursively deleted
 			return nil, err
@@ -387,7 +393,7 @@ func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
 	if observationPolicyDir(filepath.Base(root)) {
 		root = filepath.Dir(root)
 	}
-	return maintainSlowArchives(root, now, s.c.MaxDiskBytes)
+	return maintainSlowStorage(root, now, s.c.MaxDiskBytes)
 }
 
 // Recovery may delete incomplete staging data, so only run it while owning
@@ -421,9 +427,9 @@ func recoverSlowDirectories(root string, owned bool) error {
 	return nil
 }
 
-func maintainSlowArchives(root string, now time.Time, budget int64) error {
+func maintainSlowStorage(root string, now time.Time, budget int64) error {
 	if err := recoverSlowDirectories(root, false); err != nil {
 		return err
 	}
-	return maintainDiagnosticArchives(root, now, budget, nil)
+	return maintainDiagnosticStorage(root, now, budget, nil)
 }
