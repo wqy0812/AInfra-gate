@@ -51,3 +51,7 @@ systemd 会去掉值外层的单引号；其他容器环境注入方式应传入
 检查只解析配置并输出脱敏结果，不启动监听器、不连接 Router、不创建数据目录；结果的 `boot_id` 为空、`admission=false`。模板的 `--shutdown-timeout 62m` 为业务优雅收尾上限，systemd `TimeoutStopSec=63min` 为外层上限；超时后保持平台维护并处理当前版本，不恢复旧版本。切流的 `--forward-timeout 62m` 包含上传、上游等待和向连接对端写出，修改业务最长时限时一并核对。
 
 维护窗口和迁移顺序见 [MANAGEMENT.md](../MANAGEMENT.md)。部署操作必须报告新建服务器目录；现有历史观测目录保留原归属，不能把入口历史直接改标为某个 Router 的新数据。
+
+## 平台回放执行器
+
+标准 `scripts/build.sh [output-directory]` 产出 `aigate-replay-task`，由 code-eval 的 `deploy/docker/Dockerfile.replay-task` 复制到固定任务镜像的 `/usr/local/bin/aigate-replay-task`。该程序由平台准备入口校验 NAS 后启动，不安装为网关常驻服务；旧 `aigate-replay` 的退役依赖单窗口迁移验收。

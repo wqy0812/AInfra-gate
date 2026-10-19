@@ -367,7 +367,9 @@ func (p *ProxyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (p *ProxyGateway) maintainInactiveStorage(now time.Time) {
 	if p.g.slow == nil {
-		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "slow-requests"), now, p.settings.SlowRequests.MaxDiskBytes); err != nil {
+		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "slow-requests"), now, p.settings.SlowRequests.MaxDiskBytes, func() error {
+			return recoverSlowDirectories(filepath.Join(p.dataRoot, "slow-requests"), true)
+		}); err != nil {
 			p.g.audit.Printf("slow_archive_failed: %v", err)
 		}
 	}

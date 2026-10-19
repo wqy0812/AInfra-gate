@@ -1,8 +1,11 @@
 package aigate
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -44,7 +47,7 @@ func diagnosticReference(dir string) (diagnosticRef, error) {
 }
 func diagnosticFolders(root string) ([]string, error) {
 	dirs := []string{root}
-	entries, e := os.ReadDir(root)
+	entries, e := boundedDiagnosticEntries(root)
 	if os.IsNotExist(e) {
 		return nil, nil
 	}
@@ -65,7 +68,7 @@ func diagnosticScan(root string, active func(string) bool) ([]diagnosticItem, er
 	}
 	var items []diagnosticItem
 	for _, dir := range dirs {
-		entries, e := os.ReadDir(dir)
+		entries, e := boundedDiagnosticEntries(dir)
 		if e != nil {
 			return nil, e
 		}
@@ -92,6 +95,9 @@ func diagnosticScan(root string, active func(string) bool) ([]diagnosticItem, er
 				n, e := recordingTreeBytes(path)
 				if e != nil {
 					return nil, e
+				}
+				if len(items) >= archiveManifestMaxFiles {
+					return nil, fmt.Errorf("archive_metadata_limit")
 				}
 				items = append(items, diagnosticItem{path, at.Add(recordingSegment), n, true})
 				continue
@@ -128,6 +134,9 @@ func diagnosticScan(root string, active func(string) bool) ([]diagnosticItem, er
 			n, e := recordingTreeBytes(path)
 			if e != nil {
 				return nil, e
+			}
+			if len(items) >= archiveManifestMaxFiles {
+				return nil, fmt.Errorf("archive_metadata_limit")
 			}
 			items = append(items, diagnosticItem{path, *m.EndedAt, n, false})
 		}
@@ -182,18 +191,18 @@ func finalizeDiagnosticArchive(dest string) error {
 	if digest != m.SHA256 || n != m.Bytes {
 		return fmt.Errorf("diagnostic archive checksum mismatch")
 	}
-	records := map[string]bool{}
+	records := map[string][]archiveEntry{}
 	for _, f := range m.Files {
 		parts := strings.Split(f.Name, "/")
 		if len(parts) != 2 || !slowRequestID(strings.TrimPrefix(parts[0], "request-")) || parts[0] != "request-"+strings.TrimPrefix(parts[0], "request-") {
 			return fmt.Errorf("invalid diagnostic member")
 		}
-		records[parts[0]] = true
+		records[parts[0]] = append(records[parts[0]], f)
 	}
 	if e = func() error {
 		diagnosticArchiveMu.Lock()
 		defer diagnosticArchiveMu.Unlock()
-		for name := range records {
+		for name, files := range records {
 			path := filepath.Join(filepath.Dir(dest), name)
 			if _, e = os.Stat(path); os.IsNotExist(e) {
 				continue
@@ -206,7 +215,7 @@ func finalizeDiagnosticArchive(dest string) error {
 			if _, e = recordingAtomicJSON(path, diagnosticRefName, diagnosticRef{filepath.Base(dest)}); e != nil {
 				return e
 			}
-			for _, f := range m.Files {
+			for _, f := range files {
 				if !strings.HasPrefix(f.Name, name+"/") || filepath.Base(f.Name) == "meta.json" {
 					continue
 				}
@@ -293,7 +302,7 @@ func maintainDiagnosticArchives(root string, now time.Time, budget int64, active
 		return e
 	}
 	for _, dir := range dirs {
-		entries, e := os.ReadDir(dir)
+		entries, e := boundedDiagnosticEntries(dir)
 		if e != nil {
 			return e
 		}
@@ -389,30 +398,15 @@ func archivedDiagnosticRange(ctx context.Context, dir, name string, offset int64
 		f.Close()
 		return nil, entry, "", fmt.Errorf("invalid archive range index")
 	}
-	target := entry.Offset + offset
-	block := m.Blocks[0]
-	for _, candidate := range m.Blocks {
-		if candidate.Offset > target {
-			break
+	reader := &verifiedArchiveReader{ctx: ctx, file: f, blocks: m.Blocks, position: entry.Offset + offset, end: entry.Offset + entry.Bytes}
+	// Validate the first complete block before exposing any requested bytes.
+	if reader.position < reader.end {
+		if e = reader.load(); e != nil {
+			f.Close()
+			return nil, entry, "", e
 		}
-		block = candidate
 	}
-	if target < block.Offset || target-block.Offset > archiveBlockBytes || block.Compressed < 0 || block.Compressed >= m.Bytes {
-		f.Close()
-		return nil, entry, "", fmt.Errorf("invalid archive range index")
-	}
-	gz, e := gzip.NewReader(&archiveContextReader{ctx, io.NewSectionReader(f, block.Compressed, m.Bytes-block.Compressed)})
-	if e != nil {
-		f.Close()
-		return nil, entry, "", e
-	}
-	reader := &archiveContextReader{ctx, gz}
-	if _, e = io.CopyN(io.Discard, reader, target-block.Offset); e != nil {
-		gz.Close()
-		f.Close()
-		return nil, entry, "", e
-	}
-	return &diagnosticArchiveReader{Reader: io.LimitReader(reader, entry.Bytes-offset), gz: gz, file: f}, entry, m.SHA256, nil
+	return reader, entry, m.SHA256, nil
 }
 
 type archiveContextReader struct {
@@ -427,13 +421,76 @@ func (r *archiveContextReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-type diagnosticArchiveReader struct {
-	io.Reader
-	gz   *gzip.Reader
-	file *os.File
+// Each compressed member is bounded, SHA-256 verified and fully decompressed
+// (including gzip CRC/trailer) before its bytes are made available to callers.
+// At most one decompressed block is retained across Read calls.
+type verifiedArchiveReader struct {
+	ctx           context.Context
+	file          *os.File
+	blocks        []archiveBlock
+	position, end int64
+	buffer        []byte
+	bufferOffset  int64
 }
 
-func (r *diagnosticArchiveReader) Close() error { r.gz.Close(); return r.file.Close() }
+func (r *verifiedArchiveReader) load() error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	index := sort.Search(len(r.blocks), func(i int) bool { return r.blocks[i].Offset > r.position }) - 1
+	if index < 0 {
+		return fmt.Errorf("invalid archive range index")
+	}
+	block := r.blocks[index]
+	if r.position >= block.Offset+block.RawBytes {
+		return fmt.Errorf("invalid archive range index")
+	}
+	data := make([]byte, block.Bytes)
+	if _, err := io.ReadFull(&archiveContextReader{r.ctx, io.NewSectionReader(r.file, block.Compressed, block.Bytes)}, data); err != nil {
+		return err
+	}
+	digest := sha256.Sum256(data)
+	if hex.EncodeToString(digest[:]) != block.SHA256 {
+		return fmt.Errorf("archive block checksum mismatch")
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	gz.Multistream(false)
+	plain, err := io.ReadAll(io.LimitReader(&archiveContextReader{r.ctx, gz}, archiveBlockBytes+1))
+	gz.Close()
+	if err != nil {
+		return err
+	}
+	if int64(len(plain)) != block.RawBytes {
+		return fmt.Errorf("archive block size mismatch")
+	}
+	r.buffer, r.bufferOffset = plain, block.Offset
+	return nil
+}
+func (r *verifiedArchiveReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.position >= r.end {
+		return 0, io.EOF
+	}
+	if r.buffer == nil || r.position >= r.bufferOffset+int64(len(r.buffer)) {
+		r.buffer = nil
+		if err := r.load(); err != nil {
+			return 0, err
+		}
+	}
+	start := r.position - r.bufferOffset
+	n := copy(p, r.buffer[start:min(int64(len(r.buffer)), start+r.end-r.position)])
+	r.position += int64(n)
+	return n, nil
+}
+func (r *verifiedArchiveReader) Close() error { r.buffer = nil; return r.file.Close() }
 
 // Before manifest publication, original records are untouched. Discard a
 // partial hard-link staging tree only when every source inode is still present.
@@ -441,7 +498,7 @@ func discardUncommittedDiagnostic(dest string) error {
 	if _, e := os.Lstat(filepath.Join(dest, archiveManifestName)); !os.IsNotExist(e) {
 		return e
 	}
-	e := filepath.WalkDir(dest, func(path string, d os.DirEntry, e error) error {
+	e := walkArchiveFiles(dest, func(path string, d os.DirEntry, e error) error {
 		if e != nil {
 			return e
 		}
@@ -523,4 +580,28 @@ func maintainInactiveDiagnostics(root string, now time.Time, budget int64, recov
 		}
 	}
 	return maintainDiagnosticArchives(root, now, budget, nil)
+}
+
+// Explicit candidate budget protects maintenance before it builds a manifest.
+// No original data is modified when a directory exceeds this safety budget.
+func boundedDiagnosticEntries(path string) ([]os.DirEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries := []os.DirEntry{}
+	for {
+		batch, err := f.ReadDir(128)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if len(entries)+len(batch) > archiveManifestMaxFiles {
+			return nil, fmt.Errorf("archive_metadata_limit")
+		}
+		entries = append(entries, batch...)
+		if err == io.EOF {
+			return entries, nil
+		}
+	}
 }

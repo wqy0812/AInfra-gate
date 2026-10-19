@@ -2,6 +2,8 @@ package aigate
 
 // One platform-owned task, with a filesystem command mailbox on shared NAS.
 // There is no listening socket or independently deployed replay daemon.
+// Production callers must use app.execution.replay_runtime, which verifies
+// expected content digests and every immutable NAS input before exec.
 import (
 	"bytes"
 	"context"

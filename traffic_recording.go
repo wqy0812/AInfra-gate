@@ -866,7 +866,7 @@ func recordingReadSmall(path string) ([]byte, error) {
 
 func recordingTreeBytes(path string) (int64, error) {
 	var total int64
-	err := filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+	err := walkArchiveFiles(path, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

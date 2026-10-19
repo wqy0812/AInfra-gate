@@ -336,7 +336,7 @@ func slowRemoveFiles(path string) error {
 }
 
 func slowStoredRecords(directory string) ([]slowStoredRecord, error) {
-	entries, err := os.ReadDir(directory)
+	entries, err := boundedDiagnosticEntries(directory)
 	if err != nil {
 		return nil, err
 	}
@@ -390,19 +390,39 @@ func (s *slowRequestStore) cleanup(now time.Time, incoming int64) error {
 	return maintainSlowArchives(root, now, s.c.MaxDiskBytes)
 }
 
-func maintainSlowArchives(root string, now time.Time, budget int64) error {
-	diagnosticArchiveMu.Lock()
+// Recovery may delete incomplete staging data, so only run it while owning
+// that directory. The current active writer already recovered at startup.
+func recoverSlowDirectories(root string, owned bool) error {
 	dirs, err := diagnosticFolders(root)
-	if err == nil {
-		for _, dir := range dirs {
-			_, err = slowStoredRecords(dir)
+	if err != nil {
+		return err
+	}
+	for _, dir := range dirs {
+		var owner *os.File
+		if !owned {
+			owner, err = os.Open(dir)
 			if err != nil {
-				break
+				return err
+			}
+			if err = lockState(owner); err != nil {
+				owner.Close()
+				continue
 			}
 		}
+		_, err = slowStoredRecords(dir)
+		if owner != nil {
+			unlockState(owner)
+			owner.Close()
+		}
+		if err != nil {
+			return err
+		}
 	}
-	diagnosticArchiveMu.Unlock()
-	if err != nil {
+	return nil
+}
+
+func maintainSlowArchives(root string, now time.Time, budget int64) error {
+	if err := recoverSlowDirectories(root, false); err != nil {
 		return err
 	}
 	return maintainDiagnosticArchives(root, now, budget, nil)

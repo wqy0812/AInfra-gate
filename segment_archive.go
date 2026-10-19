@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -20,6 +21,29 @@ import (
 const archiveAfter = 72 * time.Hour
 const archivePayload = "segment.tar.gz"
 const archiveManifestName = "archive.json"
+const archiveManifestMaxBytes = int64(16 << 20)
+const archiveManifestMaxFiles = 65536
+const archiveManifestMaxBlocks = 131072
+
+type archiveLimits struct {
+	files, blocks int
+	metadata      int64
+}
+
+var defaultArchiveLimits = archiveLimits{archiveManifestMaxFiles, archiveManifestMaxBlocks, archiveManifestMaxBytes}
+
+type archiveMetadataBudget struct {
+	limits archiveLimits
+	bytes  int64
+}
+
+func (b *archiveMetadataBudget) reserve(n int64) error {
+	if n < 0 || b.bytes > b.limits.metadata-n {
+		return fmt.Errorf("archive_metadata_limit")
+	}
+	b.bytes += n
+	return nil
+}
 
 type archiveEntry struct {
 	Name   string `json:"name"`
@@ -52,12 +76,103 @@ func readSegmentArchive(dir string) (segmentArchive, error) {
 		return m, e
 	}
 	defer f.Close()
-	e = json.NewDecoder(io.LimitReader(f, 64<<20)).Decode(&m)
-	if e == nil && (m.Version != 1 || !validDigest(m.SHA256) || m.Bytes <= 0) {
-		e = fmt.Errorf("invalid archive manifest")
+	info, e := f.Stat()
+	if e != nil {
+		return m, e
 	}
-	return m, e
+	if info.Size() > archiveManifestMaxBytes {
+		return m, fmt.Errorf("archive_metadata_limit")
+	}
+	// Decode arrays incrementally: a small JSON document can still contain an
+	// excessive number of tiny objects. Reject before growing either slice.
+	dec := json.NewDecoder(io.LimitReader(f, archiveManifestMaxBytes+1))
+	token, e := dec.Token()
+	if e != nil || token != json.Delim('{') {
+		return m, fmt.Errorf("invalid archive manifest")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		token, e = dec.Token()
+		if e != nil {
+			return m, e
+		}
+		key, ok := token.(string)
+		if !ok || seen[key] {
+			return m, fmt.Errorf("invalid archive manifest field")
+		}
+		seen[key] = true
+		switch key {
+		case "version":
+			e = dec.Decode(&m.Version)
+		case "bytes":
+			e = dec.Decode(&m.Bytes)
+		case "sha256":
+			e = dec.Decode(&m.SHA256)
+		case "files", "blocks":
+			token, e = dec.Token()
+			if e != nil || token != json.Delim('[') {
+				return m, fmt.Errorf("invalid archive manifest array")
+			}
+			for dec.More() {
+				if key == "files" {
+					if len(m.Files) >= archiveManifestMaxFiles {
+						return m, fmt.Errorf("archive_metadata_limit")
+					}
+					var entry archiveEntry
+					if e = dec.Decode(&entry); e != nil {
+						return m, e
+					}
+					if !fs.ValidPath(entry.Name) || strings.Contains(entry.Name, "\\") || len(entry.Name) > 4096 || !validDigest(entry.SHA256) || entry.Offset < 0 || entry.Bytes < 0 {
+						return m, fmt.Errorf("invalid archive entry")
+					}
+					m.Files = append(m.Files, entry)
+				} else {
+					if len(m.Blocks) >= archiveManifestMaxBlocks {
+						return m, fmt.Errorf("archive_metadata_limit")
+					}
+					var block archiveBlock
+					if e = dec.Decode(&block); e != nil {
+						return m, e
+					}
+					m.Blocks = append(m.Blocks, block)
+				}
+			}
+			_, e = dec.Token()
+		default:
+			return m, fmt.Errorf("invalid archive manifest field")
+		}
+		if e != nil {
+			return m, e
+		}
+	}
+	if _, e = dec.Token(); e != nil {
+		return m, e
+	}
+	if _, e = dec.Token(); e != io.EOF {
+		return m, fmt.Errorf("trailing archive metadata")
+	}
+	if m.Version != 1 || !validDigest(m.SHA256) || m.Bytes <= 0 || len(m.Blocks) == 0 {
+		return m, fmt.Errorf("invalid archive manifest")
+	}
+	var raw, compressed int64
+	for _, block := range m.Blocks {
+		if block.Offset != raw || block.Compressed != compressed || block.Bytes <= 0 || block.Bytes > 2*archiveBlockBytes || block.RawBytes <= 0 || block.RawBytes > archiveBlockBytes || !validDigest(block.SHA256) {
+			return m, fmt.Errorf("invalid archive block index")
+		}
+		raw += block.RawBytes
+		compressed += block.Bytes
+	}
+	if compressed != m.Bytes {
+		return m, fmt.Errorf("archive block size mismatch")
+	}
+	for _, entry := range m.Files {
+		if entry.Offset > raw || entry.Bytes > raw-entry.Offset {
+			return m, fmt.Errorf("invalid archive entry bounds")
+		}
+	}
+	return m, nil
 }
+
 func syncDirectory(dir string) error {
 	f, e := os.Open(dir)
 	if e != nil {
@@ -69,6 +184,9 @@ func syncDirectory(dir string) error {
 
 // Caller owns the directory lock and guarantees all included files are sealed.
 func prepareSegmentArchive(dir string) (segmentArchive, error) {
+	return prepareSegmentArchiveLimits(dir, defaultArchiveLimits)
+}
+func prepareSegmentArchiveLimits(dir string, limits archiveLimits) (segmentArchive, error) {
 	if m, e := readSegmentArchive(dir); e == nil {
 		digest, n, e := archiveHash(filepath.Join(dir, archivePayload))
 		if e != nil {
@@ -88,9 +206,10 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 		return m, e
 	}
 	defer os.Remove(tmp)
-	gz := &indexedGzipWriter{file: f}
+	budget := &archiveMetadataBudget{limits: limits, bytes: 1024}
+	gz := &indexedGzipWriter{file: f, budget: budget}
 	tw := tar.NewWriter(gz)
-	e = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	e = walkArchiveFiles(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -113,6 +232,13 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 		}
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("archive refuses non-regular file: %s", name)
+		}
+		if len(m.Files) >= limits.files || len(name) > 4096 {
+			return fmt.Errorf("archive_metadata_limit")
+		}
+		quoted, _ := json.Marshal(filepath.ToSlash(name))
+		if err = budget.reserve(int64(len(quoted)) + 200); err != nil {
+			return err
 		}
 		h := &tar.Header{Name: filepath.ToSlash(name), Mode: 0600, Size: info.Size(), Typeflag: tar.TypeReg}
 		if err = tw.WriteHeader(h); err != nil {
@@ -237,14 +363,19 @@ func compactSegmentArchive(dir string, keep map[string]bool) error {
 const archiveBlockBytes = int64(1 << 20)
 
 type archiveBlock struct {
-	Offset     int64 `json:"offset"`
-	Compressed int64 `json:"compressed"`
+	Offset     int64  `json:"offset"`
+	Compressed int64  `json:"compressed"`
+	Bytes      int64  `json:"bytes"`
+	RawBytes   int64  `json:"raw_bytes"`
+	SHA256     string `json:"sha256"`
 }
 type indexedGzipWriter struct {
 	file     *os.File
 	writer   *gzip.Writer
 	position int64
 	blocks   []archiveBlock
+	sum      hash.Hash
+	budget   *archiveMetadataBudget
 }
 
 func (w *indexedGzipWriter) Write(p []byte) (int, error) {
@@ -255,8 +386,15 @@ func (w *indexedGzipWriter) Write(p []byte) (int, error) {
 			if err != nil {
 				return total, err
 			}
-			w.blocks = append(w.blocks, archiveBlock{w.position, offset})
-			w.writer, _ = gzip.NewWriterLevel(w.file, gzip.BestSpeed)
+			if len(w.blocks) >= w.budget.limits.blocks {
+				return total, fmt.Errorf("archive_metadata_limit")
+			}
+			if err := w.budget.reserve(200); err != nil {
+				return total, err
+			}
+			w.blocks = append(w.blocks, archiveBlock{Offset: w.position, Compressed: offset})
+			w.sum = sha256.New()
+			w.writer, _ = gzip.NewWriterLevel(io.MultiWriter(w.file, w.sum), gzip.BestSpeed)
 		}
 		size := min(int64(len(p)), archiveBlockBytes-w.position%archiveBlockBytes)
 		n, err := w.writer.Write(p[:size])
@@ -267,17 +405,67 @@ func (w *indexedGzipWriter) Write(p []byte) (int, error) {
 			return total, err
 		}
 		if w.position%archiveBlockBytes == 0 {
-			if err := w.writer.Close(); err != nil {
+			if err := w.closeBlock(); err != nil {
 				return total, err
 			}
-			w.writer = nil
 		}
 	}
 	return total, nil
 }
-func (w *indexedGzipWriter) Close() error {
-	if w.writer != nil {
-		return w.writer.Close()
+func (w *indexedGzipWriter) closeBlock() error {
+	if w.writer == nil {
+		return nil
 	}
+	err := w.writer.Close()
+	w.writer = nil
+	if err != nil {
+		return err
+	}
+	offset, err := w.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	block := &w.blocks[len(w.blocks)-1]
+	block.Bytes = offset - block.Compressed
+	block.RawBytes = w.position - block.Offset
+	block.SHA256 = hex.EncodeToString(w.sum.Sum(nil))
 	return nil
+}
+func (w *indexedGzipWriter) Close() error { return w.closeBlock() }
+
+// WalkDir reads and sorts an entire directory. Read bounded batches instead so
+// even millions of small request directories cannot allocate an unbounded list.
+func walkArchiveFiles(root string, visit fs.WalkDirFunc) error {
+	var walk func(string, int) error
+	walk = func(path string, depth int) error {
+		if depth > 32 {
+			return fmt.Errorf("archive_directory_depth_limit")
+		}
+		dir, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		for {
+			entries, err := dir.ReadDir(128)
+			if err != nil && err != io.EOF {
+				return err
+			}
+			for _, entry := range entries {
+				child := filepath.Join(path, entry.Name())
+				if e := visit(child, entry, nil); e != nil {
+					return e
+				}
+				if entry.IsDir() {
+					if e := walk(child, depth+1); e != nil {
+						return e
+					}
+				}
+			}
+			if err == io.EOF {
+				return nil
+			}
+		}
+	}
+	return walk(root, 0)
 }
