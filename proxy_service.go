@@ -150,7 +150,8 @@ func (p *ProxyGateway) retain() {
 	defer close(p.done)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	var lastSlow time.Time
+	maintenanceDone := dailyArchiveMaintenance(p.stop, p.maintainInactiveStorage)
+	defer func() { <-maintenanceDone }()
 	for {
 		protected := map[string]bool{}
 		if p.g.profile != nil {
@@ -171,12 +172,7 @@ func (p *ProxyGateway) retain() {
 				p.g.audit.Print(string(encodeJSON(map[string]any{"event": "observation_retention_error", "error": err.Error()})))
 			}
 		}
-		if p.g.slow == nil && time.Since(lastSlow) >= archiveInterval {
-			if err := maintainSlowArchives(filepath.Join(p.dataRoot, "slow-requests"), time.Now(), p.settings.SlowRequests.MaxDiskBytes); err != nil {
-				p.g.audit.Printf("slow_archive_failed: %v", err)
-			}
-			lastSlow = time.Now()
-		}
+
 		select {
 		case <-p.stop:
 			return
@@ -367,4 +363,28 @@ func (p *ProxyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(headerRoute, strconv.FormatUint(meta.revision, 10))
 	w.Header().Set("X-Aigate-Config-Digest", p.digest)
 	p.g.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), runtimeRequestKey{}, meta)))
+}
+
+func (p *ProxyGateway) maintainInactiveStorage(now time.Time) {
+	if p.g.slow == nil {
+		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "slow-requests"), now, p.settings.SlowRequests.MaxDiskBytes); err != nil {
+			p.g.audit.Printf("slow_archive_failed: %v", err)
+		}
+	}
+	if p.g.captures == nil {
+		budget := p.settings.StreamCaptureMaxDiskBytes
+		if budget <= 0 {
+			budget = streamCaptureDisk
+		}
+		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "stream-incidents", "requests"), now, budget, func() error {
+			root := filepath.Join(p.dataRoot, "stream-incidents", "requests")
+			if _, err := os.Stat(root); os.IsNotExist(err) {
+				return nil
+			}
+			store := &streamCaptureStore{root: root, serviceID: p.id, routerID: p.router, stored: map[string]*captureStored{}, maxDisk: budget}
+			return store.recoverStored(now)
+		}); err != nil {
+			p.g.audit.Printf("capture_archive_failed: %v", err)
+		}
+	}
 }

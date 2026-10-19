@@ -22,6 +22,7 @@ import (
 type replayTaskInput struct {
 	BootID  string            `json:"boot_id"`
 	Targets map[string]string `json:"targets"`
+	Digests map[string]string `json:"digests"`
 }
 type replayTaskCommand struct {
 	Method  string          `json:"method"`
@@ -66,6 +67,29 @@ func RunReplayTask(args []string) error {
 	if !validOperationID(input.BootID) {
 		return fmt.Errorf("invalid task boot identity")
 	}
+	normalized := map[string]string{}
+	for name, raw := range input.Targets {
+		base, err := controlBase(raw)
+		if !validOperationID(name) || err != nil {
+			return fmt.Errorf("invalid replay target %q", name)
+		}
+		normalized[name] = base
+	}
+	input.Targets = normalized
+	if len(input.Digests) == 0 {
+		return fmt.Errorf("saved task inputs missing")
+	}
+	saved := map[string]bool{}
+	for identity, digest := range input.Digests {
+		parts := strings.Split(identity, "/")
+		if len(parts) != 3 || !validOperationID(parts[0]) || !validOperationID(parts[1]) || !validDigest(digest) {
+			return fmt.Errorf("invalid saved task input")
+		}
+		if _, ok := parseRecordingSegment(parts[2]); !ok {
+			return fmt.Errorf("invalid saved task segment")
+		}
+		saved[identity] = true
+	}
 	key := os.Getenv("AIGATE_REPLAY_MARK_KEY")
 	if len(key) < replayMarkMinBytes {
 		return fmt.Errorf("task signing key missing")
@@ -78,7 +102,8 @@ func RunReplayTask(args []string) error {
 	if e != nil {
 		return e
 	}
-	defer func() { service.Close(); _ = os.RemoveAll(inputRoot) }()
+	defer service.Close()
+	service.taskInputs = saved
 	service.boot = input.BootID
 	for _, dir := range []string{"commands", "responses"} {
 		if e = os.MkdirAll(filepath.Join(root, dir), 0700); e != nil {

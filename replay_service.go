@@ -56,6 +56,7 @@ func readReplayTargets(path string) (map[string]string, error) {
 }
 
 type replayService struct {
+	taskInputs  map[string]bool
 	taskMode    bool
 	key         string
 	cidrs       []netip.Prefix

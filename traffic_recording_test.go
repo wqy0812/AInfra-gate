@@ -602,9 +602,13 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	if session.State != "ended" || session.EndReason != "end_unknown" || segment.State != "end_unknown" || segment.Recorded != 2 {
 		t.Fatalf("recovery %+v %+v", session, segment)
 	}
-	// Over capacity at boot: the next maintenance pass evicts the oldest
+	// Startup does not catch up. An explicit scheduled maintenance pass evicts the oldest
 	// unpinned sealed segments and keeps the pinned one.
 	r.flush()
+	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0000")); err != nil {
+		t.Fatal("startup evicted before daily maintenance", err)
+	}
+	r.maintainStorage()
 	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0000")); !os.IsNotExist(err) {
 		t.Fatal("oldest segment kept", err)
 	}

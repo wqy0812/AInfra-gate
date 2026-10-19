@@ -18,7 +18,6 @@ import (
 )
 
 const archiveAfter = 72 * time.Hour
-const archiveInterval = 5 * time.Minute
 const archivePayload = "segment.tar.gz"
 const archiveManifestName = "archive.json"
 
@@ -26,12 +25,14 @@ type archiveEntry struct {
 	Name   string `json:"name"`
 	Bytes  int64  `json:"bytes"`
 	SHA256 string `json:"sha256"`
+	Offset int64  `json:"offset"`
 }
 type segmentArchive struct {
 	Version int            `json:"version"`
 	Bytes   int64          `json:"bytes"`
 	SHA256  string         `json:"sha256"`
 	Files   []archiveEntry `json:"files"`
+	Blocks  []archiveBlock `json:"blocks"`
 }
 
 func archiveHash(path string) (string, int64, error) {
@@ -87,7 +88,7 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 		return m, e
 	}
 	defer os.Remove(tmp)
-	gz, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	gz := &indexedGzipWriter{file: f}
 	tw := tar.NewWriter(gz)
 	e = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -117,6 +118,7 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 		if err = tw.WriteHeader(h); err != nil {
 			return err
 		}
+		offset := gz.position
 		src, err := os.Open(path)
 		if err != nil {
 			return err
@@ -130,7 +132,7 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 		if n != info.Size() {
 			return fmt.Errorf("archive source changed")
 		}
-		m.Files = append(m.Files, archiveEntry{filepath.ToSlash(name), n, hex.EncodeToString(sum.Sum(nil))})
+		m.Files = append(m.Files, archiveEntry{Name: filepath.ToSlash(name), Bytes: n, SHA256: hex.EncodeToString(sum.Sum(nil)), Offset: offset})
 		return nil
 	})
 	for _, close := range []func() error{tw.Close, gz.Close, f.Sync, f.Close} {
@@ -141,6 +143,7 @@ func prepareSegmentArchive(dir string) (segmentArchive, error) {
 	if e != nil {
 		return m, e
 	}
+	m.Blocks = gz.blocks
 	m.SHA256, m.Bytes, e = archiveHash(tmp)
 	if e != nil {
 		return m, e
@@ -229,4 +232,52 @@ func compactSegmentArchive(dir string, keep map[string]bool) error {
 		}
 	}
 	return syncDirectory(dir)
+}
+
+const archiveBlockBytes = int64(1 << 20)
+
+type archiveBlock struct {
+	Offset     int64 `json:"offset"`
+	Compressed int64 `json:"compressed"`
+}
+type indexedGzipWriter struct {
+	file     *os.File
+	writer   *gzip.Writer
+	position int64
+	blocks   []archiveBlock
+}
+
+func (w *indexedGzipWriter) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		if w.writer == nil {
+			offset, err := w.file.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return total, err
+			}
+			w.blocks = append(w.blocks, archiveBlock{w.position, offset})
+			w.writer, _ = gzip.NewWriterLevel(w.file, gzip.BestSpeed)
+		}
+		size := min(int64(len(p)), archiveBlockBytes-w.position%archiveBlockBytes)
+		n, err := w.writer.Write(p[:size])
+		w.position += int64(n)
+		total += n
+		p = p[n:]
+		if err != nil {
+			return total, err
+		}
+		if w.position%archiveBlockBytes == 0 {
+			if err := w.writer.Close(); err != nil {
+				return total, err
+			}
+			w.writer = nil
+		}
+	}
+	return total, nil
+}
+func (w *indexedGzipWriter) Close() error {
+	if w.writer != nil {
+		return w.writer.Close()
+	}
+	return nil
 }

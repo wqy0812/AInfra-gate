@@ -120,7 +120,11 @@ func TestSlowRetentionAfterProxyRestartWithCaptureDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.Close()
-	retentionProxy(t, root, `{"slow_requests":{"enabled":false,"retention_hours":1}}`)
+	inactive := retentionProxy(t, root, `{"slow_requests":{"enabled":false,"retention_hours":1}}`)
+	if _, err := diagnosticReference(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); !os.IsNotExist(err) {
+		t.Fatal("startup performed maintenance")
+	}
+	inactive.maintainInactiveStorage(time.Now())
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		if _, err := diagnosticReference(filepath.Join(store.c.Directory, "request-"+job.meta.RequestID)); err == nil {

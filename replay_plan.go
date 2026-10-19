@@ -284,14 +284,14 @@ func copyableHeaders(headers map[string]string) map[string]string {
 // buildReplayPlan selects sealed segments and orders requests by arrival.
 // Segments are concatenated in time order by their covered durations, so
 // contiguous segments keep real time and gaps between distant ones collapse.
-func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
+func buildReplayPlan(root string, req replayRequest, saved ...map[string]bool) (*replayPlan, error) {
 	if len(req.Recordings) > 0 {
 		merged := &replayPlan{Schema: recordingSchema, RunID: req.RunID, Excluded: map[string]int{}, Rewritten: req.rewritten(), OriginalBytes: len(req.rewritten()) == 0}
 		for _, ref := range req.Recordings {
 			one := req
 			one.Recordings = nil
 			one.Recording = ref
-			plan, err := buildReplayPlan(root, one)
+			plan, err := buildReplayPlan(root, one, saved...)
 			if err != nil {
 				return nil, err
 			}
@@ -313,12 +313,15 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		return merged, nil
 	}
 
-	session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
-	if err != nil {
-		return nil, err
-	}
-	if session.Schema != recordingSchema {
-		return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+	task := len(saved) > 0 && saved[0] != nil
+	if !task {
+		session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
+		if err != nil {
+			return nil, err
+		}
+		if session.Schema != recordingSchema {
+			return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+		}
 	}
 	plan := &replayPlan{Schema: recordingSchema, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
 		Excluded: map[string]int{}, Rewritten: req.rewritten(), Segments: []replayPlanSegment{}}
@@ -335,7 +338,11 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		if status.State != "sealed" {
 			return nil, fmt.Errorf("segment_not_sealed")
 		}
-		if !status.Pinned {
+		if task {
+			if !saved[0][req.Recording.GatewayID+"/"+req.Recording.RecordingID+"/"+name] {
+				return nil, fmt.Errorf("segment_not_saved")
+			}
+		} else if !status.Pinned {
 			return nil, fmt.Errorf("segment_not_retained")
 		}
 		segments = append(segments, status)

@@ -120,7 +120,7 @@ func newSlowRequestStore(c SlowRequestConfig, logger *log.Logger) (*slowRequestS
 		return nil, fmt.Errorf("slow_requests directory lock: %w", err)
 	}
 	s := &slowRequestStore{c: c, log: logger, directory: dir, queue: make(chan slowRequestJob, 1024), done: make(chan struct{})}
-	if err := s.cleanup(time.Now(), 0); err != nil {
+	if _, err := slowStoredRecords(c.Directory); err != nil {
 		unlockState(dir)
 		dir.Close()
 		return nil, fmt.Errorf("slow_requests startup cleanup: %w", err)
@@ -199,9 +199,15 @@ func (s *slowRequestStore) close() {
 }
 
 func (s *slowRequestStore) run() {
-	ticker := time.NewTicker(archiveInterval)
+	maintenanceStop := make(chan struct{})
+	maintenanceDone := dailyArchiveMaintenance(maintenanceStop, func(now time.Time) {
+		if err := s.cleanup(now, 0); err != nil {
+			s.diagnostic("", "cleanup_failed", err.Error())
+		}
+	})
 	defer func() {
-		ticker.Stop()
+		close(maintenanceStop)
+		<-maintenanceDone
 		unlockState(s.directory)
 		s.directory.Close()
 		close(s.done)
@@ -220,10 +226,6 @@ func (s *slowRequestStore) run() {
 			s.mu.Lock()
 			s.queueBytes -= int64(len(job.body))
 			s.mu.Unlock()
-		case now := <-ticker.C:
-			if err := s.cleanup(now, 0); err != nil {
-				s.diagnostic("", "cleanup_failed", err.Error())
-			}
 		}
 	}
 }
@@ -252,8 +254,6 @@ func slowWriteFile(path string, data []byte) error {
 }
 
 func (s *slowRequestStore) writeRecord(job slowRequestJob) error {
-	diagnosticArchiveMu.RLock()
-	defer diagnosticArchiveMu.RUnlock()
 	if !slowRequestID(job.meta.RequestID) {
 		return fmt.Errorf("invalid request ID")
 	}

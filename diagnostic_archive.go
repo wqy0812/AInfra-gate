@@ -1,8 +1,8 @@
 package aigate
 
 import (
-	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +17,7 @@ import (
 // Serializes maintenance with diagnostic readers; request forwarding never
 // takes this lock. Published request directories are immutable.
 var diagnosticArchiveMu sync.RWMutex
+var diagnosticMaintenanceMu sync.Mutex
 
 const diagnosticRefName = "archive-ref.json"
 
@@ -189,35 +190,44 @@ func finalizeDiagnosticArchive(dest string) error {
 		}
 		records[parts[0]] = true
 	}
-	for name := range records {
-		path := filepath.Join(filepath.Dir(dest), name)
-		if _, e = os.Stat(path); os.IsNotExist(e) {
-			continue
-		} else if e != nil {
-			return e
-		}
-		if ref, err := diagnosticReference(path); err == nil && ref.Archive != filepath.Base(dest) {
-			return fmt.Errorf("diagnostic already archived")
-		}
-		if _, e = recordingAtomicJSON(path, diagnosticRefName, diagnosticRef{filepath.Base(dest)}); e != nil {
-			return e
-		}
-		for _, f := range m.Files {
-			if !strings.HasPrefix(f.Name, name+"/") || filepath.Base(f.Name) == "meta.json" {
+	if e = func() error {
+		diagnosticArchiveMu.Lock()
+		defer diagnosticArchiveMu.Unlock()
+		for name := range records {
+			path := filepath.Join(filepath.Dir(dest), name)
+			if _, e = os.Stat(path); os.IsNotExist(e) {
 				continue
+			} else if e != nil {
+				return e
 			}
-			source := filepath.Join(filepath.Dir(dest), filepath.FromSlash(f.Name))
-			if e = os.Remove(source); e != nil && !os.IsNotExist(e) {
+			if ref, err := diagnosticReference(path); err == nil && ref.Archive != filepath.Base(dest) {
+				return fmt.Errorf("diagnostic already archived")
+			}
+			if _, e = recordingAtomicJSON(path, diagnosticRefName, diagnosticRef{filepath.Base(dest)}); e != nil {
+				return e
+			}
+			for _, f := range m.Files {
+				if !strings.HasPrefix(f.Name, name+"/") || filepath.Base(f.Name) == "meta.json" {
+					continue
+				}
+				source := filepath.Join(filepath.Dir(dest), filepath.FromSlash(f.Name))
+				if e = os.Remove(source); e != nil && !os.IsNotExist(e) {
+					return e
+				}
+			}
+			if e = syncDirectory(path); e != nil {
 				return e
 			}
 		}
-		if e = syncDirectory(path); e != nil {
-			return e
-		}
+		return nil
+	}(); e != nil {
+		return e
 	}
 	return compactSegmentArchive(dest, nil)
 }
 func removeDiagnosticItem(item diagnosticItem) error {
+	diagnosticArchiveMu.Lock()
+	defer diagnosticArchiveMu.Unlock()
 	if !item.archived {
 		return removeDiagnosticRecord(item.path)
 	}
@@ -276,8 +286,8 @@ func removeDiagnosticRecord(path string) error {
 	return os.Remove(path)
 }
 func maintainDiagnosticArchives(root string, now time.Time, budget int64, active func(string) bool) error {
-	diagnosticArchiveMu.Lock()
-	defer diagnosticArchiveMu.Unlock()
+	diagnosticMaintenanceMu.Lock()
+	defer diagnosticMaintenanceMu.Unlock()
 	dirs, e := diagnosticFolders(root)
 	if e != nil {
 		return e
@@ -348,6 +358,9 @@ func maintainDiagnosticArchives(root string, now time.Time, budget int64, active
 // The caller holds the diagnostic read lock. No extraction or unbounded body
 // buffering is needed to read an archived evidence range.
 func archivedDiagnosticFile(dir, name string) (io.ReadCloser, archiveEntry, string, error) {
+	return archivedDiagnosticRange(context.Background(), dir, name, 0)
+}
+func archivedDiagnosticRange(ctx context.Context, dir, name string, offset int64) (io.ReadCloser, archiveEntry, string, error) {
 	ref, e := diagnosticReference(dir)
 	if e != nil {
 		return nil, archiveEntry{}, "", e
@@ -372,28 +385,46 @@ func archivedDiagnosticFile(dir, name string) (io.ReadCloser, archiveEntry, stri
 	if e != nil {
 		return nil, entry, "", e
 	}
-	gz, e := gzip.NewReader(f)
+	if offset < 0 || offset > entry.Bytes || len(m.Blocks) == 0 {
+		f.Close()
+		return nil, entry, "", fmt.Errorf("invalid archive range index")
+	}
+	target := entry.Offset + offset
+	block := m.Blocks[0]
+	for _, candidate := range m.Blocks {
+		if candidate.Offset > target {
+			break
+		}
+		block = candidate
+	}
+	if target < block.Offset || target-block.Offset > archiveBlockBytes || block.Compressed < 0 || block.Compressed >= m.Bytes {
+		f.Close()
+		return nil, entry, "", fmt.Errorf("invalid archive range index")
+	}
+	gz, e := gzip.NewReader(&archiveContextReader{ctx, io.NewSectionReader(f, block.Compressed, m.Bytes-block.Compressed)})
 	if e != nil {
 		f.Close()
 		return nil, entry, "", e
 	}
-	tr := tar.NewReader(gz)
-	for {
-		h, e := tr.Next()
-		if e != nil {
-			gz.Close()
-			f.Close()
-			return nil, entry, "", e
-		}
-		if h.Name == wanted {
-			if h.Size != entry.Bytes {
-				gz.Close()
-				f.Close()
-				return nil, entry, "", fmt.Errorf("archive size mismatch")
-			}
-			return &diagnosticArchiveReader{Reader: tr, gz: gz, file: f}, entry, m.SHA256, nil
-		}
+	reader := &archiveContextReader{ctx, gz}
+	if _, e = io.CopyN(io.Discard, reader, target-block.Offset); e != nil {
+		gz.Close()
+		f.Close()
+		return nil, entry, "", e
 	}
+	return &diagnosticArchiveReader{Reader: io.LimitReader(reader, entry.Bytes-offset), gz: gz, file: f}, entry, m.SHA256, nil
+}
+
+type archiveContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *archiveContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }
 
 type diagnosticArchiveReader struct {
@@ -457,4 +488,39 @@ func discardUncommittedDiagnostic(dest string) error {
 		return e
 	}
 	return os.RemoveAll(dest)
+}
+
+// Inactive maintenance must own every policy directory, just as an active writer does.
+func maintainInactiveDiagnostics(root string, now time.Time, budget int64, recover ...func() error) error {
+	dirs, err := diagnosticFolders(root)
+	if err != nil {
+		return err
+	}
+	files := []*os.File{}
+	defer func() {
+		for _, f := range files {
+			unlockState(f)
+			f.Close()
+		}
+	}()
+	for _, dir := range dirs {
+		f, err := os.Open(dir)
+		if err != nil {
+			return err
+		}
+		if err = lockState(f); err != nil {
+			f.Close()
+			return err
+		}
+		files = append(files, f)
+	}
+	if budget <= 0 {
+		budget = 10 << 30
+	}
+	for _, repair := range recover {
+		if err := repair(); err != nil {
+			return err
+		}
+	}
+	return maintainDiagnosticArchives(root, now, budget, nil)
 }

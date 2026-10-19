@@ -335,7 +335,7 @@ func TestStreamCaptureCompletedRecordsLeaveNoMemoryIndex(t *testing.T) {
 	captureAssertReleased(t, s)
 }
 
-func TestStreamCaptureStartupCompressesOldAndKeepsRecent(t *testing.T) {
+func TestStreamCaptureWaitsForScheduledMaintenance(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "requests")
 	oldID, recentID := randomID(), randomID()
 	old, recent := time.Now().Add(-73*time.Hour), time.Now().Add(-time.Hour)
@@ -346,6 +346,12 @@ func TestStreamCaptureStartupCompressesOldAndKeepsRecent(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.close()
+	if _, err := diagnosticReference(oldPath); !os.IsNotExist(err) {
+		t.Fatal("startup compressed before scheduled maintenance")
+	}
+	if err := s.cleanup(time.Now(), 0); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := diagnosticReference(oldPath); err != nil {
 		t.Fatalf("old record not archived: %v", err)
 	}

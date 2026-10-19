@@ -522,7 +522,21 @@ func (s *streamCaptureStore) close() {
 
 func (s *streamCaptureStore) run() {
 	ticker := time.NewTicker(time.Second)
-	defer func() { ticker.Stop(); unlockState(s.directory); s.directory.Close(); close(s.done) }()
+	maintenanceStop := make(chan struct{})
+	maintenanceDone := dailyArchiveMaintenance(maintenanceStop, func(now time.Time) {
+		if err := maintainDiagnosticArchives(s.root, now, s.maxDisk, nil); err != nil {
+			s.failures.Add(1)
+			s.audit.Printf("capture_archive_failed: %v", err)
+		}
+	})
+	defer func() {
+		ticker.Stop()
+		close(maintenanceStop)
+		<-maintenanceDone
+		unlockState(s.directory)
+		s.directory.Close()
+		close(s.done)
+	}()
 	for {
 		select {
 		case job, ok := <-s.queue:
@@ -601,12 +615,7 @@ func (s *streamCaptureStore) reconcileAll(now time.Time, closing bool) {
 	for _, c := range active {
 		s.safeWork(c, func() error { return s.reconcile(c, now, closing) })
 	}
-	if now.Sub(s.lastCleanup) >= archiveInterval {
-		if err := s.cleanup(now, 0); err != nil {
-			s.failures.Add(1)
-		}
-		s.lastCleanup = now
-	}
+
 }
 
 func (s *streamCaptureStore) process(job captureJob) error {
@@ -994,7 +1003,7 @@ func (s *streamCaptureStore) capacity(additional int64) error {
 }
 
 func (s *streamCaptureStore) cleanup(now time.Time, additional int64) error {
-	// Writes use a soft quota. Housekeeping runs independently every five minutes.
+	// Writes use a soft quota. Housekeeping runs independently at 05:00 Shanghai.
 	if additional > 0 {
 		return nil
 	}
@@ -1199,7 +1208,7 @@ func (s *streamCaptureStore) recoverStored(now time.Time) error {
 		delete(s.stored, path)
 	}
 	s.lastCleanup = now
-	return s.cleanup(now, 0)
+	return nil
 }
 
 func captureReadSmall(path string, limit int) ([]byte, error) {

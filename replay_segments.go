@@ -1,6 +1,7 @@
 package aigate
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +16,16 @@ type replaySegmentLease struct {
 
 func (s *replayService) acquireSegment(path string) (*os.File, error) {
 	if s.taskMode {
-		path = filepath.Join(path, ".replay.lock")
+		relative, err := filepath.Rel(s.recordRoot, path)
+		if err != nil || !s.taskInputs[filepath.ToSlash(relative)] {
+			return nil, fmt.Errorf("segment_not_saved")
+		}
+		// Only the task result directory is writable. The platform owns input retention.
+		lockRoot := filepath.Join(s.dataRoot, "input-locks")
+		if err := os.MkdirAll(lockRoot, 0700); err != nil {
+			return nil, err
+		}
+		path = filepath.Join(lockRoot, fmt.Sprintf("%x", sha256.Sum256([]byte(relative))))
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

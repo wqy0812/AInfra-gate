@@ -11,8 +11,18 @@ import (
 )
 
 func (r *trafficRecorder) maintainStorage() {
-	now := r.now()
+	r.maintenanceMu.Lock()
+	defer r.maintenanceMu.Unlock()
+	now := time.Now()
+	r.mu.Lock()
+	segments := make([]recordingStoredSegment, 0, len(r.stored))
 	for _, seg := range r.stored {
+		if seg.sealed {
+			segments = append(segments, *seg)
+		}
+	}
+	r.mu.Unlock()
+	for _, seg := range segments {
 		if !seg.sealed || !now.After(seg.start.Add(recordingSegment+archiveAfter)) {
 			continue
 		}
@@ -25,7 +35,11 @@ func (r *trafficRecorder) maintainStorage() {
 			f.Close()
 			continue
 		}
-		e = compactSegmentArchive(dir, map[string]bool{"segment.json": true})
+		compact := r.archiveSegment
+		if compact == nil {
+			compact = compactSegmentArchive
+		}
+		e = compact(dir, map[string]bool{"segment.json": true})
 		unlockState(f)
 		f.Close()
 		if e != nil {
@@ -33,12 +47,18 @@ func (r *trafficRecorder) maintainStorage() {
 		}
 	}
 	// Include archives, manifests and temporary files, not logical body lengths.
-	for _, seg := range r.stored {
+	for _, snapshot := range segments {
+		seg := &snapshot
 		n, e := recordingTreeBytes(filepath.Join(r.sessionDir(seg.recording), seg.name))
 		if e != nil {
 			continue
 		}
 		r.mu.Lock()
+		seg = r.stored[seg.key]
+		if seg == nil {
+			r.mu.Unlock()
+			continue
+		}
 		r.diskBytes += n - seg.bytes
 		if seg.pinned {
 			r.pinnedBytes += n - seg.bytes

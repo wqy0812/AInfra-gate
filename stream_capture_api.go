@@ -204,7 +204,7 @@ func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if target.Archive != "" {
-		stream, entry, digest, e := archivedDiagnosticFile(filepath.Join(s.root, "request-"+id), name)
+		stream, entry, digest, e := archivedDiagnosticRange(ctx, filepath.Join(s.root, "request-"+id), name, offset)
 		if e != nil {
 			fail(503, "capture_unavailable")
 			return
@@ -216,9 +216,7 @@ func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Reques
 		}
 		size := min(int64(limit), target.Bytes-offset)
 		data := make([]byte, size)
-		if _, e = io.CopyN(io.Discard, stream, offset); e == nil {
-			_, e = io.ReadFull(stream, data)
-		}
+		_, e = io.ReadFull(stream, data)
 		if e != nil || ctx.Err() != nil {
 			fail(503, "capture_unavailable")
 			return
