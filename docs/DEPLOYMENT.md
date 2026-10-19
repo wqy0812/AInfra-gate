@@ -1,5 +1,27 @@
 # 当前部署身份
 
+<a id="nas-main-20261019"></a>
+
+## 2026-10-19 NAS 录制与平台独立回放
+
+状态：与平台在同一维护窗口发布完成，北京时间 22:15:47 开启、23:15:24 恢复原维护状态，共 3,577.74 秒。四处 switch/proxy 均已替换并验证实际运行程序，旧常驻 replay 已退役。源码 [PR #7](https://github.com/wqy0812/AInfra-gate/pull/7) 合并提交 `40372f27ddcd51e85cd68c45820bb5239a9af689`；配套平台 Web/worker/回放镜像源码 `967403be606912c4ae2333fb13db76f3c78dd920`、engine 含四并发导入的提交 `9c56a5ff901c372aa686584c030961d6ff9666b2`。Go 1.27.1、CGO_ENABLED=0、离线 vendor、trimpath 构建，内嵌 revision 匹配且 `vcs.modified=false`。
+
+| 程序 | linux/amd64 SHA-256 |
+| --- | --- |
+| aigate-switch，DCU/XPU/A3/PPU 实际进程 | `f8f964507197121f2740b65a68a41306310353836a57bcec6b741630b73ab79c` |
+| aigate-proxy，DCU/XPU/A3/PPU 实际进程 | `a2b934db94631ee0f317b13280670c68a633f376bc373bcf02549f1f826eddfd` |
+| aigate-replay-task，新固定回放镜像内 | `075ca574491795b914c23eb10cef4267eecef4c8f80b6103767486329a1ef9d8` |
+
+四个当前网关节点均为 amd64，A3 使用 A3-gate。DCU 沿用 systemd，XPU 沿用 Kubernetes ai-gate，A3/PPU 沿用 containerd ai-gateway。等待所有已接受请求自然结束后替换程序；配置、权限、资源、目标及签名密钥信任保持，仅 switch 本地软额度使用本次 10 GiB 默认值。A3/PPU 的规范化 OCI、XPU 除二进制 hostPath 外的 Deployment spec 均一致；PPU 保留 proxy 4 GiB、switch 512 MiB、2 CPU、只读根目录及 uid 65532。
+
+新平台回放在 test2/test3 的一次性容器中运行。两台 worker 的 IP 仅获 DCU/XPU/A3 proxy TCP 18084 来源规则，18082 未向其开放；持久化入口为原访问控制 unit 的 ExecStartPost。PPU 发压 proxy 使用 60013，旧 replay 为 60014。实际 proxy 的 Router、service_id、config_digest 及两个签名验证密钥已核对，回放镜像在两节点通过真实 Docker/NAS 和模拟模型验收。
+
+DCU 的七个旧保留片段共 34,862 个原始文件、2,804,618,924 bytes。首片段已由 test1 发布；按用户指示临时挂载 NAS，使用四线程经本机认证 switch 接口导出其余六片段，并复核首片段，完成来源与 NAS 逐文件哈希校验、持久化和原子发布。平台已接管，全部 saved/local_released=true，原始文件保留。暂存阶段约 55.5 秒，停止 engine 后七片段完整校验与发布约 75.84 秒。临时挂载已正常卸载，未写 fstab。旧 runs 的 72 文件、28,585,563 bytes 已迁入 NAS 并完整核验，历史产品报告可读。
+
+四处旧 replay 确认空闲后停止：DCU/XPU unit inactive/masked，A3/PPU 容器 restart.policy=no、restart.status=stopped；18085（PPU 60014）无任何地址监听。停止容器的 nerdctl NetNS 警告与陈旧 PID 已通过进程不存在、容器非运行和端口关闭证据核实，未重启旧服务。原容器、数据、历史登记和私有 unit 备份保留。恢复原 Router/配置版本后，DCU/XPU/A3 revision=54/35/55、admission=true，PPU revision=10、admission=false。两条原录制计划恢复，平台 maintenance=false、health 全组件 ok、容量新鲜、无资源锁或未完成控制操作。
+
+新增发布根目录：dcu1 `/data4/aigate/releases/nas-main-20261019/`；xpu1、A3-gate `/var/lib/ai-gate/releases/nas-main-20261019/`；ppu `/home/wqy/aigate/releases/nas-main-20261019/`，与 `/bmcp_lvm_fs/aigate` 为同一部署数据。各含 bin/、private/ 及脱敏 verification.json、replay-retired.json。DCU 另有新建临时挂载点 `nas/`，现为空且未挂载，卸载回执为 temporary-nas-unmounted.json。DCU 两个 zzzzzz-nas-main-20261019.conf 写入既有 unit.d 目录；没有新建 systemd 目录。原程序、停止容器、配置和数据保留，不回退。平台镜像、完整迁移与窗口完成证据详见[平台发布记录](../../code-eval/deploy/releases/README.md#nas-main-20261019)。
+
 ## 2026-10-19 00:46 回放器重启中断不再生成报告
 
 DCU、XPU、A3、PPU 的 aigate-replay 已部署 `0de4f2a2fd0189d1f46ce528bdedd203614c776f`。重启恢复保留状态与原始结果，不生成性能报告；报告读取也不返回旧缓存或重建报告。普通失败、主动停止和重启前已完成的任务保持原有规则。配套 code-eval engine/Web 发布 `a0ff6eb5c05251c6d97d23fad1af10ad1f74a491`，同时上线重启确认、安全收尾及报告隐藏。
