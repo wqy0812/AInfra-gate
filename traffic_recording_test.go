@@ -583,14 +583,14 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	recordRoot := t.TempDir()
 	root := filepath.Join(recordRoot, "g1")
 	writeStoredSession(t, root, "old", "ended")
-	writeStoredSegment(t, root, "old", "20260101T0000", 4000, false)
-	writeStoredSegment(t, root, "old", "20260101T0030", 4000, true)
-	writeStoredSegment(t, root, "old", "20260101T0100", 4000, false)
+	writeStoredSegment(t, root, "old", "20990101T0000", 4000, false)
+	writeStoredSegment(t, root, "old", "20990101T0030", 4000, true)
+	writeStoredSegment(t, root, "old", "20990101T0100", 4000, false)
 	writeStoredSession(t, root, "crashed", "recording")
-	if err := os.MkdirAll(filepath.Join(root, "crashed", "20260102T0000"), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, "crashed", "20990102T0000"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	os.WriteFile(filepath.Join(root, "crashed", "20260102T0000", "index.jsonl"), []byte("{}\n{}\n"), 0600)
+	os.WriteFile(filepath.Join(root, "crashed", "20990102T0000", "index.jsonl"), []byte("{}\n{}\n"), 0600)
 	r, err := newTrafficRecorder(recordRoot, "g1", "boot", 9000, nil, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -598,17 +598,21 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	var session recordingSessionFile
 	readJSONFile(t, filepath.Join(root, "crashed", "session.json"), &session)
 	var segment recordingSegmentFile
-	readJSONFile(t, filepath.Join(root, "crashed", "20260102T0000", "segment.json"), &segment)
+	readJSONFile(t, filepath.Join(root, "crashed", "20990102T0000", "segment.json"), &segment)
 	if session.State != "ended" || session.EndReason != "end_unknown" || segment.State != "end_unknown" || segment.Recorded != 2 {
 		t.Fatalf("recovery %+v %+v", session, segment)
 	}
-	// Over capacity at boot: the next maintenance pass evicts the oldest
+	// Startup does not catch up. An explicit scheduled maintenance pass evicts the oldest
 	// unpinned sealed segments and keeps the pinned one.
 	r.flush()
-	if _, err := os.Stat(filepath.Join(root, "old", "20260101T0000")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0000")); err != nil {
+		t.Fatal("startup evicted before daily maintenance", err)
+	}
+	r.maintainStorage()
+	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0000")); !os.IsNotExist(err) {
 		t.Fatal("oldest segment kept", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "old", "20260101T0030")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0030")); err != nil {
 		t.Fatal("pinned segment evicted", err)
 	}
 	r.mu.Lock()
@@ -619,7 +623,7 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	}
 	// Unpin and pin through the worker.
 	done := make(chan error, 1)
-	if err := r.pinLocked("old", "20260101T0030", false, func(e error) { done <- e }); err != nil || <-done != nil {
+	if err := r.pinLocked("old", "20990101T0030", false, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("unpin", err)
 	}
 	if err := r.pinLocked("old", "20991231T2330", true, func(e error) { done <- e }); err != nil {
@@ -627,18 +631,21 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	} else if e := <-done; e == nil || e.Error() != "segment_not_found" {
 		t.Fatal(e)
 	}
+	if err := r.pinLocked("old", "20990101T0030", true, func(e error) { done <- e }); err != nil || <-done != nil {
+		t.Fatal("pin before restart", err)
+	}
 	r.close("process_exit")
-	// Pinned segments filling the capacity block new sessions.
+	// Pinned exports may temporarily exceed the soft capacity.
 	r2, err := newTrafficRecorder(recordRoot, "g1", "boot2", 10, nil, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r2.close("process_exit")
-	if err := r2.pinLocked("old", "20260101T0030", true, func(e error) { done <- e }); err != nil || <-done != nil {
+	if err := r2.pinLocked("old", "20990101T0030", true, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("pin", err)
 	}
 	r2.flush()
-	if _, err := os.Stat(filepath.Join(root, "old", "20260101T0100")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "old", "20990101T0100")); !os.IsNotExist(err) {
 		t.Fatal("unpinned segment kept over capacity", err)
 	}
 	now := time.Now()
@@ -646,7 +653,7 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	if err := p.normalize(10, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := r2.startLocked(p, now, func(error) {}); err == nil || err.Error() != "capacity_reserved" {
+	if err := r2.startLocked(p, now, func(error) {}); err != nil {
 		t.Fatal(err)
 	}
 }

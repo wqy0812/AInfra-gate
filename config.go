@@ -15,13 +15,14 @@ import (
 // local configuration file.
 // Deployment paths and the Router snapshot are supplied separately.
 type RuntimeSettings struct {
-	TimeoutSeconds          float64           `json:"timeout_seconds"`
-	DiscoveryTimeoutSeconds float64           `json:"discovery_timeout_seconds"`
-	ModelCacheSeconds       float64           `json:"model_cache_seconds"`
-	DiscoveryRetrySeconds   float64           `json:"discovery_retry_seconds"`
-	HTTPPool                PoolConfig        `json:"http_pool"`
-	Profile                 ProfileConfig     `json:"profile"`
-	SlowRequests            SlowRequestConfig `json:"slow_requests"`
+	StreamCaptureMaxDiskBytes int64             `json:"stream_capture_max_disk_bytes,omitempty"`
+	TimeoutSeconds            float64           `json:"timeout_seconds"`
+	DiscoveryTimeoutSeconds   float64           `json:"discovery_timeout_seconds"`
+	ModelCacheSeconds         float64           `json:"model_cache_seconds"`
+	DiscoveryRetrySeconds     float64           `json:"discovery_retry_seconds"`
+	HTTPPool                  PoolConfig        `json:"http_pool"`
+	Profile                   ProfileConfig     `json:"profile"`
+	SlowRequests              SlowRequestConfig `json:"slow_requests"`
 }
 
 // RuntimeConfig belongs to one immutable Router generation. Switching is owned
@@ -95,6 +96,9 @@ func parseRuntimeSettings(data []byte) (RuntimeSettings, error) {
 }
 
 func (c *RuntimeConfig) validate() error {
+	if c.StreamCaptureMaxDiskBytes < 0 {
+		return fmt.Errorf("invalid stream capture disk limit")
+	}
 	if err := c.SlowRequests.validate(); err != nil {
 		return err
 	}

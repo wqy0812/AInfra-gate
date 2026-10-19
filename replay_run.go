@@ -226,7 +226,7 @@ func (r *replayRun) execute(ctx context.Context) {
 			r.segmentFiles = append(r.segmentFiles, f)
 		}
 	}
-	plan, err := buildReplayPlan(r.svc.recordRoot, r.req)
+	plan, err := buildReplayPlan(r.svc.recordRoot, r.req, r.svc.taskInputs)
 	if err != nil {
 		if plan != nil {
 			r.mu.Lock()

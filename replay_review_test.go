@@ -122,6 +122,7 @@ func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
 	recorder.maxBytes = 1
 	recorder.mu.Unlock()
 	recorder.flush()
+	recorder.maintainStorage()
 	path := filepath.Join(rec.root, "g1", "rec-evict", summary.Segments[0].Segment)
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal("active input evicted", err)
@@ -130,6 +131,7 @@ func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
 	f.wait(t, req.RunID)
 	recordingCommand(t, rec.c, "record-unpin", map[string]any{"recording_id": "rec-evict", "segment": summary.Segments[0].Segment})
 	recorder.flush()
+	recorder.maintainStorage()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("finished replay still prevented eviction", err)
 	}

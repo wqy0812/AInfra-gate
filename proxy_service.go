@@ -137,7 +137,7 @@ func prepareProxyGateway(cfg ProxyConfig, dataRoot string, audit io.Writer, chec
 		}
 		// Detail capture has its own queue, lock and disk budget. Failure must not
 		// disable the existing summary store or refuse business admission.
-		g.captures, err = newStreamCaptureStore(filepath.Join(dataRoot, "stream-incidents", "requests"), p.id, p.router, p.boot, g.audit)
+		g.captures, err = newStreamCaptureStore(filepath.Join(dataRoot, "stream-incidents", "requests"), p.id, p.router, p.boot, g.audit, settings.StreamCaptureMaxDiskBytes)
 		if err != nil {
 			g.audit.Print(`{"event":"stream_capture_storage_unavailable"}`)
 		}
@@ -150,6 +150,8 @@ func (p *ProxyGateway) retain() {
 	defer close(p.done)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	maintenanceDone := dailyArchiveMaintenance(p.stop, p.maintainInactiveStorage)
+	defer func() { <-maintenanceDone }()
 	for {
 		protected := map[string]bool{}
 		if p.g.profile != nil {
@@ -165,12 +167,12 @@ func (p *ProxyGateway) retain() {
 			bytes int64
 		}{
 			{"request-profile", false, p.settings.Profile.RetentionHours, p.settings.Profile.MaxDiskBytes},
-			{"slow-requests", true, p.settings.SlowRequests.RetentionHours, p.settings.SlowRequests.MaxDiskBytes},
 		} {
 			if err := cleanObservationRoot(filepath.Join(p.dataRoot, item.dir), item.slow, time.Now(), item.hours, item.bytes, protected); err != nil {
 				p.g.audit.Print(string(encodeJSON(map[string]any{"event": "observation_retention_error", "error": err.Error()})))
 			}
 		}
+
 		select {
 		case <-p.stop:
 			return
@@ -361,4 +363,30 @@ func (p *ProxyGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set(headerRoute, strconv.FormatUint(meta.revision, 10))
 	w.Header().Set("X-Aigate-Config-Digest", p.digest)
 	p.g.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), runtimeRequestKey{}, meta)))
+}
+
+func (p *ProxyGateway) maintainInactiveStorage(now time.Time) {
+	if p.g.slow == nil {
+		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "slow-requests"), now, p.settings.SlowRequests.MaxDiskBytes, func() error {
+			return recoverSlowDirectories(filepath.Join(p.dataRoot, "slow-requests"), true)
+		}); err != nil {
+			p.g.audit.Printf("slow_archive_failed: %v", err)
+		}
+	}
+	if p.g.captures == nil {
+		budget := p.settings.StreamCaptureMaxDiskBytes
+		if budget <= 0 {
+			budget = streamCaptureDisk
+		}
+		if err := maintainInactiveDiagnostics(filepath.Join(p.dataRoot, "stream-incidents", "requests"), now, budget, func() error {
+			root := filepath.Join(p.dataRoot, "stream-incidents", "requests")
+			if _, err := os.Stat(root); os.IsNotExist(err) {
+				return nil
+			}
+			store := &streamCaptureStore{root: root, serviceID: p.id, routerID: p.router, stored: map[string]*captureStored{}, maxDisk: budget}
+			return store.recoverStored(now)
+		}); err != nil {
+			p.g.audit.Printf("capture_archive_failed: %v", err)
+		}
+	}
 }

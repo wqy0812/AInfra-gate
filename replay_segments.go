@@ -3,6 +3,7 @@ package aigate
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // The service admits only one batch. Its target runs share one filesystem lock
@@ -13,13 +14,22 @@ type replaySegmentLease struct {
 }
 
 func (s *replayService) acquireSegment(path string) (*os.File, error) {
+	if s.taskMode {
+		relative, err := filepath.Rel(s.recordRoot, path)
+		if err != nil || !s.taskInputs[filepath.ToSlash(relative)] {
+			return nil, fmt.Errorf("segment_not_saved")
+		}
+		return nil, nil // Immutable NAS inputs are protected by platform references.
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if lease := s.segments[path]; lease != nil {
 		lease.refs++
 		return lease.file, nil
 	}
-	f, err := os.Open(path)
+	var f *os.File
+	var err error
+	f, err = os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("segment_not_found")
 	}
@@ -32,6 +42,9 @@ func (s *replayService) acquireSegment(path string) (*os.File, error) {
 }
 
 func (s *replayService) releaseSegmentLocked(f *os.File) {
+	if f == nil {
+		return
+	}
 	lease := s.segments[f.Name()]
 	lease.refs--
 	if lease.refs == 0 {

@@ -56,6 +56,8 @@ func readReplayTargets(path string) (map[string]string, error) {
 }
 
 type replayService struct {
+	taskInputs  map[string]bool
+	taskMode    bool
 	key         string
 	cidrs       []netip.Prefix
 	recordRoot  string
@@ -80,7 +82,7 @@ type replayService struct {
 	wg        sync.WaitGroup
 }
 
-func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot string, targets map[string]string, markKey []byte, audit io.Writer) (*replayService, error) {
+func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot string, targets map[string]string, markKey []byte, audit io.Writer, taskMode ...bool) (*replayService, error) {
 	if len(key) < 32 || len(cidrs) == 0 || len(markKey) < replayMarkMinBytes || recordRoot == "" || dataRoot == "" || len(targets) == 0 {
 		return nil, fmt.Errorf("control key (32+ bytes), replay mark key (32+ bytes), allowed CIDRs, record root, data root and targets are required")
 	}
@@ -91,7 +93,14 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 	if err := os.MkdirAll(runs, 0700); err != nil {
 		return nil, err
 	}
-	directory, err := os.Open(dataRoot)
+	task := len(taskMode) > 0 && taskMode[0]
+	var directory *os.File
+	var err error
+	if task {
+		directory, err = os.OpenFile(filepath.Join(dataRoot, ".replay.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	} else {
+		directory, err = os.Open(dataRoot)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +111,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 4096, IdleConnTimeout: 90 * time.Second, DisableCompression: true}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &replayService{key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
+	s := &replayService{taskMode: task, key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
 		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, openResults: func(path string) (replayResultFile, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{}, active: map[string]*replayRun{}, reporting: map[string]int{}, segments: map[string]*replaySegmentLease{},
@@ -154,6 +163,9 @@ func (s *replayService) recover() error {
 // Callers hold s.mu or run before the service starts. Never remove the active
 // run when recording a stop that arrived before its start.
 func (s *replayService) pruneRuns(keep int) error {
+	if s.taskMode {
+		return nil
+	}
 	root := filepath.Join(s.dataRoot, "runs")
 	entries, err := os.ReadDir(root)
 	if err != nil {

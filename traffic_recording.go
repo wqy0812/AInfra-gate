@@ -30,7 +30,7 @@ const (
 	recordingMemory          = int64(64 << 20)
 	recordingHandles         = 1024
 	recordingQueue           = 1024
-	recordingDefaultMaxBytes = int64(50 << 30)
+	recordingDefaultMaxBytes = int64(10 << 30)
 	recordingTimelineEvents  = 8192
 	recordingEventBlock      = 128
 	recordingEventCharge     = int64(64)
@@ -83,9 +83,6 @@ func (p *recordingParams) normalize(limit int64, now time.Time) error {
 	}
 	if p.SampleOneIn > recordingMaxSampleOneIn {
 		return fmt.Errorf("invalid_sample_rate")
-	}
-	if p.MaxBytes == 0 {
-		p.MaxBytes = limit
 	}
 	if p.MaxBytes < 0 || p.MaxBytes > limit {
 		return fmt.Errorf("invalid_max_bytes")
@@ -744,17 +741,18 @@ type trafficRecorder struct {
 	directory             *os.File
 	now                   func() time.Time
 
-	mu          sync.Mutex
-	sessions    []*recordingSession
-	finished    []*recordingSession
-	used        int64
-	active      int
-	closing     bool
-	exited      bool
-	diskBytes   int64
-	pinnedBytes int64
-	dropped     uint64
-	failures    uint64
+	maintenanceMu sync.Mutex
+	mu            sync.Mutex
+	sessions      []*recordingSession
+	finished      []*recordingSession
+	used          int64
+	active        int
+	closing       bool
+	exited        bool
+	diskBytes     int64
+	pinnedBytes   int64
+	dropped       uint64
+	failures      uint64
 
 	queue    chan *recordingSnapshot
 	control  chan recordingControlJob
@@ -762,7 +760,7 @@ type trafficRecorder struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// Worker-only state.
+	// Stored accounting is protected by mu; session metadata belongs to the writer.
 	stored       map[string]*recordingStoredSegment
 	sessionBytes map[string]int64
 	writeJSON    func(string, string, any) (int64, error)
@@ -867,7 +865,7 @@ func recordingReadSmall(path string) ([]byte, error) {
 
 func recordingTreeBytes(path string) (int64, error) {
 	var total int64
-	err := filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+	err := walkArchiveFiles(path, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -899,6 +897,9 @@ func (r *trafficRecorder) recover() error {
 		if data, err := recordingReadSmall(filepath.Join(dir, "session.json")); err != nil || json.Unmarshal(data, &session) != nil || session.RecordingID != entry.Name() {
 			r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_recover_skipped", "recording_id": entry.Name()})))
 			continue
+		}
+		if err := recoverStorageDeletes(dir); err != nil {
+			return err
 		}
 		segments, err := os.ReadDir(dir)
 		if err != nil {
@@ -1077,9 +1078,6 @@ func (r *trafficRecorder) startLocked(p recordingParams, now time.Time, done fun
 			return fmt.Errorf("recording_active")
 		}
 	}
-	if r.pinnedBytes >= r.maxBytes {
-		return fmt.Errorf("capacity_reserved")
-	}
 	s := &recordingSession{params: p, created: now, segments: map[time.Time]*recordingSegmentState{}}
 	select {
 	case r.control <- recordingControlJob{create: s, done: done}:
@@ -1221,6 +1219,9 @@ func (r *trafficRecorder) run() {
 	defer close(r.done)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	maintenanceStop := make(chan struct{})
+	maintenanceDone := dailyArchiveMaintenance(maintenanceStop, func(time.Time) { r.maintainStorage() })
+	defer func() { close(maintenanceStop); <-maintenanceDone; unlockState(r.directory); r.directory.Close() }()
 	for {
 		select {
 		case snapshot := <-r.queue:
@@ -1275,8 +1276,6 @@ func (r *trafficRecorder) drain() {
 		break
 	}
 	r.maintain(true)
-	unlockState(r.directory)
-	r.directory.Close()
 }
 
 func (r *trafficRecorder) sessionDir(id string) string { return filepath.Join(r.root, id) }
@@ -1339,8 +1338,24 @@ func (r *trafficRecorder) removeSessionLocked(s *recordingSession) {
 }
 
 func (r *trafficRecorder) pin(id, name string, pin bool) error {
+	storageLeaseMu.Lock()
+	defer storageLeaseMu.Unlock()
+	if _, e := os.Stat(filepath.Join(r.sessionDir(id), name, deleteMarker)); e == nil {
+		return errStorageDeleting
+	}
 	key := id + "/" + name
+	directory, err := os.Open(filepath.Join(r.sessionDir(id), name))
+	if err != nil {
+		return fmt.Errorf("segment_not_found")
+	}
+	defer directory.Close()
+	if err = lockState(directory); err != nil {
+		return fmt.Errorf("segment_busy")
+	}
+	defer unlockState(directory)
+	r.mu.Lock()
 	stored := r.stored[key]
+	r.mu.Unlock()
 	if stored == nil {
 		return fmt.Errorf("segment_not_found")
 	}
@@ -1504,18 +1519,16 @@ func (r *trafficRecorder) write(snapshot *recordingSnapshot) {
 		r.stored[key] = stored
 	}
 	stored.bytes += written
-	if s.bytes >= s.params.MaxBytes {
+	if s.params.MaxBytes > 0 && s.bytes >= s.params.MaxBytes {
 		r.stopSessionLocked(s, r.now(), "max_bytes")
 	}
 	r.mu.Unlock()
-	r.evict()
 }
 
 // evict removes whole sealed, unpinned segments, oldest first. The open
-// segments of a live session are never removed; if they alone exceed the
-// capacity, sampling stops.
+// segments of a live session are never removed; the quota can remain exceeded.
 func (r *trafficRecorder) evict() {
-	r.removeEmptySessions()
+	defer r.removeEmptySessions()
 	r.mu.Lock()
 	over := r.diskBytes > r.maxBytes
 	r.mu.Unlock()
@@ -1523,11 +1536,19 @@ func (r *trafficRecorder) evict() {
 		return
 	}
 	candidates := []*recordingStoredSegment{}
+	r.mu.Lock()
+	projected := r.diskBytes
 	for _, v := range r.stored {
 		if v.sealed && !v.pinned {
-			candidates = append(candidates, v)
+			if _, err := os.Stat(filepath.Join(r.sessionDir(v.recording), v.name, deleteMarker)); err == nil {
+				projected -= v.bytes
+				continue
+			}
+			copy := *v
+			candidates = append(candidates, &copy)
 		}
 	}
+	r.mu.Unlock()
 	sort.Slice(candidates, func(i, j int) bool {
 		if !candidates[i].start.Equal(candidates[j].start) {
 			return candidates[i].start.Before(candidates[j].start)
@@ -1536,27 +1557,24 @@ func (r *trafficRecorder) evict() {
 	})
 	for _, v := range candidates {
 		r.mu.Lock()
-		over = r.diskBytes > r.maxBytes
+		over = projected > r.maxBytes
 		r.mu.Unlock()
 		if !over {
 			return
 		}
 		path := filepath.Join(r.sessionDir(v.recording), v.name)
-		directory, err := os.Open(path)
-		if err != nil {
+		if err := markStorageDelete(path); err != nil {
 			continue
 		}
-		if err := lockState(directory); err != nil {
-			directory.Close()
+		projected -= v.bytes
+		if err := finishStorageDelete(path); err != nil {
+			r.audit.Printf("recording_delete_failed: %v", err)
 			continue
 		}
-		err = os.RemoveAll(path)
-		unlockState(directory)
-		directory.Close()
-		if err != nil {
-			r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_evict_failed", "segment": v.key, "error": err.Error()})))
+		if _, err := os.Stat(path); err == nil {
 			continue
 		}
+
 		r.mu.Lock()
 		r.diskBytes -= v.bytes
 		delete(r.stored, v.key)
@@ -1568,16 +1586,7 @@ func (r *trafficRecorder) evict() {
 			}
 		}
 		r.mu.Unlock()
-		r.removeEmptySessions()
 		r.audit.Print(string(encodeJSON(map[string]any{"event": "recording_segment_evicted", "segment": v.key, "bytes": v.bytes})))
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.diskBytes > r.maxBytes {
-		now := r.now()
-		for _, s := range r.sessions {
-			r.stopSessionLocked(s, now, "capacity")
-		}
 	}
 }
 
@@ -1585,12 +1594,12 @@ func (r *trafficRecorder) evict() {
 // input left. Remove its metadata as well so empty directories cannot grow
 // forever. The platform keeps its own history of completed schedules.
 func (r *trafficRecorder) removeEmptySessions() {
-	keep := map[string]bool{}
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	keep := map[string]bool{}
 	for _, s := range r.sessions {
 		keep[s.params.RecordingID] = true
 	}
-	r.mu.Unlock()
 	for _, seg := range r.stored {
 		keep[seg.recording] = true
 	}
@@ -1602,9 +1611,7 @@ func (r *trafficRecorder) removeEmptySessions() {
 			continue
 		}
 		delete(r.sessionBytes, id)
-		r.mu.Lock()
 		r.diskBytes -= size
-		r.mu.Unlock()
 	}
 }
 
@@ -1738,7 +1745,6 @@ func (r *trafficRecorder) maintain(closing bool) {
 		}
 		r.mu.Unlock()
 	}
-	r.evict()
 }
 
 // flush waits until queued work and maintenance have run once (tests only).

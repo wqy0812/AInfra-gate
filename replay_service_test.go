@@ -92,6 +92,7 @@ func recordSample(t *testing.T, f *recordingFixture, id string, n int) recording
 	for _, segment := range summary.Segments {
 		recordingCommand(t, f.c, "record-pin", map[string]any{"recording_id": id, "segment": segment.Segment})
 	}
+	f.c.recorder.flush()
 	return summary
 }
 

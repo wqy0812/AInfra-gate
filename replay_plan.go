@@ -232,7 +232,9 @@ type replayPlan struct {
 // replaySegmentStatus is the metadata the platform lists for each segment.
 type replaySegmentStatus struct {
 	recordingSegmentFile
-	Pinned bool `json:"pinned"`
+	Pinned      bool  `json:"pinned"`
+	Compressed  bool  `json:"compressed,omitempty"`
+	StoredBytes int64 `json:"stored_bytes,omitempty"`
 }
 
 func readRecordingSession(root, gateway, recording string) (recordingSessionFile, error) {
@@ -260,8 +262,13 @@ func readRecordingSegment(root, gateway, recording, name string) (replaySegmentS
 	if err != nil || json.Unmarshal(data, &out.recordingSegmentFile) != nil || out.Segment != name {
 		return out, fmt.Errorf("segment_invalid")
 	}
+	if _, err := os.Stat(filepath.Join(dir, deleteMarker)); err == nil {
+		out.State = "deleting"
+		return out, nil
+	}
 	_, pinErr := os.Stat(filepath.Join(dir, "pinned"))
 	out.Pinned = pinErr == nil
+
 	return out, nil
 }
 
@@ -278,14 +285,14 @@ func copyableHeaders(headers map[string]string) map[string]string {
 // buildReplayPlan selects sealed segments and orders requests by arrival.
 // Segments are concatenated in time order by their covered durations, so
 // contiguous segments keep real time and gaps between distant ones collapse.
-func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
+func buildReplayPlan(root string, req replayRequest, saved ...map[string]bool) (*replayPlan, error) {
 	if len(req.Recordings) > 0 {
 		merged := &replayPlan{Schema: recordingSchema, RunID: req.RunID, Excluded: map[string]int{}, Rewritten: req.rewritten(), OriginalBytes: len(req.rewritten()) == 0}
 		for _, ref := range req.Recordings {
 			one := req
 			one.Recordings = nil
 			one.Recording = ref
-			plan, err := buildReplayPlan(root, one)
+			plan, err := buildReplayPlan(root, one, saved...)
 			if err != nil {
 				return nil, err
 			}
@@ -307,12 +314,15 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		return merged, nil
 	}
 
-	session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
-	if err != nil {
-		return nil, err
-	}
-	if session.Schema != recordingSchema {
-		return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+	task := len(saved) > 0 && saved[0] != nil
+	if !task {
+		session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
+		if err != nil {
+			return nil, err
+		}
+		if session.Schema != recordingSchema {
+			return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
+		}
 	}
 	plan := &replayPlan{Schema: recordingSchema, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
 		Excluded: map[string]int{}, Rewritten: req.rewritten(), Segments: []replayPlanSegment{}}
@@ -329,7 +339,11 @@ func buildReplayPlan(root string, req replayRequest) (*replayPlan, error) {
 		if status.State != "sealed" {
 			return nil, fmt.Errorf("segment_not_sealed")
 		}
-		if !status.Pinned {
+		if task {
+			if !saved[0][req.Recording.GatewayID+"/"+req.Recording.RecordingID+"/"+name] {
+				return nil, fmt.Errorf("segment_not_saved")
+			}
+		} else if !status.Pinned {
 			return nil, fmt.Errorf("segment_not_retained")
 		}
 		segments = append(segments, status)

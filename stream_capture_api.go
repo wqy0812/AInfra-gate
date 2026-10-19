@@ -75,13 +75,6 @@ func (s *streamCaptureStore) evidenceMeta(id string) (streamCaptureMeta, error) 
 	if err != nil || len(raw) > captureMetaLimit || json.Unmarshal(raw, &meta) != nil || meta.Schema != 1 || meta.RequestID != id || !meta.Retained || meta.ServiceID != s.serviceID || meta.RouterID != s.routerID {
 		return meta, errors.New("invalid capture metadata")
 	}
-	retainedAt := meta.StartedAt
-	if meta.TriggeredAt != nil {
-		retainedAt = *meta.TriggeredAt
-	}
-	if meta.CaptureState != "recording" && retainedAt.Before(time.Now().Add(-s.retention)) {
-		return meta, os.ErrNotExist
-	}
 	return meta, nil
 }
 
@@ -130,6 +123,18 @@ func (s *streamCaptureStore) serveEvidence(w http.ResponseWriter, r *http.Reques
 		fail(400, "invalid_capture_query")
 		return
 	}
+	lease, leaseErr := acquireStorageRead(filepath.Join(s.root, "request-"+id))
+	if leaseErr != nil {
+		if errors.Is(leaseErr, errStorageDeleting) {
+			fail(410, "capture_deleting")
+		} else if os.IsNotExist(leaseErr) {
+			fail(404, "capture_not_retained")
+		} else {
+			fail(503, "capture_unavailable")
+		}
+		return
+	}
+	defer lease.Close()
 	q := r.URL.Query()
 	part := q.Get("part")
 	if len(q.Get("snapshot")) > 4096 || (part != "" && part != "request" && part != "response") {

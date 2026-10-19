@@ -199,8 +199,8 @@ func TestEvidenceReplacementExpiryAndCleanup(t *testing.T) {
 	meta.StartedAt = time.Now().Add(-100 * time.Hour)
 	raw, _ := json.Marshal(meta)
 	os.WriteFile(filepath.Join(dir, "meta.json"), raw, 0600)
-	if w := evidenceQuery(s, id, nil); w.Code != 404 {
-		t.Fatalf("expiry: %d", w.Code)
+	if w := evidenceQuery(s, id, nil); w.Code != 200 {
+		t.Fatalf("old retained evidence unavailable: %d", w.Code)
 	}
 	now := time.Now()
 	meta.TriggeredAt = &now
