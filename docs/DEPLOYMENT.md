@@ -22,6 +22,16 @@ DCU 的七个旧保留片段共 34,862 个原始文件、2,804,618,924 bytes。�
 
 新增发布根目录：dcu1 `/data4/aigate/releases/nas-main-20261019/`；xpu1、A3-gate `/var/lib/ai-gate/releases/nas-main-20261019/`；ppu `/home/wqy/aigate/releases/nas-main-20261019/`，与 `/bmcp_lvm_fs/aigate` 为同一部署数据。各含 bin/、private/ 及脱敏 verification.json、replay-retired.json。DCU 另有新建临时挂载点 `nas/`，现为空且未挂载，卸载回执为 temporary-nas-unmounted.json。DCU 两个 zzzzzz-nas-main-20261019.conf 写入既有 unit.d 目录；没有新建 systemd 目录。原程序、停止容器、配置和数据保留，不回退。平台镜像、完整迁移与窗口完成证据详见[平台发布记录](../../code-eval/deploy/releases/README.md#nas-main-20261019)。
 
+## 2026-10-19 10:58 A3 网关迁回原节点
+
+A3 switch、proxy、replay 已从 `hwA3-1` 迁回 `A3-gate（122.52.5.131）`，继续使用 containerd + nerdctl、namespace `ai-gateway`、restart=unless-stopped。业务 `9090/v1`、控制 `18083`、proxy `18084`、replay `18085`、诊断/指标 `18082` 恢复原地址。模型/P/D 留在现有节点，proxy 后端使用 `122.209.21.24:8077`。源节点三个网关容器已停止并禁止自动重启，历史文件保留。
+
+当前 switch/proxy 源码仍为 `9cb5626dcd5a49be690b3bf86fd3bac421d285eb`，replay 仍为 `0de4f2a2fd0189d1f46ce528bdedd203614c776f`，改用已验证的对应 amd64 产物。实际 SHA-256 分别为 `3284d5bb98f67ce568882a8df068d0f29f820ef63aadb10f1693a54f8b086013`、`7c63090662081c7db271868bb7f04aa2e83d1a49b28214a2be1628207ac8fe55`、`caa2bdf030ab99470bc83cb7444f7067a4b455076b8ce4e7c70c9942fe5c019f`。基础镜像保留，通过只读程序挂载运行上述版本，镜像标签不代表当前程序源码。
+
+两个完整固定请求门禁均通过（31.707 / 22.996 秒），9 项原绑定校验及业务 SSE 冒烟通过；Router 版本 7、binding revision 52、admission=true，平台 maintenance=false。迁移数据 3,573 个条目核验通过。监控采集与自动探针正常；DCU replay 仅更新 A3 目标引用并重启同版本，XPU 无需修改。
+
+新增服务器根目录及完整证据索引见 [迁回记录](../../environment/A3/changes/20261019-aigate-relocate-back/README.md)。原始门禁响应保留在 A3-gate `/var/lib/ai-gate/releases/relocate-back-20261019/private/gate/`，不进入 Git。以下各节为历史部署记录，涉及 A3 宿主和架构时以本节为准。
+
 ## 2026-10-19 00:46 回放器重启中断不再生成报告
 
 DCU、XPU、A3、PPU 的 aigate-replay 已部署 `0de4f2a2fd0189d1f46ce528bdedd203614c776f`。重启恢复保留状态与原始结果，不生成性能报告；报告读取也不返回旧缓存或重建报告。普通失败、主动停止和重启前已完成的任务保持原有规则。配套 code-eval engine/Web 发布 `a0ff6eb5c05251c6d97d23fad1af10ad1f74a491`，同时上线重启确认、安全收尾及报告隐藏。
