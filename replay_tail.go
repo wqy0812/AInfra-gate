@@ -2,9 +2,6 @@ package aigate
 
 import "time"
 
-const replayPerformanceCapability = "replay-performance-v2"
-const replaySourceConcurrencyCapability = "recording-concurrency-per-source-v1"
-
 type replayTruncation struct {
 	At        time.Time `json:"at"`
 	Elapsed   float64   `json:"elapsed_seconds"`
@@ -23,10 +20,8 @@ func replayTailEligible(mode string, concurrency int, duration, elapsed float64,
 	return mode == "concurrency" && float64(inflight) < float64(concurrency)/2
 }
 
-// Coordinators check the combined in-flight count before calling each source.
-// Once dispatch is complete, that count only decreases; a stale observation
-// cannot cancel work before the threshold. Natural completion wins at zero.
-func (r *replayRun) truncateTail(coordinated bool) (replayRunView, int, string) {
+// The task owns the complete target and applies its combined tail threshold.
+func (r *replayRun) truncateTail() (replayRunView, int, string) {
 	r.mu.Lock()
 	if r.ended != nil || r.truncation != nil {
 		v := r.viewLocked()
@@ -35,9 +30,6 @@ func (r *replayRun) truncateTail(coordinated bool) (replayRunView, int, string) 
 	}
 	n := r.inflight.Load()
 	eligible := r.plan != nil && replayTailEligible(r.req.Mode, r.req.tailConcurrency(), r.plan.DurationSeconds, time.Since(r.begin).Seconds(), r.plan.Planned, r.sent.Load(), n)
-	if coordinated && r.req.CoordinatedTruncation && r.req.Mode == "timed" && r.plan != nil {
-		eligible = r.sent.Load() == int64(r.plan.Planned) && time.Since(r.begin).Seconds() > r.plan.DurationSeconds && n <= 5
-	}
 	if !r.req.AutoTruncate || r.state != "running" || r.truncateCancel == nil || !eligible {
 		v := r.viewLocked()
 		r.mu.Unlock()
@@ -72,7 +64,7 @@ func (r *replayRun) watchTail(done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			r.truncateTail(false)
+			r.truncateTail()
 		}
 	}
 }

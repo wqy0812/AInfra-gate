@@ -8,23 +8,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 type replayTaskInput struct {
-	BootID    string            `json:"boot_id"`
-	Targets   map[string]string `json:"targets"`
-	Digests   map[string]string `json:"digests"`
-	Request   replayRequest     `json:"request"`
-	Execution map[string]any    `json:"execution"`
-	PlanID    string            `json:"plan_id"`
+	BootID     string               `json:"boot_id"`
+	Targets    map[string]string    `json:"targets"`
+	Digests    map[string]string    `json:"digests"`
+	Recordings []replayRecordingRef `json:"recordings,omitempty"`
+	Request    replayRequest        `json:"request"`
+	Execution  map[string]any       `json:"execution"`
+	PlanID     string               `json:"plan_id"`
 }
 
 func RunReplayTask(args []string) error {
@@ -37,14 +36,11 @@ func RunReplayTask(args []string) error {
 		return e
 	}
 	var input replayTaskInput
-	if e = json.Unmarshal(raw, &input); e != nil {
+	if e = strictDecode(raw, &input); e != nil {
 		return e
 	}
 	if !validOperationID(input.BootID) || !validOperationID(input.PlanID) || len(input.Targets) != 1 || len(input.Digests) == 0 {
 		return fmt.Errorf("invalid task identity")
-	}
-	if input.Request.PrepareOnly || input.Request.BatchID != "" || input.Request.CoordinatedTruncation {
-		return fmt.Errorf("task cannot use service coordination")
 	}
 	if e = input.Request.normalize(); e != nil {
 		return e
@@ -92,7 +88,7 @@ func RunReplayTask(args []string) error {
 	if e = syncDirectory(root); e != nil {
 		return e
 	}
-	service, e := newReplayService(strings.Repeat("t", 32), []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}, inputRoot, filepath.Join(root, "results"), input.Targets, []byte(key), os.Stderr, true)
+	service, e := newReplayExecutor(inputRoot, filepath.Join(root, "results"), input.Targets, []byte(key), os.Stderr)
 	if e != nil {
 		return e
 	}

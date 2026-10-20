@@ -378,7 +378,7 @@ func replayReportSuppressed(view replayRunView) bool {
 	return view.Error == "service_restarted" || view.EndReason == "service_restarted"
 }
 
-func (s *replayService) saveReport(view replayRunView) {
+func (s *replayExecutor) saveReport(view replayRunView) {
 	if replayReportSuppressed(view) {
 		return
 	}
@@ -387,23 +387,10 @@ func (s *replayService) saveReport(view replayRunView) {
 		s.audit.Print("replay_report_write_failed run=" + view.RunID)
 	}
 }
-func (s *replayService) loadReport(id string) (any, bool) {
+func (s *replayExecutor) loadReport(id string) (any, bool) {
 	s.mu.Lock()
 	view, ok := s.loadRunLocked(id)
-	if ok {
-		s.reporting[id]++
-	}
 	s.mu.Unlock()
-	if ok {
-		defer func() {
-			s.mu.Lock()
-			s.reporting[id]--
-			if s.reporting[id] == 0 {
-				delete(s.reporting, id)
-			}
-			s.mu.Unlock()
-		}()
-	}
 	if !ok || replayReportSuppressed(view) {
 		return nil, false
 	}

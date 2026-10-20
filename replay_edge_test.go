@@ -9,7 +9,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -53,38 +52,6 @@ func TestReplayStartIsIdempotentForConcurrentDeliveries(t *testing.T) {
 		}
 		f.svc.stop(req.RunID)
 		f.wait(t, req.RunID)
-	}
-}
-
-func TestReplayKeepsRunLimitWhileServing(t *testing.T) {
-	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
-	summary := recordSample(t, rec, "rec-k", 1)
-	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
-	runs := filepath.Join(f.svc.dataRoot, "runs")
-	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	for i := 0; i < replayRunsKept; i++ {
-		id := fmt.Sprintf("old-%03d", i)
-		os.Mkdir(filepath.Join(runs, id), 0700)
-		end := old.Add(time.Duration(i) * time.Minute)
-		view := replayRunView{RunID: id, State: "completed", CreatedAt: end, EndedAt: &end}
-		if _, err := recordingAtomicJSON(filepath.Join(runs, id), "state.json", view); err != nil {
-			t.Fatal(err)
-		}
-	}
-	req := normalizedReplayRequest(t, "fresh", "rec-k", summary.Segments[0].Segment, "r1")
-	if _, status, code := f.svc.start(req); status != 200 {
-		t.Fatal(status, code)
-	}
-	f.wait(t, "fresh")
-	entries, _ := os.ReadDir(runs)
-	if len(entries) != replayRunsKept {
-		t.Fatalf("%d run directories", len(entries))
-	}
-	if _, err := os.Stat(filepath.Join(runs, "old-000")); !os.IsNotExist(err) {
-		t.Fatal("oldest run kept", err)
-	}
-	if _, err := os.Stat(filepath.Join(runs, "fresh", "state.json")); err != nil {
-		t.Fatal(err)
 	}
 }
 

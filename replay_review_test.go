@@ -97,46 +97,6 @@ func TestReplayStateWriteFailuresDoNotPublishSuccess(t *testing.T) {
 	}
 }
 
-func TestReplayProtectsSelectedSegmentsUntilItEnds(t *testing.T) {
-	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
-	summary := recordSample(t, rec, "rec-evict", 1)
-	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
-	// Keep the replay active without sending while the recorder tries to evict.
-	f.svc.bodyMemory.acquire(context.Background(), replayBodyBudget)
-	defer f.svc.bodyMemory.release(replayBodyBudget)
-	req := normalizedReplayRequest(t, "evict", "rec-evict", summary.Segments[0].Segment, "r1")
-	f.svc.start(req)
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		view, _ := f.svc.loadRun(req.RunID)
-		if view.State == "running" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal(view)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	recorder := rec.c.recorder
-	recorder.mu.Lock()
-	recorder.maxBytes = 1
-	recorder.mu.Unlock()
-	recorder.flush()
-	recorder.maintainStorage()
-	path := filepath.Join(rec.root, "g1", "rec-evict", summary.Segments[0].Segment)
-	if _, err := os.Stat(path); err != nil {
-		t.Fatal("active input evicted", err)
-	}
-	f.svc.stop(req.RunID)
-	f.wait(t, req.RunID)
-	recordingCommand(t, rec.c, "record-unpin", map[string]any{"recording_id": "rec-evict", "segment": summary.Segments[0].Segment})
-	recorder.flush()
-	recorder.maintainStorage()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("finished replay still prevented eviction", err)
-	}
-}
-
 func TestReplayIncludesUnknownUsage(t *testing.T) {
 	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
 	summary := recordSample(t, rec, "rec-usage", 1)
@@ -197,31 +157,6 @@ func TestReplayPreservesAbsentAndPresentUserAgent(t *testing.T) {
 		if got := <-agents; got != agent {
 			t.Fatalf("User-Agent %q, want %q", got, agent)
 		}
-	}
-}
-
-func TestReplayStopBeforeStartSurvivesRestart(t *testing.T) {
-	rec := newRecordingFixture(t, recordingDefaultMaxBytes)
-	summary := recordSample(t, rec, "rec-stop", 1)
-	f := newReplayFixture(t, rec.root, map[string]string{"r1": rec.proxy.URL})
-	code, stopped := f.call(t, "POST", "/control/replay/v1/runs/late/stop", nil)
-	if code != 200 || stopped["state"] != "stopped" || stopped["start_cancelled"] != true {
-		t.Fatal(code, stopped)
-	}
-	// Disk-only recovery, as with a fresh process (no active run).
-	if err := f.svc.recover(); err != nil {
-		t.Fatal(err)
-	}
-	before := rec.router.posts.Load()
-	req := normalizedReplayRequest(t, "late", "rec-stop", summary.Segments[0].Segment, "r1")
-	for i := 0; i < 2; i++ {
-		code, view := f.call(t, "POST", "/control/replay/v1/runs", req)
-		if code != 200 || view["state"] != "stopped" || view["start_cancelled"] != true {
-			t.Fatal(code, view)
-		}
-	}
-	if rec.router.posts.Load() != before || len(f.svc.active) != 0 {
-		t.Fatal("cancelled start sent traffic")
 	}
 }
 

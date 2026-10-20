@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | `aigate-switch` | 请求转发、在线切流、准入、绑定版本、在途计数、测试占用 | 仅控制接口需要 Bearer 密钥与来源 CIDR | code-eval 下发内存绑定快照 |
 | `aigate-proxy` | 模型发现、适配、参数覆盖、SSE、指标、画像、慢请求与异常诊断 | 所有接口无需认证 | 本地 JSON 文件，修改后重启 |
-| `aigate-replay` | 回放录制的业务流量到本地白名单中的功能服务，提供状态与发送进度 | 控制接口需要独立 Bearer 密钥与来源 CIDR | 本地目标白名单文件；run 由平台下发 |
+| `aigate-replay-task` | 固定任务容器内回放 NAS 录制并生成报告 | 平台校验任务、输入与目标身份，无 HTTP 监听 | 一次任务一个目标，结果持久化至 NAS |
 
 每个功能服务固定连接一个 Router，可脱离切流服务和平台独立运行。多个切流入口可共享同一功能服务。指标与观测文件归属 Router，同时包含经过切流和直接访问的请求；切流不迁移这些数据。平台负责入口、目标登记、绑定及操作记录，功能参数的权威来源是功能服务本地文件。
 
@@ -33,13 +33,12 @@
 # 等价的独立构建：
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-switch ./cmd/aigate-switch
 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-proxy ./cmd/aigate-proxy
-GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-replay ./cmd/aigate-replay
+GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/aigate-replay-task ./cmd/aigate-replay-task
 ./bin/aigate-switch version
 ./bin/aigate-proxy version
-./bin/aigate-replay version
 ```
 
-`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch`、`bin/aigate-proxy` 和 `bin/aigate-replay`。版本命令分别标识 `control/v3 (v2 test compatibility)` 、`runtime/v1` 与 `replay/v1`；发布身份仍需记录源码 commit 和二进制摘要。
+`scripts/build.sh [输出目录]` 默认生成 `bin/aigate-switch`、`bin/aigate-proxy` 和 `bin/aigate-replay-task`。switch/proxy 的版本命令标识控制与运行协议；任务执行器由平台传入任务目录启动。发布身份记录源码 commit 和二进制摘要。
 
 功能服务可单独启动，示例连接本机 Router 的 18077 端口：
 
@@ -108,7 +107,7 @@ sum by (backend, model) (
 
 ### 流量录制与回放
 
-切流服务配置 `--record-root` 后，可由平台按整点、半点定时录制入口看到的原始业务流量（半小时分段、容量上限、可保留段），`aigate-replay` 把录制按原速或固定并发回放到候选功能服务，回放端生成客户端性能报告，服务端指标由监控观察。录制与回放只由平台控制，没有命令行入口。见 [流量录制与回放](docs/TRAFFIC_RECORDING.md)。
+切流服务配置 `--record-root` 后，可由平台按整点、半点定时录制入口看到的原始业务流量（半小时分段、容量上限、可保留段），固定任务容器内的 `aigate-replay-task` 把 NAS 录制按原速或固定并发回放到候选功能服务，回放端生成客户端性能报告，服务端指标由监控观察。录制与回放只由平台控制，没有命令行入口。见 [流量录制与回放](docs/TRAFFIC_RECORDING.md)。
 
 ### 流停顿方向
 

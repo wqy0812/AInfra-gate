@@ -37,20 +37,16 @@ type replayFilter struct {
 // --option names with hyphens replaced by underscores.
 type replayRequest struct {
 	RunID                 string               `json:"run_id"`
-	BatchID               string               `json:"batch_id,omitempty"`
 	ExpectedTarget        *replayTargetState   `json:"expected_target,omitempty"`
 	Recording             replayRecordingRef   `json:"recording"`
 	Recordings            []replayRecordingRef `json:"recordings,omitempty"`
-	PrepareOnly           bool                 `json:"prepare_only,omitempty"`
 	Filter                replayFilter         `json:"filter"`
 	Target                string               `json:"target"`
 	Mode                  string               `json:"mode"`
 	Concurrency           int                  `json:"concurrency,omitempty"`
-	TargetConcurrency     int                  `json:"target_concurrency,omitempty"`
 	SetModel              string               `json:"set_model,omitempty"`
 	RequestTimeoutSeconds int                  `json:"request_timeout_seconds,omitempty"`
 	AutoTruncate          bool                 `json:"auto_truncate,omitempty"`
-	CoordinatedTruncation bool                 `json:"coordinated_truncation,omitempty"`
 }
 
 // Omit the legacy selector from multi-source state as well as wire requests.
@@ -74,9 +70,6 @@ func (r replayRequest) sources() []replayRecordingRef {
 }
 
 func (r *replayRequest) normalize() error {
-	if r.BatchID != "" && (!validOperationID(r.BatchID) || !r.PrepareOnly) {
-		return fmt.Errorf("invalid_batch")
-	}
 	if len(r.Recordings) > 0 {
 		if len(r.Recordings) > 2 || r.Recording.GatewayID != "" || r.Recording.RecordingID != "" || len(r.Recording.Segments) != 0 {
 			return fmt.Errorf("invalid_recordings")
@@ -107,9 +100,6 @@ func (r *replayRequest) normalize() error {
 			return err
 		}
 		r.Filter, r.Mode, r.RequestTimeoutSeconds = one.Filter, one.Mode, one.RequestTimeoutSeconds
-		if r.TargetConcurrency != 0 && r.TargetConcurrency < r.localConcurrency() {
-			return fmt.Errorf("invalid_target_concurrency")
-		}
 		return nil
 	}
 	if !validOperationID(r.RunID) || !validOperationID(r.Recording.GatewayID) || !validOperationID(r.Recording.RecordingID) {
@@ -152,9 +142,6 @@ func (r *replayRequest) normalize() error {
 	default:
 		return fmt.Errorf("invalid_mode")
 	}
-	if r.TargetConcurrency != 0 && (r.Mode != "concurrency" || !r.CoordinatedTruncation || r.TargetConcurrency < r.Concurrency || r.TargetConcurrency > 2*r.Concurrency) {
-		return fmt.Errorf("invalid_target_concurrency")
-	}
 	if len(r.SetModel) > 256 {
 		return fmt.Errorf("invalid_rewrite")
 	}
@@ -170,12 +157,7 @@ func (r *replayRequest) normalize() error {
 // Concurrency is a separate allowance for every recording, never a shared pool.
 func (r replayRequest) localConcurrency() int { return r.Concurrency * len(r.sources()) }
 
-func (r replayRequest) tailConcurrency() int {
-	if r.CoordinatedTruncation && r.TargetConcurrency != 0 {
-		return r.TargetConcurrency
-	}
-	return r.localConcurrency()
-}
+func (r replayRequest) tailConcurrency() int { return r.localConcurrency() }
 
 func (r replayRequest) rewritten() []string {
 	out := []string{}
@@ -314,15 +296,8 @@ func buildReplayPlan(root string, req replayRequest, saved ...map[string]bool) (
 		return merged, nil
 	}
 
-	task := len(saved) > 0 && saved[0] != nil
-	if !task {
-		session, err := readRecordingSession(root, req.Recording.GatewayID, req.Recording.RecordingID)
-		if err != nil {
-			return nil, err
-		}
-		if session.Schema != recordingSchema {
-			return nil, fmt.Errorf("recording_schema_unsupported_rerecord")
-		}
+	if len(saved) == 0 || saved[0] == nil {
+		return nil, fmt.Errorf("saved task inputs required")
 	}
 	plan := &replayPlan{Schema: recordingSchema, RunID: req.RunID, GatewayID: req.Recording.GatewayID, RecordingID: req.Recording.RecordingID,
 		Excluded: map[string]int{}, Rewritten: req.rewritten(), Segments: []replayPlanSegment{}}
@@ -339,12 +314,8 @@ func buildReplayPlan(root string, req replayRequest, saved ...map[string]bool) (
 		if status.State != "sealed" {
 			return nil, fmt.Errorf("segment_not_sealed")
 		}
-		if task {
-			if !saved[0][req.Recording.GatewayID+"/"+req.Recording.RecordingID+"/"+name] {
-				return nil, fmt.Errorf("segment_not_saved")
-			}
-		} else if !status.Pinned {
-			return nil, fmt.Errorf("segment_not_retained")
+		if !saved[0][req.Recording.GatewayID+"/"+req.Recording.RecordingID+"/"+name] {
+			return nil, fmt.Errorf("segment_not_saved")
 		}
 		segments = append(segments, status)
 	}

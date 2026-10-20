@@ -2,13 +2,12 @@
 
 这里是当前源码的待部署模板，不表示生产已替换。`aigate-switch@入口ID` 和 `aigate-proxy@RouterID` 不相互依赖；多个切流入口可转发到一个功能服务。默认仅监听回环地址，跨主机部署时在各实例环境文件中明确填写监听地址。
 
-先用 `scripts/build.sh` 从选定 commit 构建并记录二进制摘要，再将 `aigate-switch`、`aigate-proxy`、`aigate-replay` 三个二进制安装到 `/usr/local/bin/`，按影响范围安装模板。`version` 输出用于识别服务角色与协议，不能代替源码 commit 和构建摘要。模板使用固定系统账号 `aigate-switch`、`aigate-proxy`。部署时先创建缺少的同名系统组与无登录账号，再安装服务；账号创建命令按目标主机既有账号管理方式执行。功能服务可能从导出的配置读取上游 header，因此不能将配置文件设为公开可读。
+先用 `scripts/build.sh` 从选定 commit 构建并记录二进制摘要，再将 `aigate-switch`、`aigate-proxy` 两个服务二进制安装到 `/usr/local/bin/`，按影响范围安装模板。`version` 输出用于识别服务角色与协议，不能代替源码 commit 和构建摘要。模板使用固定系统账号 `aigate-switch`、`aigate-proxy`。部署时先创建缺少的同名系统组与无登录账号，再安装服务；账号创建命令按目标主机既有账号管理方式执行。功能服务可能从导出的配置读取上游 header，因此不能将配置文件设为公开可读。
 
 | 实例 | 所需文件 | 创建的持久目录 |
 | --- | --- | --- |
 | `aigate-switch@g1` | `/etc/aigate/switch-g1.env` | `/var/lib/aigate-record`（StateDirectory，0700；仅设置 `AIGATE_RECORD_ROOT` 后写入 `<入口ID>/` 子目录） |
 | `aigate-proxy@r1` | `/etc/aigate/proxy-r1.json`；可选 `/etc/aigate/proxy-r1.env` | `/var/lib/aigate-proxy-r1`（systemd StateDirectory，归 `aigate-proxy:aigate-proxy`） |
-| `aigate-replay` | `/etc/aigate/replay.env`、`/etc/aigate/replay-targets.json` | `/var/lib/aigate-replay`（StateDirectory，0700，归 `aigate-switch`） |
 
 安装文件采用以下明确权限：`/etc/aigate` 为 `root:aigate-proxy`、0751，其他服务账号可以进入目录但不能列出内容，能否读取由各文件自己的属主和权限决定（回放服务以 `aigate-switch` 运行，需要进入该目录读取目标白名单）；`proxy-r1.json` 为 `root:aigate-proxy`、0640；所有实例 `.env` 文件为 `root:root`、0600，由 systemd 以 root 读取后注入环境。切流进程无需直接读取环境文件。二进制为 `root:root`、0755，服务文件为 `root:root`、0644。`StateDirectory` 由 systemd 创建并归属功能服务账号，权限 0700；不要复用旧入口观测目录。
 
@@ -54,4 +53,4 @@ systemd 会去掉值外层的单引号；其他容器环境注入方式应传入
 
 ## 平台回放执行器
 
-标准 `scripts/build.sh [output-directory]` 产出 `aigate-replay-task`，由 code-eval 的 `deploy/docker/Dockerfile.replay-task` 复制到固定任务镜像的 `/usr/local/bin/aigate-replay-task`。该程序由平台准备入口校验 NAS 后启动，不安装为网关常驻服务；旧 `aigate-replay` 的退役依赖单窗口迁移验收。
+标准 `scripts/build.sh [output-directory]` 产出 `aigate-replay-task`，由 code-eval 的 `deploy/docker/Dockerfile.replay-task` 复制到固定任务镜像的 `/usr/local/bin/aigate-replay-task`。该程序由平台准备入口校验 NAS 后启动，不安装为网关常驻服务；旧常驻服务已退役，其模板和控制代码已移除。

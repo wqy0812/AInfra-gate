@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -50,20 +49,15 @@ type replaySourceProgress struct {
 }
 
 type replayRun struct {
-	persistMu     sync.Mutex
-	sources       []replaySourceProgress
-	svc           *replayService
-	req           replayRequest
-	digest        string
-	dir           string
-	cancel        context.CancelFunc
-	stopped       atomic.Bool
-	done          chan struct{}
-	segmentFiles  []*os.File
-	leaseUntil    time.Time
-	scheduledAt   *time.Time
-	startDeadline time.Time
-	startSignal   chan struct{}
+	persistMu sync.Mutex
+	sources   []replaySourceProgress
+	svc       *replayExecutor
+	req       replayRequest
+	digest    string
+	dir       string
+	cancel    context.CancelFunc
+	stopped   atomic.Bool
+	done      chan struct{}
 
 	mu       sync.Mutex
 	state    string
@@ -93,7 +87,6 @@ type replayRun struct {
 type replayRunView struct {
 	SampledAt        *time.Time             `json:"sampled_at,omitempty"`
 	Sources          []replaySourceProgress `json:"sources,omitempty"`
-	ScheduledAt      *time.Time             `json:"scheduled_at,omitempty"`
 	Plan             *replayPlan            `json:"plan,omitempty"`
 	RunID            string                 `json:"run_id"`
 	State            string                 `json:"state"`
@@ -144,7 +137,7 @@ func (r *replayRun) viewLocked() replayRunView {
 		}
 		sources[i].Progress.Unsent = max(0, int64(sources[i].Progress.Planned)-sources[i].Progress.Sent)
 	}
-	return replayRunView{SampledAt: &sampled, DispatchComplete: progress.Planned > 0 && progress.Sent == int64(progress.Planned), Truncation: r.truncation, Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
+	return replayRunView{SampledAt: &sampled, DispatchComplete: progress.Planned > 0 && progress.Sent == int64(progress.Planned), Truncation: r.truncation, Sources: sources, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
 		Request: &r.req, Target: r.target, Progress: progress, LastError: r.lastError, MaxSendDelay: r.maxSendDelay}
 }
 
@@ -195,39 +188,14 @@ func (r *replayRun) finish(state, errText string) {
 		r.state, r.errText = "failed", "storage_failed"
 		r.mu.Unlock()
 	}
-	for _, f := range r.segmentFiles {
-		r.svc.releaseSegmentLocked(f)
-	}
-	r.segmentFiles = nil
 	delete(r.svc.active, r.req.RunID)
-	r.svc.reporting[r.req.RunID]++
 	r.svc.mu.Unlock()
-	// Report reduction can read a large result log. Keep this run protected from
-	// pruning, but never hold the service mutex and delay peers' lease renewals.
 	r.svc.saveReport(r.view())
-	r.svc.mu.Lock()
-	r.svc.reporting[r.req.RunID]--
-	if r.svc.reporting[r.req.RunID] == 0 {
-		delete(r.svc.reporting, r.req.RunID)
-	}
-	r.svc.mu.Unlock()
 	close(r.done)
 }
 
 // execute plans, checks the target, sends and persists progress.
 func (r *replayRun) execute(ctx context.Context) {
-	// One descriptor per selected segment (at most 96), using the same
-	// nonblocking directory lock as capacity eviction. No source files change.
-	for _, ref := range r.req.sources() {
-		for _, name := range ref.Segments {
-			f, err := r.svc.acquireSegment(filepath.Join(r.svc.recordRoot, ref.GatewayID, ref.RecordingID, name))
-			if err != nil {
-				r.finish("failed", err.Error())
-				return
-			}
-			r.segmentFiles = append(r.segmentFiles, f)
-		}
-	}
 	plan, err := buildReplayPlan(r.svc.recordRoot, r.req, r.svc.taskInputs)
 	if err != nil {
 		if plan != nil {
@@ -270,42 +238,6 @@ func (r *replayRun) execute(ctx context.Context) {
 		r.finish("failed", "replay_target_mismatch")
 		return
 	}
-	if r.req.PrepareOnly {
-		r.mu.Lock()
-		if r.stopped.Load() || ctx.Err() != nil {
-			r.mu.Unlock()
-			r.finish("stopped", "")
-			return
-		}
-		r.target = target
-		r.state = "prepared"
-		r.mu.Unlock()
-		if err := r.persist(); err != nil {
-			r.finish("failed", "storage_failed")
-			return
-		}
-		select {
-		case <-ctx.Done():
-			r.finish("stopped", "")
-			return
-		case <-r.startSignal:
-		}
-		r.mu.Lock()
-		due := r.startDeadline
-		r.mu.Unlock()
-		timer := time.NewTimer(time.Until(due))
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			r.finish("stopped", "")
-			return
-		case <-timer.C:
-		}
-		if time.Since(due) > replayStartTolerance {
-			r.finish("failed", "sync_start_late")
-			return
-		}
-	}
 	now := time.Now()
 	started := now.UTC()
 	r.mu.Lock()
@@ -335,7 +267,7 @@ func (r *replayRun) execute(ctx context.Context) {
 	r.mu.Unlock()
 	defer r.truncateCancel()
 	tailDone := make(chan struct{})
-	if r.req.AutoTruncate && !r.req.CoordinatedTruncation {
+	if r.req.AutoTruncate {
 		go r.watchTail(tailDone)
 	}
 	defer close(tailDone)

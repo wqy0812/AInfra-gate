@@ -24,7 +24,7 @@
 | 功能服务 | `proxy_service.go` | 本地不可变配置、独立启动、脱敏状态、Router 观测目录 |
 | 转发 | `gateway.go`、`adapter.go`、`routing.go`、`sse_*.go` | 模型发现、请求适配、SSE 观察与转发 |
 | 观测 | `profile*.go`、`slow_requests.go`、`stream_incidents.go`、`*_diagnostics.go`、`runtime_retention.go` | 指标、画像、慢请求、流异常、传输诊断及保留 |
-| 录放 | `traffic_recording.go`、`replay_*.go`、`cmd/aigate-replay` | 切流旁路录制、回放标记、平台控制的回放服务 |
+| 录放 | `traffic_recording.go`、`replay_*.go`、`cmd/aigate-replay-task` | 切流旁路录制、回放标记、平台固定容器内的单次回放执行器 |
 
 ## 网关规则
 

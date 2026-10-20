@@ -402,7 +402,7 @@ func TestReplayPlanRequiresSchemaAndRequestIntegrity(t *testing.T) {
 			test.mutate(&meta)
 			recordingAtomicJSON(dir, "meta.json", meta)
 			// The absent response.tail must never be consulted.
-			if _, err := buildReplayPlan(root, req); err == nil || err.Error() != test.want {
+			if _, err := buildReplayPlan(root, req, savedTestInputs(root)); err == nil || err.Error() != test.want {
 				t.Fatal(err)
 			}
 		})
@@ -416,7 +416,7 @@ func TestReplayInvalidStructuredUsageDoesNotReadTail(t *testing.T) {
 	raw = bytes.Replace(raw, []byte(`"completion_tokens":800`), []byte(`"completion_tokens":-1`), 1)
 	os.WriteFile(filepath.Join(dir, "meta.json"), raw, 0600)
 	os.WriteFile(filepath.Join(dir, "response.tail"), []byte(`{"usage":{"completion_tokens":800}}`), 0600)
-	if _, err := buildReplayPlan(root, req); err != nil {
+	if _, err := buildReplayPlan(root, req, savedTestInputs(root)); err != nil {
 		t.Fatal(err)
 	}
 }
