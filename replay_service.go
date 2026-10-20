@@ -56,23 +56,24 @@ func readReplayTargets(path string) (map[string]string, error) {
 }
 
 type replayService struct {
-	taskInputs  map[string]bool
-	taskMode    bool
-	key         string
-	cidrs       []netip.Prefix
-	recordRoot  string
-	dataRoot    string
-	targets     map[string]string
-	markKey     []byte
-	boot        string
-	audit       *log.Logger
-	client      *http.Client
-	bodyMemory  *replayByteBudget
-	openResults func(string) (replayResultFile, error)
-	writeJSON   func(string, string, any) (int64, error)
-	directory   *os.File
-	ctx         context.Context
-	cancel      context.CancelFunc
+	checkpointTicker func(time.Duration) (<-chan time.Time, func())
+	taskInputs       map[string]bool
+	taskMode         bool
+	key              string
+	cidrs            []netip.Prefix
+	recordRoot       string
+	dataRoot         string
+	targets          map[string]string
+	markKey          []byte
+	boot             string
+	audit            *log.Logger
+	client           *http.Client
+	bodyMemory       *replayByteBudget
+	openResults      func(string) (replayResultFile, error)
+	writeJSON        func(string, string, any) (int64, error)
+	directory        *os.File
+	ctx              context.Context
+	cancel           context.CancelFunc
 
 	mu        sync.Mutex
 	active    map[string]*replayRun
@@ -111,7 +112,7 @@ func newReplayService(key string, cidrs []netip.Prefix, recordRoot, dataRoot str
 	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		MaxIdleConns: 4096, MaxIdleConnsPerHost: 4096, IdleConnTimeout: 90 * time.Second, DisableCompression: true}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &replayService{taskMode: task, key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
+	s := &replayService{checkpointTicker: func(d time.Duration) (<-chan time.Time, func()) { t := time.NewTicker(d); return t.C, t.Stop }, taskMode: task, key: key, cidrs: cidrs, recordRoot: recordRoot, dataRoot: dataRoot, targets: targets, markKey: markKey, boot: randomID(),
 		audit: log.New(audit, "", 0), bodyMemory: newReplayByteBudget(), writeJSON: recordingAtomicJSON, openResults: func(path string) (replayResultFile, error) {
 			return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 		}, directory: directory, ctx: ctx, cancel: cancel, runs: map[string]*replayRun{}, active: map[string]*replayRun{}, reporting: map[string]int{}, segments: map[string]*replaySegmentLease{},
@@ -352,37 +353,49 @@ func (s *replayService) start(req replayRequest) (replayRunView, int, string) {
 
 func (s *replayService) stop(id string) (replayRunView, int, string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	r := s.runs[id]
 	if r == nil {
-		if view, ok := s.loadRunLocked(id); ok {
-			return view, 200, ""
-		}
-		// 404 cannot prove a concurrent POST /runs will never arrive. Persist
-		// the stop under the start lock before acknowledging it to the platform.
-		if err := s.pruneRuns(replayRunsKept - 1); err != nil {
-			return replayRunView{}, 500, "storage_failed"
-		}
-		dir := s.runDir(id)
-		if err := os.Mkdir(dir, 0700); err != nil {
-			return replayRunView{}, 500, "storage_failed"
-		}
-		now := time.Now().UTC()
-		view := replayRunView{RunID: id, State: "stopped", CreatedAt: now, EndedAt: &now, StartCancelled: true}
-		if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
-			_ = os.RemoveAll(dir)
-			return replayRunView{}, 500, "storage_failed"
-		}
-		return view, 200, ""
+		defer s.mu.Unlock()
+		return s.stopAbsentLocked(id)
 	}
+	s.mu.Unlock()
 	r.mu.Lock()
-	if r.ended == nil && r.state != "stopping" {
+	changed := r.ended == nil && r.state != "stopping"
+	if changed {
 		r.state = "stopping"
 		r.stopped.Store(true)
 		r.cancel()
 	}
 	r.mu.Unlock()
+	if changed {
+		if err := r.persist(); err != nil {
+			r.abort("storage_failed")
+			return r.view(), 500, "storage_failed"
+		}
+	}
 	return r.view(), 200, ""
+}
+
+func (s *replayService) stopAbsentLocked(id string) (replayRunView, int, string) {
+	if view, ok := s.loadRunLocked(id); ok {
+		return view, 200, ""
+	}
+	// 404 cannot prove a concurrent POST /runs will never arrive. Persist
+	// the stop under the start lock before acknowledging it to the platform.
+	if err := s.pruneRuns(replayRunsKept - 1); err != nil {
+		return replayRunView{}, 500, "storage_failed"
+	}
+	dir := s.runDir(id)
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return replayRunView{}, 500, "storage_failed"
+	}
+	now := time.Now().UTC()
+	view := replayRunView{SampledAt: &now, RunID: id, State: "stopped", CreatedAt: now, EndedAt: &now, StartCancelled: true}
+	if _, err := recordingAtomicJSON(dir, "state.json", view); err != nil {
+		_ = os.RemoveAll(dir)
+		return replayRunView{}, 500, "storage_failed"
+	}
+	return view, 200, ""
 }
 
 type replayRecordingView struct {

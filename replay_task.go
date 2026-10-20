@@ -4,6 +4,7 @@ package aigate
 // NAS manifest before calling this kernel. No command mailbox or HTTP handler.
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -97,9 +99,29 @@ func RunReplayTask(args []string) error {
 	defer service.Close()
 	service.taskInputs = saved
 	service.boot = input.BootID
+	var current atomic.Pointer[replayRun]
+	var terminal atomic.Pointer[replayProgressView]
+	if path := os.Getenv(replayProgressSocketEnv); path != "" {
+		identity := replayProgressIdentity{input.Request.RunID, input.BootID, fmt.Sprintf("%x", sha256.Sum256(raw))}
+		closeProgress, err := startReplayProgress(path, identity, func() replayProgressView {
+			if run := current.Load(); run != nil {
+				return run.progressView()
+			}
+			if view := terminal.Load(); view != nil {
+				return *view
+			}
+			return replayProgressView{RunID: input.Request.RunID, State: "planning"}
+		})
+		if err != nil {
+			return fmt.Errorf("progress socket: %w", err)
+		}
+		defer closeProgress()
+	}
 	if _, e = os.Stat(filepath.Join(root, "stop.json")); e == nil {
 		view, _, _ := service.stop(input.Request.RunID)
 		view.Request = &input.Request
+		compact := replayCompactProgress(view)
+		terminal.Store(&compact)
 		service.writeJSON(service.runDir(input.Request.RunID), "state.json", view)
 		service.saveReport(view)
 		return publishTaskReport(root, service.runDir(input.Request.RunID), input)
@@ -115,6 +137,7 @@ func RunReplayTask(args []string) error {
 	if run == nil {
 		return fmt.Errorf("task was not created")
 	}
+	current.Store(run)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 	ticker := time.NewTicker(250 * time.Millisecond)

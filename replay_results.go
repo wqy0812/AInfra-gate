@@ -76,7 +76,8 @@ func (r *replayRun) abort(reason string) {
 		r.mu.Unlock()
 		return
 	}
-	if r.fatalError == "" {
+	changed := r.fatalError == ""
+	if changed {
 		r.fatalError = reason
 	}
 	// Expose fatal dispatch failure while accepted requests still drain, so
@@ -85,6 +86,10 @@ func (r *replayRun) abort(reason string) {
 	r.stopped.Store(true)
 	r.mu.Unlock()
 	r.cancel()
+	if changed {
+		// Best effort: a storage failure must not recurse into abort.
+		_ = r.persist()
+	}
 }
 
 func (r *replayRun) saveResult(result replayResult) {

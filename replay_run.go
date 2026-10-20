@@ -91,6 +91,7 @@ type replayRun struct {
 }
 
 type replayRunView struct {
+	SampledAt        *time.Time             `json:"sampled_at,omitempty"`
 	Sources          []replaySourceProgress `json:"sources,omitempty"`
 	ScheduledAt      *time.Time             `json:"scheduled_at,omitempty"`
 	Plan             *replayPlan            `json:"plan,omitempty"`
@@ -116,6 +117,7 @@ type replayRunView struct {
 }
 
 func (r *replayRun) viewLocked() replayRunView {
+	sampled := time.Now().UTC()
 	progress := r.progress
 	if (r.state == "running" || r.state == "stopping") && !r.begin.IsZero() {
 		progress.Sent, progress.Completed, progress.Failed, progress.Inflight = r.sent.Load(), r.completed.Load(), r.failed.Load(), r.inflight.Load()
@@ -142,7 +144,7 @@ func (r *replayRun) viewLocked() replayRunView {
 		}
 		sources[i].Progress.Unsent = max(0, int64(sources[i].Progress.Planned)-sources[i].Progress.Sent)
 	}
-	return replayRunView{DispatchComplete: progress.Planned > 0 && progress.Sent == int64(progress.Planned), Truncation: r.truncation, Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
+	return replayRunView{SampledAt: &sampled, DispatchComplete: progress.Planned > 0 && progress.Sent == int64(progress.Planned), Truncation: r.truncation, Sources: sources, ScheduledAt: r.scheduledAt, Plan: r.plan, EndReason: reason, Excluded: excluded, Rewritten: r.req.rewritten(), Output: r.output, MaxWriteDelay: r.maxWriteDelay, RunID: r.req.RunID, State: r.state, Error: r.errText, CreatedAt: r.created, StartedAt: r.started, EndedAt: r.ended,
 		Request: &r.req, Target: r.target, Progress: progress, LastError: r.lastError, MaxSendDelay: r.maxSendDelay}
 }
 
@@ -337,11 +339,34 @@ func (r *replayRun) execute(ctx context.Context) {
 		go r.watchTail(tailDone)
 	}
 	defer close(tailDone)
+	// Persist recovery checkpoints independently of dispatch and response writes.
+	// Live queries use the task UDS, including while accepted requests drain.
+	progressStop, progressDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		ticks, stop := r.svc.checkpointTicker(30 * time.Second)
+		defer stop()
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ticks:
+				if err := r.persist(); err != nil {
+					r.abort("storage_failed")
+					return
+				}
+			}
+		}
+	}()
 	if r.req.Mode == "timed" {
 		r.sendTimed(ctx, plan)
 	} else {
 		r.sendConcurrent(ctx, plan)
 	}
+	// Join before the final snapshot/report so no background write can replace
+	// terminal counters or publish an error after the run has finished.
+	close(progressStop)
+	<-progressDone
 	if err := results.Close(); err != nil {
 		r.mu.Lock()
 		r.output.ResultsFailed = true
