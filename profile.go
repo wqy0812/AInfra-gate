@@ -35,9 +35,6 @@ type ProfileConfig struct {
 	RetentionHours int    `json:"retention_hours"`
 	MaxDiskBytes   int64  `json:"max_disk_bytes"`
 	QueueEvents    int    `json:"queue_events"`
-	// Deprecated: accepted for configuration compatibility; no prefix index or payload analysis remains.
-	MaxIndexEntries int `json:"max_index_entries"`
-	MaxPayloadBytes int `json:"max_payload_bytes"`
 }
 
 func (c *ProfileConfig) defaults(path string) {

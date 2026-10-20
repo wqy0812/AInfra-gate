@@ -82,9 +82,8 @@ func TestProfileGatewayJSONAndSSE(t *testing.T) {
 		t.Fatal("private label")
 	}
 }
-func TestProfileBoundedIndexMissingUsageAndAnalysis(t *testing.T) {
+func TestProfileMissingUsageAndAnalysis(t *testing.T) {
 	p, c := profileFixture(t)
-	p.c.MaxIndexEntries = 2
 	backend := c.Backend
 	_ = profileNow()
 	for i, text := range []string{"a", "b", "a"} {
@@ -131,16 +130,6 @@ func TestProfileAuthAndLimits(t *testing.T) {
 		if w.Code != tc.code {
 			t.Errorf("%s got %d want %d", tc.path, w.Code, tc.code)
 		}
-	}
-}
-func TestProfilePayloadLimitDoesNotRejectBusiness(t *testing.T) {
-	p, c := profileFixture(t)
-	p.c.MaxPayloadBytes = 4
-	r := p.begin("limit")
-	p.input(r, []byte(`{"messages":[]}`), c.Backend, "api1", "model")
-	p.end(r, &auditEntry{Outcome: "completed"}, false)
-	if r.quality != "" {
-		t.Fatal(r.quality)
 	}
 }
 
@@ -418,9 +407,6 @@ func TestProfileNoMessageStructureCollected(t *testing.T) {
 	p, c := profileFixture(t)
 	payload := []byte(`{"messages":[{"role":"user","content":"same"}]}`)
 	for i := 0; i < 3; i++ {
-		if i == 2 {
-			p.c.MaxPayloadBytes = 4
-		}
 		r := p.begin(strconv.Itoa(i))
 		p.input(r, payload, c.Backend, "api1", "model")
 		p.end(r, &auditEntry{Outcome: "completed"}, false)
