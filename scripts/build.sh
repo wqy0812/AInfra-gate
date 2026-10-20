@@ -13,8 +13,6 @@ export GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local
 go version
 go build -mod=vendor -trimpath -o "$AIGATE_BUILD_OUTPUT/aigate-switch" ./cmd/aigate-switch
 go build -mod=vendor -trimpath -o "$AIGATE_BUILD_OUTPUT/aigate-proxy" ./cmd/aigate-proxy
-go build -mod=vendor -trimpath -o "$AIGATE_BUILD_OUTPUT/aigate-replay" ./cmd/aigate-replay
 go build -mod=vendor -trimpath -o "$AIGATE_BUILD_OUTPUT/aigate-replay-task" ./cmd/aigate-replay-task
 "$AIGATE_BUILD_OUTPUT/aigate-switch" version
 "$AIGATE_BUILD_OUTPUT/aigate-proxy" version
-"$AIGATE_BUILD_OUTPUT/aigate-replay" version

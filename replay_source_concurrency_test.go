@@ -13,7 +13,7 @@ import (
 
 func TestReplayIndependentRecordingAllowances(t *testing.T) {
 	root, req := overlayFixtureCount(t, 24)
-	req.Mode, req.Concurrency, req.PrepareOnly = "concurrency", 8, false
+	req.Mode, req.Concurrency = "concurrency", 8
 	var active, peak, sent [2]atomic.Int64
 	gates := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
 	var release [2]sync.Once
@@ -66,7 +66,7 @@ func TestReplayIndependentRecordingAllowances(t *testing.T) {
 	for _, source := range req.Recordings {
 		one := req
 		one.Recordings, one.Recording = nil, source
-		plan, err := buildReplayPlan(root, one)
+		plan, err := buildReplayPlan(root, one, savedTestInputs(root))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -81,36 +81,5 @@ func TestReplayIndependentRecordingAllowances(t *testing.T) {
 				t.Fatal("source digest depends on sender grouping", input, digest)
 			}
 		}
-	}
-}
-
-func TestReplayCoordinatedConcurrencyUsesTargetThreshold(t *testing.T) {
-	root, req := syntheticReplay(t, 6, 0, `{"stream":true}`)
-	req.Mode, req.Concurrency, req.TargetConcurrency = "concurrency", 8, 16
-	req.AutoTruncate, req.CoordinatedTruncation = true, true
-	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-	})
-	f := newReplayFixture(t, root, map[string]string{"r1": target.URL})
-	if _, status, reason := f.svc.start(req); status != 200 {
-		t.Fatal(status, reason)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		view, _ := f.svc.loadRun(req.RunID)
-		if view.Progress.Sent == 6 && view.Progress.Inflight == 6 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if _, status, reason := f.svc.runs[req.RunID].truncateTail(true); status != 200 {
-		t.Fatal(status, reason)
-	}
-	view := f.wait(t, req.RunID)
-	if view.State != "truncated" || view.Progress.Truncated != 6 || view.Truncation.Threshold != 8 {
-		t.Fatal(view)
 	}
 }

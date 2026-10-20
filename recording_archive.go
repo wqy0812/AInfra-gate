@@ -2,10 +2,12 @@ package aigate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -71,13 +73,12 @@ func (r *trafficRecorder) archiveHTTP(w http.ResponseWriter, req *http.Request) 
 	}
 	suffix := strings.TrimPrefix(req.URL.Path, "/control/v3/recordings")
 	if suffix == "" || suffix == "/" {
-		service := replayService{recordRoot: filepath.Dir(r.root)}
-		rows, e := service.listRecordings(r.gatewayID)
+		rows, e := listStoredRecordings(filepath.Dir(r.root), r.gatewayID)
 		if e != nil {
 			runtimeError(w, 500, "recording_list_failed")
 			return
 		}
-		replayJSON(w, 200, map[string]any{"gateway_id": r.gatewayID, "recordings": rows})
+		newRuntimeResponse(200, map[string]any{"gateway_id": r.gatewayID, "recordings": rows}).write(w)
 		return
 	}
 	parts := strings.Split(strings.Trim(suffix, "/"), "/")
@@ -116,7 +117,7 @@ func (r *trafficRecorder) archiveHTTP(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	if parts[3] == "manifest" {
-		replayJSON(w, 200, map[string]any{"gateway_id": r.gatewayID, "recording_id": parts[0], "segment": parts[2], "archive": m, "metadata": seg})
+		newRuntimeResponse(200, map[string]any{"gateway_id": r.gatewayID, "recording_id": parts[0], "segment": parts[2], "archive": m, "metadata": seg}).write(w)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-tar")
@@ -124,4 +125,48 @@ func (r *trafficRecorder) archiveHTTP(w http.ResponseWriter, req *http.Request) 
 	if e = writeSegmentTar(w, dir, m); e != nil {
 		r.audit.Printf("recording_export_failed: %v", e)
 	}
+}
+
+type storedRecordingView struct {
+	recordingSessionFile
+	SegmentStatus []replaySegmentStatus `json:"segment_status"`
+}
+
+// listRecordings returns metadata only, never request or response bytes.
+func listStoredRecordings(root, gateway string) ([]storedRecordingView, error) {
+	dir := filepath.Join(root, gateway)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return []storedRecordingView{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := []storedRecordingView{}
+	for _, entry := range entries {
+		if !entry.IsDir() || !validOperationID(entry.Name()) {
+			continue
+		}
+		session, err := readRecordingSession(root, gateway, entry.Name())
+		if err != nil {
+			continue
+		}
+		view := storedRecordingView{recordingSessionFile: session, SegmentStatus: []replaySegmentStatus{}}
+		children, _ := os.ReadDir(filepath.Join(dir, entry.Name()))
+		for _, child := range children {
+			if _, ok := parseRecordingSegment(child.Name()); !ok || !child.IsDir() {
+				continue
+			}
+			if status, err := readRecordingSegment(root, gateway, entry.Name(), child.Name()); err == nil {
+				view.SegmentStatus = append(view.SegmentStatus, status)
+			}
+		}
+		sort.Slice(view.SegmentStatus, func(i, j int) bool { return view.SegmentStatus[i].Start.Before(view.SegmentStatus[j].Start) })
+		out = append(out, view)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if len(out) > 500 {
+		out = out[:500]
+	}
+	return out, nil
 }

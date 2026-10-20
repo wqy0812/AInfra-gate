@@ -103,14 +103,9 @@ func TestReplayReportProductionFlow(t *testing.T) {
 			if r.State != "complete" || r.Stream.TTFT.Count != 2 || r.Stream.TPOT.Count != 2 || *r.Stream.TTFT.P50 < .01 {
 				t.Fatalf("%s", data)
 			}
-			path := "/control/replay/v1/runs/" + req.RunID + "/report"
+			path := "/executor/runs/" + req.RunID + "/report"
 			if status, current := f.call(t, "GET", path, nil); status != 200 || current["version"] != float64(2) {
 				t.Fatal(status, current)
-			}
-			for _, query := range []string{"?version=1", "?version=2", "?version="} {
-				if status, _ := f.call(t, "GET", path+query, nil); status != 400 {
-					t.Fatal("version selection still available", status)
-				}
 			}
 			results := readReplayResults(t, f, req.RunID)
 			for _, v := range results {

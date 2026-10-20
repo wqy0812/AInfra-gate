@@ -14,7 +14,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('environment', choices=['ppu', 'a3'])
 parser.add_argument('action', choices=['status', 'start', 'stop'])
-parser.add_argument('role', choices=['switch', 'proxy', 'replay'])
+parser.add_argument('role', choices=['switch', 'proxy'])
 args = parser.parse_args()
 binary = '/usr/local/nerdctl/nerdctl.current' if args.environment == 'ppu' else '/usr/bin/nerdctl'
 nerdctl = [binary, '--namespace', 'ai-gateway']
@@ -40,9 +40,8 @@ def require_idle(obj):
     host, port = argv[argv.index(flag) + 1].rsplit(':', 1)
     if host == '0.0.0.0':
         host = '127.0.0.1'
-    path = {'switch': '/control/v3/status', 'proxy': '/runtime/v1/status',
-            'replay': '/control/replay/v1/status'}[args.role]
-    key = {'switch': 'AIGATE_CONTROL_KEY', 'replay': 'AIGATE_REPLAY_CONTROL_KEY'}.get(args.role)
+    path = {'switch': '/control/v3/status', 'proxy': '/runtime/v1/status'}[args.role]
+    key = 'AIGATE_CONTROL_KEY' if args.role == 'switch' else None
     conn = http.client.HTTPConnection(host, int(port), timeout=10, source_address=('127.0.0.1', 0))
     try:
         conn.request('GET', path, headers={'Authorization': 'Bearer ' + env[key]} if key else {})
@@ -59,15 +58,12 @@ def require_idle(obj):
         recording = status['recording']
         if recording is not None and (recording.get('sessions') or recording.get('active_records')):
             raise RuntimeError('Active recording; no stop performed')
-    if args.role == 'replay':
-        if status['active_run'] is not None:
-            raise RuntimeError('Active replay; no stop performed')
-    else:
-        counts = status['counts']
-        if isinstance(counts, dict):
-            counts = [counts]
-        if any(sum(c.get(k, 0) for k in ['business', 'streams', 'tests', 'probes']) for c in counts):
-            raise RuntimeError('Requests are still in flight; no stop performed')
+    counts = status['counts']
+    if isinstance(counts, dict):
+        counts = [counts]
+    if any(sum(c.get(k, 0) for k in ['business', 'streams', 'tests', 'probes']) for c in counts):
+        raise RuntimeError('Requests are still in flight; no stop performed')
+
 
 
 obj = inspect()
@@ -78,7 +74,7 @@ if args.action == 'stop':
             command(*nerdctl, 'update', '--restart', 'no', name)
             command('ctr', '-n', 'ai-gateway', 'containers', 'label', obj['Id'],
                     'containerd.io/restart.status=stopped')
-        command(*nerdctl, 'stop', '--time', '3720' if args.role != 'replay' else '60', name)
+        command(*nerdctl, 'stop', '--time', '3720', name)
     elif args.environment == 'ppu':
         command('ctr', '-n', 'ai-gateway', 'containers', 'label', obj['Id'],
                 'containerd.io/restart.policy=no', 'containerd.io/restart.status=stopped')

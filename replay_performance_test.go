@@ -34,7 +34,7 @@ func TestReplayTailThresholds(t *testing.T) {
 	}
 }
 
-func TestReplayStreamEligibilityAndRetention(t *testing.T) {
+func TestReplayStreamEligibilityAndSavedInputs(t *testing.T) {
 	for body, reason := range map[string]string{`{"stream":true}`: "", `{"stream":false}`: "nonstream", `{}`: "stream_unspecified", `{"stream":"true"}`: "stream_unclassifiable", `null`: "stream_unclassifiable", `{`: "stream_unclassifiable"} {
 		if got := replayStreamExclusion([]byte(body)); got != reason {
 			t.Fatalf("%s %s", body, got)
@@ -45,7 +45,7 @@ func TestReplayStreamEligibilityAndRetention(t *testing.T) {
 	if err := os.Remove(filepath.Join(segment, "pinned")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := buildReplayPlan(root, req); err == nil || err.Error() != "segment_not_retained" {
+	if _, err := buildReplayPlan(root, req, map[string]bool{}); err == nil || err.Error() != "segment_not_saved" {
 		t.Fatal(err)
 	}
 }
@@ -77,7 +77,7 @@ func TestReplayTailCancelsRequestsAndReportsCensoring(t *testing.T) {
 		t.Fatalf("%+v", report)
 	}
 	// Retrying the same cancellation never changes terminal evidence.
-	if v, status, code := f.svc.runs[req.RunID].truncateTail(true); status != 200 || code != "" || v.Progress.Truncated != 3 {
+	if v, status, code := f.svc.runs[req.RunID].truncateTail(); status != 200 || code != "" || v.Progress.Truncated != 3 {
 		t.Fatal(v, status, code)
 	}
 }
@@ -111,7 +111,7 @@ func TestReplayCancellationDoesNotCancelOrdinaryStopDrain(t *testing.T) {
 	r.truncateCancel = cancel
 	r.sent.Store(2)
 	r.inflight.Store(2)
-	if _, status, _ := r.truncateTail(false); status != 409 || ctx.Err() != nil {
+	if _, status, _ := r.truncateTail(); status != 409 || ctx.Err() != nil {
 		t.Fatal("cancelled before dispatch completed")
 	}
 }
