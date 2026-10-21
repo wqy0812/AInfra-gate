@@ -631,6 +631,10 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	} else if e := <-done; e == nil || e.Error() != "segment_not_found" {
 		t.Fatal(e)
 	}
+	// Unpinning a segment that no longer exists has nothing left to release.
+	if err := r.pinLocked("old", "20991231T2330", false, func(e error) { done <- e }); err != nil || <-done != nil {
+		t.Fatal("unpin missing segment", err)
+	}
 	if err := r.pinLocked("old", "20990101T0030", true, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("pin before restart", err)
 	}

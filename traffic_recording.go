@@ -1341,11 +1341,18 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	storageLeaseMu.Lock()
 	defer storageLeaseMu.Unlock()
 	if _, e := os.Stat(filepath.Join(r.sessionDir(id), name, deleteMarker)); e == nil {
+		if !pin {
+			// A segment being deleted holds no pin; unpin is already done.
+			return nil
+		}
 		return errStorageDeleting
 	}
 	key := id + "/" + name
 	directory, err := os.Open(filepath.Join(r.sessionDir(id), name))
 	if err != nil {
+		if !pin && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return fmt.Errorf("segment_not_found")
 	}
 	defer directory.Close()
@@ -1357,6 +1364,9 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	stored := r.stored[key]
 	r.mu.Unlock()
 	if stored == nil {
+		if !pin {
+			return nil
+		}
 		return fmt.Errorf("segment_not_found")
 	}
 	if !stored.sealed {

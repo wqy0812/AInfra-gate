@@ -418,3 +418,108 @@ func TestSwitchFailedValidationKeepsActiveRouteAndReleasesProbe(t *testing.T) {
 		t.Fatal("validation failure affected business")
 	}
 }
+
+func controlResult(t *testing.T, c *ControlledGateway, seq uint64) (int, RuntimeResult) {
+	t.Helper()
+	r := httptest.NewRequest("GET", "/control/v3/commands/"+strconv.FormatUint(seq, 10), nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+	r.Header.Set("Authorization", "Bearer "+strings.Repeat("k", 32))
+	w := httptest.NewRecorder()
+	c.ControlHandler().ServeHTTP(w, r)
+	var result RuntimeResult
+	_ = json.Unmarshal(w.Body.Bytes(), &result)
+	return w.Code, result
+}
+
+func TestSwitchValidationSurvivesUnrelatedCommands(t *testing.T) {
+	c := controlledFixture(t)
+	p := newProtocolBackend(t)
+	commandV3(t, c, "verify", "prepare", switchSnapshot(t, "r1", p.server.URL, 1))
+	result := commandV3(t, c, "verify", "validate", map[string]any{"rounds": 1, "step_seconds": 2, "timeout_seconds": 10, "max_tokens": 1024})
+	if result.Status != "running" {
+		t.Fatal(result)
+	}
+	// A failing command from another owner still advances the sequence.
+	c.mu.Lock()
+	cmd := RuntimeCommand{ProtocolVersion: 3, OperationID: "status", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: c.sequence + 1, ExpectedRevision: c.revisionLocked(), Action: "record-status", Payload: encodeJSON(map[string]any{"recording_id": "rec1"})}
+	c.mu.Unlock()
+	if status, other := controlRequest(t, c, cmd); status != 200 || other.Status != "failed" {
+		t.Fatal(status, other)
+	}
+	waitValidation(t, c, result.Sequence)
+	c.mu.Lock()
+	final := c.results[result.Sequence]
+	c.mu.Unlock()
+	if final.Status != "completed" || final.Report == nil || !final.Report.Passed {
+		t.Fatal("unrelated command superseded validation", final.Status, final.Error)
+	}
+}
+
+func TestSwitchCandidateChangeSupersedesValidation(t *testing.T) {
+	c := controlledFixture(t)
+	p := newProtocolBackend(t)
+	commandV3(t, c, "verify", "prepare", switchSnapshot(t, "r1", p.server.URL, 1))
+	first := commandV3(t, c, "verify", "validate", map[string]any{"rounds": 1, "step_seconds": 2, "timeout_seconds": 10, "max_tokens": 1024})
+	second := commandV3(t, c, "verify", "validate", map[string]any{"rounds": 1, "step_seconds": 2, "timeout_seconds": 10, "max_tokens": 1024})
+	waitValidation(t, c, first.Sequence)
+	waitValidation(t, c, second.Sequence)
+	commandV3(t, c, "verify", "prepare", switchSnapshot(t, "r1", p.server.URL, 1))
+	third := commandV3(t, c, "verify", "validate", map[string]any{"rounds": 1, "step_seconds": 2, "timeout_seconds": 10, "max_tokens": 1024})
+	commandV3(t, c, "verify", "discard", map[string]any{})
+	waitValidation(t, c, third.Sequence)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r := c.results[first.Sequence]; r.Status != "failed" || r.Error != "validation_superseded" {
+		t.Fatal("older validation of the same candidate reported", r.Status, r.Error)
+	}
+	if r := c.results[second.Sequence]; r.Status != "completed" {
+		t.Fatal("latest validation failed", r.Status, r.Error)
+	}
+	if r := c.results[third.Sequence]; r.Status != "failed" || r.Error != "validation_superseded" {
+		t.Fatal("discarded candidate reported", r.Status, r.Error)
+	}
+}
+
+func waitValidation(t *testing.T, c *ControlledGateway, seq uint64) {
+	t.Helper()
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		status := c.results[seq].Status
+		c.mu.Unlock()
+		if status != "running" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("validation did not finish")
+}
+
+func TestSwitchStaleCommandOutcomeIsReadable(t *testing.T) {
+	c := controlledFixture(t)
+	later := RuntimeCommand{ProtocolVersion: 3, OperationID: "later", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: 6, Action: "quiesce", Payload: json.RawMessage(`{}`)}
+	if status, _ := controlRequest(t, c, later); status != 200 {
+		t.Fatal(status)
+	}
+	earlier := RuntimeCommand{ProtocolVersion: 3, OperationID: "earlier", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: 5, Action: "resume", Payload: json.RawMessage(`{}`)}
+	if status, _ := controlRequest(t, c, earlier); status != 409 {
+		t.Fatal("stale command accepted", status)
+	}
+	// The sender lost the 409; the stored outcome says it never ran.
+	status, result := controlResult(t, c, 5)
+	if status != 200 || result.Status != "failed" || result.Error != "stale_command" || result.OperationID != "earlier" {
+		t.Fatal(status, result)
+	}
+	if status, result = controlRequest(t, c, earlier); status != 200 || result.Error != "stale_command" {
+		t.Fatal("retried stale command", status, result)
+	}
+	earlier.Action = "retire"
+	if status, _ = controlRequest(t, c, earlier); status != 409 {
+		t.Fatal("stale sequence reused with different payload")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sequence != 6 || c.retired || c.admission {
+		t.Fatal("stale command changed gateway state")
+	}
+}
