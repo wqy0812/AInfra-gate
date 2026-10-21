@@ -1341,11 +1341,22 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	storageLeaseMu.Lock()
 	defer storageLeaseMu.Unlock()
 	if _, e := os.Stat(filepath.Join(r.sessionDir(id), name, deleteMarker)); e == nil {
+		if !pin {
+			// A segment being deleted holds no pin; unpin is already done.
+			return nil
+		}
 		return errStorageDeleting
 	}
 	key := id + "/" + name
 	directory, err := os.Open(filepath.Join(r.sessionDir(id), name))
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// Only a missing directory proves there is no pin marker.
+			return fmt.Errorf("recording_storage_failed")
+		}
+		if !pin {
+			return nil
+		}
 		return fmt.Errorf("segment_not_found")
 	}
 	defer directory.Close()
@@ -1357,7 +1368,15 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	stored := r.stored[key]
 	r.mu.Unlock()
 	if stored == nil {
-		return fmt.Errorf("segment_not_found")
+		if pin {
+			return fmt.Errorf("segment_not_found")
+		}
+		// Recovery may have skipped this session, so its marker can still be
+		// on disk. Remove it under the directory lock before reporting done.
+		if err := os.Remove(filepath.Join(r.sessionDir(id), name, "pinned")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("recording_storage_failed")
+		}
+		return nil
 	}
 	if !stored.sealed {
 		return fmt.Errorf("segment_not_sealed")

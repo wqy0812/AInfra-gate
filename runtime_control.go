@@ -56,6 +56,9 @@ type runtimeGeneration struct {
 	owner    string
 	refs     int
 	closed   bool
+	// validation is the sequence of the validate command currently allowed
+	// to report on this candidate. Unrelated commands must not supersede it.
+	validation uint64
 }
 type runtimeTest struct {
 	ConfigDigest    string `json:"config_digest,omitempty"`
@@ -326,6 +329,10 @@ func (c *ControlledGateway) ControlHandler() http.Handler {
 	})
 }
 
+// runtimeResultRetention is how many sequences behind the latest one a
+// finished command result stays readable. The platform relies on it.
+const runtimeResultRetention = 256
+
 func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseData {
 	c.cmdMu.Lock()
 	defer c.cmdMu.Unlock()
@@ -345,6 +352,12 @@ func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseDa
 		return newRuntimeResponse(200, old)
 	}
 	if cmd.Sequence <= c.sequence {
+		// A stale sequence is never executed. Inside the result retention
+		// window keep that outcome readable so a sender that lost the
+		// response can tell it from a lost result.
+		if cmd.Sequence+runtimeResultRetention > c.sequence {
+			c.results[cmd.Sequence] = &RuntimeResult{Sequence: cmd.Sequence, OperationID: cmd.OperationID, Status: "failed", Error: "stale_command", digest: digest}
+		}
 		return newRuntimeError(409, "stale_command")
 	}
 	if cmd.ExpectedRevision != c.revisionLocked() {
@@ -365,7 +378,7 @@ func (c *ControlledGateway) controlCommand(cmd RuntimeCommand) runtimeResponseDa
 		result.FinishedAt = &now
 	}
 	for n, v := range c.results {
-		if n+256 <= c.sequence && v.Status != "running" {
+		if n+runtimeResultRetention <= c.sequence && v.Status != "running" {
 			delete(c.results, n)
 		}
 	}
@@ -398,6 +411,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 		}
 		g.refs++
 		g.counts.Probes++
+		g.validation = cmd.Sequence
 		result.Status = "running"
 		c.wg.Add(1)
 		go func() {
@@ -410,7 +424,7 @@ func (c *ControlledGateway) executeLocked(cmd RuntimeCommand, result *RuntimeRes
 			result.Report = report
 			now := time.Now()
 			result.FinishedAt = &now
-			if c.candidate != g || c.sequence != cmd.Sequence || c.retired {
+			if c.candidate != g || g.validation != cmd.Sequence || c.retired {
 				result.Status = "failed"
 				result.Error = "validation_superseded"
 			} else if e != nil {

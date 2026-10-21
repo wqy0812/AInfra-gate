@@ -25,7 +25,7 @@ v3 另有 `record-start`、`record-stop`、`record-status`、`record-pin`、`rec
 
 v3 的 `counts` 用于平台汇总排空；v2 兼容视图不能当作总负载。共享目标的普通业务流量不阻止旧执行镜像申请测试占用。所有接口使用同一 boot、单调命令序号及结果集合，v2 和 v3 不能各自从 1 开始编号。
 
-命令体字段固定为 `protocol_version`、`operation_id`、`gateway_id`、`expected_boot_id`、`command_seq`、`expected_binding_revision`、`action`、`payload`。版本必须与路径一致；请求体上限 1 MiB，严格拒绝未知字段。相同序号和相同内容返回原结果，内容冲突、旧 boot、过期序号或绑定版本失配拒绝。最近 256 个序号范围内的已完成回执及进行中回执保留在内存，重启不保留。命令被受理不表示远端动作成功，调用方需检查 `status`、`error` 并查询异步验证结果。
+命令体字段固定为 `protocol_version`、`operation_id`、`gateway_id`、`expected_boot_id`、`command_seq`、`expected_binding_revision`、`action`、`payload`。版本必须与路径一致；请求体上限 1 MiB，严格拒绝未知字段。相同序号和相同内容返回原结果，内容冲突、旧 boot、过期序号或绑定版本失配拒绝。过期序号返回 409 `stale_command` 且从不执行，在 256 个序号保留窗口内同时保存 `failed / stale_command` 回执，丢失应答的调用方可据此改用新序号重发。最近 256 个序号范围内的已完成回执及进行中回执保留在内存，重启不保留。命令被受理不表示远端动作成功，调用方需检查 `status`、`error` 并查询异步验证结果。
 
 `prepare` 的 v3 payload 只包含下列绑定字段，不接受旧 Router 后端、业务密钥或功能运行配置：
 
@@ -42,7 +42,7 @@ v3 的 `counts` 用于平台汇总排空；v2 兼容视图不能当作总负载�
 
 版本号必须为正，绑定版本必须大于当前版本；`config_digest` 是功能服务实际返回的 64 位小写十六进制摘要，示例值不能用于真实接入。`target_url` 是功能服务根地址，无用户名、密码、查询参数或片段。平台保留 Router 版本与入口配置版本字段供固定旧执行镜像兼容读取，功能配置来源仍为本地文件。
 
-- `prepare` 仅构造候选目标，不访问 Router；`validate` 先核对目标 `/runtime/v1/status` 的服务身份、Router 与摘要，再通过其实际业务接口执行发现、JSON、SSE、工具调用及工具结果续答。工具调用阶段提供工具定义并通过提示请求调用，不传强制指定函数的 `tool_choice`，不要求后端支持该选择方式；返回的工具调用名称、ID、参数及结果续答仍须正确。默认两轮、每步 120 秒、总计 900 秒、max_tokens 1024。
+- `prepare` 仅构造候选目标，不访问 Router；`validate` 先核对目标 `/runtime/v1/status` 的服务身份、Router 与摘要，再通过其实际业务接口执行发现、JSON、SSE、工具调用及工具结果续答。工具调用阶段提供工具定义并通过提示请求调用，不传强制指定函数的 `tool_choice`，不要求后端支持该选择方式；返回的工具调用名称、ID、参数及结果续答仍须正确。默认两轮、每步 120 秒、总计 900 秒、max_tokens 1024。验证只在候选快照被替换、丢弃或激活，或同一候选再次 `validate` 时返回 `validation_superseded`；期间的其他命令（录制、测试占用等）不影响结果。
 - `quiesce` 立即关闭新请求准入，不等待旧请求结束。`activate` 原子替换当前快照并设置 `payload.admission`；调用方必须先确认自己拥有的暂停状态。
 - `resume` 仅允许同一操作恢复其暂停的旧快照；`discard` 释放该操作的候选快照；`retire` 永久停止当前 boot 接流。
 - `test-acquire`、`test-release`、`test-status` 使用 task ID 和 32～256 字节随机令牌。申请同时校验 Router、绑定版本、模型及配置摘要；旧客户端省略摘要时从当前快照取得。令牌只以摘要存储。释放留下 tombstone 防止迟到占用，在途测试结束前不清空占用；新 boot 不接受旧令牌。
