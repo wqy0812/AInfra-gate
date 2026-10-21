@@ -1,5 +1,22 @@
 # 当前部署身份
 
+## 2026-10-22 控制回执与录制 pin 修复发布
+
+四套在线 switch/proxy 更新至 main 源码 `b2a772c9a0f18d6f1f6db968fd71383b2c1422cf`。北京时间 00:31:25 开启维护，00:35:03 完成网关验收并恢复原 `maintenance=false`，约 217 秒。XPU 三条已受理 SSE 自然排空后替换；其他空闲网关先替换并分别恢复原绑定。常驻 replay 保持退役，平台固定回放镜像及推理服务未替换。
+
+修复 validate 被无关控制命令错误标为 superseded、丢失响应后 stale_command 结果不可查询，以及未登记或已不存在片段的 unpin 清理；保留真实存储错误。Go 全量测试、vet、相关控制及录制 race 回归通过。构建使用 Go 1.27.1、linux/amd64、CGO_ENABLED=0、离线显式 vendor、trimpath；内嵌 revision 匹配、vcs.modified=false。
+
+| 程序 | 四处实际进程 SHA-256 |
+| --- | --- |
+| aigate-switch | `e9f04c320f742daa4910b3d0c9ca28b668469d2078bbe156af2cc48d34c7f986` |
+| aigate-proxy | `8b4c923f054bfc0572f2d74d014bfabf0e391194a9decafc98f59c406cf5d509` |
+
+四处配置文件、有效 settings/backend、service_id、环境、启动参数及访问限制均保持；配置摘要未变，无需画像目录迁移。DCU 沿用 systemd；XPU 两个 Deployment 仅更改二进制 hostPath，恢复 1/1；A3/PPU 保留基础镜像，规范化 OCI 参数一致，旧容器停止且禁止自启。health、profile 状态/write_errors=0、metrics、未认证控制接口 403 及 OpenAPI 字节摘要通过。
+
+维护窗口即时快照及最终绑定均为 DCU revision=61/admission=true、XPU 36/true、A3 70/true、PPU 11/false。准备早期 A3 为 69/false，进入维护前已为 70/true；本轮以窗口即时快照为准，没有改写该绑定。三个开放入口模型发现正常；本轮未发送合成模型生成请求、创建真实回放或执行新模型接入。52 条任务、32 条固定执行版本、9 条录制归档、9 条回放执行及完整绑定表摘要保持，四条原录制定时计划恢复，无资源锁。
+
+新增服务器发布目录：dcu1 `/data4/aigate/releases/latest-code-20261022/`；xpu1、A3-gate `/var/lib/ai-gate/releases/latest-code-20261022/`；ppu `/home/wqy/aigate/releases/latest-code-20261022/`，均含 bin/private/checks；配套平台 test1 `/data2/code-eval/releases/latest-code-20261022/`。私有进程环境和 OCI 快照仅保留服务器；本地脱敏收据在 `deploy/latest-code-20261022/evidence/`。code-eval 的独立平台维护窗口见其发布记录。
+
 ## 2026-10-21 四套网关更新至最新 main
 
 北京时间 05:51:40 完成发布验收。再次 fetch 确认远端 main 为 `eefb6c8b111a811cb06248f8e2f75df1b41e41df`；DCU、XPU、A3、PPU 共八个实际 switch/proxy 进程均已核对新程序 SHA-256。使用 Go 1.27.1、linux/amd64、CGO_ENABLED=0、离线显式 vendor、trimpath 构建，内嵌 revision 匹配且 vcs.modified=false。Go 全量测试、vet 和画像相关 race 回归通过。
