@@ -1,5 +1,43 @@
 # 当前部署身份
 
+## 2026-10-21 四套网关更新至最新 main
+
+北京时间 05:51:40 完成发布验收。再次 fetch 确认远端 main 为 `eefb6c8b111a811cb06248f8e2f75df1b41e41df`；DCU、XPU、A3、PPU 共八个实际 switch/proxy 进程均已核对新程序 SHA-256。使用 Go 1.27.1、linux/amd64、CGO_ENABLED=0、离线显式 vendor、trimpath 构建，内嵌 revision 匹配且 vcs.modified=false。Go 全量测试、vet 和画像相关 race 回归通过。
+
+| 程序 | 四处实际进程 SHA-256 |
+| --- | --- |
+| aigate-switch | `378d239017fab22c5d17186d5b07a440cd0020ca0f5a0b20b66bef7a6ef4f213` |
+| aigate-proxy | `7031f90fbb49d4b8ff8b545931c311e0547b61251192f407b91e9030d50cf1d6` |
+
+| 环境 / SSH MCP target | 部署方式 | Router 版本 / binding revision | 恢复后的业务准入 |
+| --- | --- | --- | --- |
+| DCU / dcu1 | 原 aigate.service、aigate-proxy-dcu.service | 5 / 59 | true |
+| XPU / xpu1 | 原 ai-gate 两个 Kubernetes Deployment，均 1/1 | 5 / 36 | true |
+| A3 / A3-gate | 原 ai-gateway namespace 的 switch/proxy 容器 | 8 / 66 | true |
+| PPU / ppu | 原 ai-gateway namespace 的 switch/proxy 容器 | 3 / 11 | false，保持原暂停状态 |
+
+使用平台维护、资源锁及认证 quiesce，停用并最终恢复原两条录制定时计划；XPU 原有三条 SSE 自然排空后才替换。后端地址、Router 身份、原配置文件、控制凭据、业务环境、监听、数据挂载及资源限制保持。A3/PPU 规范化 OCI 一致，XPU Deployment spec 仅二进制 hostPath 改变；DCU 在原 unit.d 目录新增末尾 ExecStart 覆盖文件。旧容器停止并禁止自动重启，保留作发布证据。
+
+新版移除 profile 的 max_index_entries/max_payload_bytes 两项旧零值字段，使规范化配置摘要及画像策略目录哈希改变；已核对其他有效 settings 与 backend 完全相同。通过现有平台 refresh_target 追加观察版本及原生 recover 状态机恢复原后端与原准入，四项操作均 completed、committed=true。旧 Router 版本及固定历史任务版本保留，没有将历史任务改为新配置。
+
+为继续读取画像与累计计数，将原 request-profile/fa94c4f0381ba13d 中 20,339 文件、117,551,878 bytes 逐文件 SHA-256 校验复制到新 request-profile/57276ab4504021a8，保留原目录、文件权限及属主。四处 profile 状态与指标可读、write_errors=0。52 条评测任务、32 条固定执行版本、9 条录制归档、9 条回放执行记录的完整表摘要前后一致；网关绑定仅按本次新摘要追加 Router 版本与 revision。录制原始目录及已有结果没有手工清理。
+
+四处 health、profile 状态、metrics、未认证 control 状态拒绝 403 及与源码逐字节一致的 OpenAPI 通过。DCU/XPU/A3 的业务模型分别为 DeepSeek-V4-Flash-0731-FP8-Channel、glm-5.2、dsv4-spark；三个原后端均通过真实业务入口的单次合成 SSE，HTTP 200、有效输出、finish_reason、完整 DONE 与 EOF 通过，耗时 0.500 / 2.556 / 0.690 秒。PPU 保持暂停，models 返回 503。最终 maintenance=false、health=ok、active_count=0、reservations=[]、scheduler_error=null、无网关资源锁或候选配置。
+
+本次覆盖四套在线网关的 switch/proxy。四处常驻 replay 保持退役且禁止自启动，旧端口均无监听；原 hwA3-1 无活动网关及对应端口。平台一次性回放任务继续使用其固定镜像，回放内核自已部署的 3ba7952 后没有新的源码逻辑改动，本次未替换该平台镜像、重放任务或修改可复用方案。
+
+新增服务器发布根目录如下，各含 bin/、private/；四个网关还含受限 private/profile-new-before-migration/。私有配置和逐文件迁移清单仅保存在服务器，未下载凭据或数据库。
+
+| 节点 | 新增发布目录 | 新版自动创建并承接历史的画像目录 |
+| --- | --- | --- |
+| dcu1 | `/data4/aigate/releases/latest-aigate-20261021/` | `/data4/aigate/proxy-31d935c8d7c6449d85a78ea486ac2912/request-profile/57276ab4504021a8/` |
+| xpu1 | `/var/lib/ai-gate/releases/latest-aigate-20261021/` | `/var/lib/ai-gate/proxy-13415960b76b43378cca684fa51550e3/request-profile/57276ab4504021a8/` |
+| A3-gate | `/var/lib/ai-gate/releases/latest-aigate-20261021/` | `/var/lib/ai-gate/releases/relocate-back-20261019/proxy/request-profile/57276ab4504021a8/` |
+| ppu | `/home/wqy/aigate/releases/latest-aigate-20261021/` | `/bmcp_lvm_fs/aigate/proxy/request-profile/57276ab4504021a8/` |
+| test1 | `/data2/code-eval/releases/latest-aigate-20261021/` | 无 |
+
+脱敏完成汇总在 deploy/latest-aigate-20261021/verification.json，各节点实际进程、HTTP、画像迁移及平台收据在同目录 evidence/。构建包装脚本的跨平台执行报错、DCU Python 3.7 的 shlex.join 不支持、首次立即读取维护缓存及摘要变化导致的首次绑定恢复失败均已留痕并修正当前发布工具，没有回退或启动旧程序。
+
 ## 2026-10-20 唯一回放执行器与历史数据统一
 
 平台已于北京时间 14:46:10 完成历史数据统一和当前执行器发布。Go 回放源码 `3ba79524f87ba5b9f0dfc54ad49bd11b7a421a86`，linux/amd64 二进制 SHA-256 `db976655546e212b89ad5e03a5a278d5ca8917538cce48bad3ca9fea0b7e3680`，固定任务镜像 `sha256:36b0d32bfe02f3888e1c13ca0b1962d6527c7b1556629ae292f30de4df7468be`。test2/test3 新任务只允许该镜像；旧任务固定身份和历史镜像实体保留。
