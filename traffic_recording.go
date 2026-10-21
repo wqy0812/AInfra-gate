@@ -1368,10 +1368,15 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	stored := r.stored[key]
 	r.mu.Unlock()
 	if stored == nil {
-		if !pin {
-			return nil
+		if pin {
+			return fmt.Errorf("segment_not_found")
 		}
-		return fmt.Errorf("segment_not_found")
+		// Recovery may have skipped this session, so its marker can still be
+		// on disk. Remove it under the directory lock before reporting done.
+		if err := os.Remove(filepath.Join(r.sessionDir(id), name, "pinned")); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("recording_storage_failed")
+		}
+		return nil
 	}
 	if !stored.sealed {
 		return fmt.Errorf("segment_not_sealed")

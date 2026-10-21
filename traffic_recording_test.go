@@ -635,6 +635,20 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	if err := r.pinLocked("old", "20991231T2330", false, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("unpin missing segment", err)
 	}
+	// A segment recovery did not register still loses its marker on unpin.
+	unregistered := filepath.Join(r.root, "skipped", "20990101T0030")
+	if err := os.MkdirAll(unregistered, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unregistered, "pinned"), []byte("x\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.pinLocked("skipped", "20990101T0030", false, func(e error) { done <- e }); err != nil || <-done != nil {
+		t.Fatal("unpin unregistered segment", err)
+	}
+	if _, err := os.Stat(filepath.Join(unregistered, "pinned")); !os.IsNotExist(err) {
+		t.Fatal("unpin reported success but kept the marker", err)
+	}
 	// A storage error is not proof that the pin marker is gone.
 	if err := os.WriteFile(filepath.Join(r.root, "blocked"), nil, 0600); err != nil {
 		t.Fatal(err)
