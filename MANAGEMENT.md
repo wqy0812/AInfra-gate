@@ -25,7 +25,7 @@ v3 另有 `record-start`、`record-stop`、`record-status`、`record-pin`、`rec
 
 v3 的 `counts` 用于平台汇总排空；v2 兼容视图不能当作总负载。共享目标的普通业务流量不阻止旧执行镜像申请测试占用。所有接口使用同一 boot、单调命令序号及结果集合，v2 和 v3 不能各自从 1 开始编号。
 
-命令体字段固定为 `protocol_version`、`operation_id`、`gateway_id`、`expected_boot_id`、`command_seq`、`expected_binding_revision`、`action`、`payload`。版本必须与路径一致；请求体上限 1 MiB，严格拒绝未知字段。相同序号和相同内容返回原结果，内容冲突、旧 boot、过期序号或绑定版本失配拒绝。过期序号返回 409 `stale_command` 且从不执行，同时保存 `failed / stale_command` 回执，丢失应答的调用方可据此改用新序号重发。最近 256 个序号范围内的已完成回执及进行中回执保留在内存，重启不保留。命令被受理不表示远端动作成功，调用方需检查 `status`、`error` 并查询异步验证结果。
+命令体字段固定为 `protocol_version`、`operation_id`、`gateway_id`、`expected_boot_id`、`command_seq`、`expected_binding_revision`、`action`、`payload`。版本必须与路径一致；请求体上限 1 MiB，严格拒绝未知字段。相同序号和相同内容返回原结果，内容冲突、旧 boot、过期序号或绑定版本失配拒绝。过期序号返回 409 `stale_command` 且从不执行，在 256 个序号保留窗口内同时保存 `failed / stale_command` 回执，丢失应答的调用方可据此改用新序号重发。最近 256 个序号范围内的已完成回执及进行中回执保留在内存，重启不保留。命令被受理不表示远端动作成功，调用方需检查 `status`、`error` 并查询异步验证结果。
 
 `prepare` 的 v3 payload 只包含下列绑定字段，不接受旧 Router 后端、业务密钥或功能运行配置：
 

@@ -635,6 +635,15 @@ func TestRecordingRecoveryAndCapacityEviction(t *testing.T) {
 	if err := r.pinLocked("old", "20991231T2330", false, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("unpin missing segment", err)
 	}
+	// A storage error is not proof that the pin marker is gone.
+	if err := os.WriteFile(filepath.Join(r.root, "blocked"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.pinLocked("blocked", "20990101T0030", false, func(e error) { done <- e }); err != nil {
+		t.Fatal(err)
+	} else if e := <-done; e == nil || e.Error() != "recording_storage_failed" {
+		t.Fatal("unpin storage error", e)
+	}
 	if err := r.pinLocked("old", "20990101T0030", true, func(e error) { done <- e }); err != nil || <-done != nil {
 		t.Fatal("pin before restart", err)
 	}

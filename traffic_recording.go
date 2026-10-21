@@ -1350,7 +1350,11 @@ func (r *trafficRecorder) pin(id, name string, pin bool) error {
 	key := id + "/" + name
 	directory, err := os.Open(filepath.Join(r.sessionDir(id), name))
 	if err != nil {
-		if !pin && errors.Is(err, os.ErrNotExist) {
+		if !errors.Is(err, os.ErrNotExist) {
+			// Only a missing directory proves there is no pin marker.
+			return fmt.Errorf("recording_storage_failed")
+		}
+		if !pin {
 			return nil
 		}
 		return fmt.Errorf("segment_not_found")

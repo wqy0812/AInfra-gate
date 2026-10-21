@@ -523,3 +523,36 @@ func TestSwitchStaleCommandOutcomeIsReadable(t *testing.T) {
 		t.Fatal("stale command changed gateway state")
 	}
 }
+
+func TestSwitchStaleOutcomesStayInsideRetentionWindow(t *testing.T) {
+	c := controlledFixture(t)
+	latest := RuntimeCommand{ProtocolVersion: 3, OperationID: "latest", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: 10000, Action: "quiesce", Payload: json.RawMessage(`{}`)}
+	if status, _ := controlRequest(t, c, latest); status != 200 {
+		t.Fatal(status)
+	}
+	// Only stale commands arrive; no newer command runs the cleanup.
+	for _, seq := range append(sequenceRange(1, 1000), latest.Sequence-1) {
+		stale := RuntimeCommand{ProtocolVersion: 3, OperationID: "stale", GatewayID: c.id, ExpectedBootID: c.boot, Sequence: seq, Action: "resume", Payload: json.RawMessage(`{}`)}
+		if status, _ := controlRequest(t, c, stale); status != 409 {
+			t.Fatal("stale command accepted", seq, status)
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for n := range c.results {
+		if n+runtimeResultRetention <= c.sequence {
+			t.Fatal("result kept outside the retention window", n, len(c.results))
+		}
+	}
+	if r := c.results[latest.Sequence-1]; r == nil || r.Error != "stale_command" {
+		t.Fatal("stale outcome inside the window was not kept")
+	}
+}
+
+func sequenceRange(from, to uint64) []uint64 {
+	out := []uint64{}
+	for n := from; n <= to; n++ {
+		out = append(out, n)
+	}
+	return out
+}
