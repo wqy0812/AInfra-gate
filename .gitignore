@@ -15,6 +15,7 @@ body-agent-ds4.json
 /slow-requests/
 .aigate/
 __pycache__/
+.venv/
 *.py[cod]
 .DS_Store
 coverage.out

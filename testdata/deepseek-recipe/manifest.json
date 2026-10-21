@@ -1,0 +1,2122 @@
+{
+  "schema_version": 1,
+  "policies": [
+    {
+      "id": "v4_default",
+      "model_version": "v4",
+      "default_thinking_mode": true,
+      "reasoning_content": "fill_empty",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    },
+    {
+      "id": "v4_strict",
+      "model_version": "v4",
+      "default_thinking_mode": true,
+      "reasoning_content": "reject",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    },
+    {
+      "id": "v4_nonthinking",
+      "model_version": "v4",
+      "default_thinking_mode": false,
+      "reasoning_content": "fill_empty",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    },
+    {
+      "id": "v41_default",
+      "model_version": "v41",
+      "default_thinking_mode": true,
+      "reasoning_content": "fill_empty",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    },
+    {
+      "id": "v41_strict",
+      "model_version": "v41",
+      "default_thinking_mode": true,
+      "reasoning_content": "reject",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    },
+    {
+      "id": "v41_nonthinking",
+      "model_version": "v41",
+      "default_thinking_mode": false,
+      "reasoning_content": "fill_empty",
+      "model_aliases": [
+        "Effect First",
+        "dsv4-spark",
+        "fixture-model",
+        "recipe-upstream",
+        "original-model"
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "id": "fixed_body",
+      "source": {
+        "path": "docs/MODEL_ADMISSION.md",
+        "test": "body.json",
+        "note": "Original admission file, read without changing its contents; model aliases are hypothetical evaluation mappings."
+      },
+      "request": {
+        "file": "testdata/model-admission/body.json",
+        "sha256": "8525ce2591de6c2a389396d6acaebaac7b3928f6a04adbb3d33e1839c712bb90"
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/message_count",
+          "equals": 47
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/tool_count",
+          "equals": 21
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/inference/max_tokens",
+          "equals": 28000
+        }
+      ]
+    },
+    {
+      "id": "fixed_body_agent_ds4",
+      "source": {
+        "path": "docs/MODEL_ADMISSION.md",
+        "test": "body-agent-ds4.json",
+        "note": "Original admission file, read without changing its contents; model aliases are hypothetical evaluation mappings."
+      },
+      "request": {
+        "file": "testdata/model-admission/body-agent-ds4.json",
+        "sha256": "eb15927d1100c4bf341f177c22f5d966b660fdb7e22ee89eeb662d5ccd6cf1b7"
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/message_count",
+          "equals": 277
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/tool_count",
+          "equals": 21
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/inference/max_tokens",
+          "equals": 28000
+        }
+      ]
+    },
+    {
+      "id": "metadata_mixed",
+      "source": {
+        "path": "xpu_compat_test.go",
+        "test": "TestJSONStringMetadataHTTP/mixed",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "metadata": {
+            "workspace": {
+              "n": 9007199254740993
+            },
+            "s": "{\"x\":1}",
+            "a": [
+              1,
+              2
+            ],
+            "n": 123,
+            "b": false,
+            "nil": null
+          }
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "json_string",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/aigate/payload/metadata",
+          "equals": {
+            "workspace": "{\"n\":9007199254740993}",
+            "s": "{\"x\":1}",
+            "a": "[1,2]",
+            "n": "123",
+            "b": "false",
+            "nil": "null"
+          }
+        }
+      ]
+    },
+    {
+      "id": "metadata_array_rejected",
+      "source": {
+        "path": "xpu_compat_test.go",
+        "test": "TestJSONStringMetadataHTTP/array",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "metadata": []
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "json_string",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "error"
+        },
+        {
+          "path": "/aigate/error/code",
+          "equals": "invalid_metadata"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "not_run"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "not_run"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "not_run"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "not_run"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "not_run"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "not_run"
+        }
+      ]
+    },
+    {
+      "id": "workspace_object_only",
+      "source": {
+        "path": "workspace_test.go",
+        "test": "TestWorkspaceCompatibilityHTTP/object",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "metadata": {
+            "workspace": {
+              "path": "/项目",
+              "name": "demo",
+              "n": 9007199254740993
+            },
+            "other": {
+              "x": 1
+            },
+            "count": 2,
+            "flag": false,
+            "nil": null,
+            "list": [
+              1
+            ]
+          }
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "workspace_object_json_string",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/aigate/payload/metadata/other",
+          "equals": {
+            "x": 1
+          }
+        },
+        {
+          "path": "/aigate/payload/metadata/workspace",
+          "equals": "{\"path\":\"/项目\",\"name\":\"demo\",\"n\":9007199254740993}"
+        }
+      ]
+    },
+    {
+      "id": "protected_overrides",
+      "source": {
+        "path": "gateway_test.go",
+        "test": "TestCompatibilityAndOverrides",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": false,
+          "patches": {},
+          "result_format": "message"
+        }
+      },
+      "backend": {
+        "overrides": {
+          "model": "wrong",
+          "stream": true,
+          "temperature": 0.2
+        },
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": [
+            "patches"
+          ]
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/aigate/payload/model",
+          "equals": "recipe-upstream"
+        },
+        {
+          "path": "/aigate/payload/stream",
+          "equals": false
+        },
+        {
+          "path": "/aigate/payload/temperature",
+          "equals": 0.2
+        }
+      ]
+    },
+    {
+      "id": "tool_result_continuation",
+      "source": {
+        "path": "slow_requests_test.go",
+        "test": "slowTestBody",
+        "note": "Exact existing synthetic request constant, including tool call ID, result, metadata, extension, and large integer seed."
+      },
+      "request": {
+        "body": {
+          "stream": true,
+          "model": "original-model",
+          "messages": [
+            {
+              "role": "system",
+              "content": "private system"
+            },
+            {
+              "role": "user",
+              "content": "一二三四五六七八九十秘密\n尾部"
+            },
+            {
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "id": "call1",
+                  "type": "function",
+                  "function": {
+                    "name": "lookup",
+                    "arguments": "{}"
+                  }
+                }
+              ],
+              "content": null
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "call1",
+              "content": "private tool result"
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ],
+          "seed": 9007199254740993,
+          "metadata": {
+            "workspace": {
+              "name": "private workspace"
+            }
+          },
+          "extension": {
+            "raw": 1.0
+          }
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/aigate/payload/seed",
+          "equals": 9007199254740993
+        }
+      ]
+    },
+    {
+      "id": "thinking_default",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "high"
+        }
+      ]
+    },
+    {
+      "id": "thinking_minimal",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "reasoning_effort": "minimal"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "low"
+        }
+      ]
+    },
+    {
+      "id": "thinking_medium",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "reasoning_effort": "medium"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "high"
+        }
+      ]
+    },
+    {
+      "id": "thinking_xhigh",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "xhigh"
+        }
+      ]
+    },
+    {
+      "id": "thinking_max",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "reasoning_effort": "max"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "max"
+        }
+      ]
+    },
+    {
+      "id": "thinking_none",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "reasoning_effort": "none"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": false
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": null
+        }
+      ]
+    },
+    {
+      "id": "thinking_disabled_wins",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "thinking": {
+            "type": "disabled"
+          },
+          "reasoning_effort": "max"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": false
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": null
+        }
+      ]
+    },
+    {
+      "id": "thinking_enabled_wins",
+      "source": {
+        "path": "https://github.com/deepseek-ai/deepseek-recipe/blob/935817c66f5d6e64838f419692545f06787e485f/deepseek-recipe/src/protocol/reasoning.rs",
+        "test": "resolve_thinking_mode",
+        "note": "Synthetic precedence/mapping probe from phase-one evaluation."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "temperature": 0.2,
+          "top_p": 0.3,
+          "thinking": {
+            "type": "enabled"
+          },
+          "reasoning_effort": "none"
+        }
+      },
+      "backend": {
+        "overrides": {},
+        "compatibility": {
+          "metadata_values": "preserve",
+          "drop_fields": []
+        }
+      },
+      "target_model": "recipe-upstream",
+      "checks": [
+        {
+          "path": "/aigate/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_default/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_strict/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v41_nonthinking/adapted/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/thinking_mode",
+          "equals": true
+        },
+        {
+          "path": "/official/v4_default/adapted/summary/conversation/reasoning_effort",
+          "equals": "high"
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "id": "plain_unicode",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "disabled"
+          },
+          "tools": [],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "你好🙂",
+      "finish": "Stop",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": "你好🙂"
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "stop"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": "你好🙂"
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "stop"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        }
+      ]
+    },
+    {
+      "id": "reasoning_to_content",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "enabled"
+          },
+          "tools": [],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "Let me think.\n</think>\nThe answer.",
+      "finish": "Stop",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": "The answer."
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": "Let me think."
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "stop"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": "The answer."
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": "Let me think."
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "stop"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        }
+      ]
+    },
+    {
+      "id": "reasoning_only_length",
+      "source": {
+        "path": "xpu_compat_test.go",
+        "test": "TestReasoningOnlyResponseHTTP",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "enabled"
+          },
+          "tools": [],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "thinking",
+      "finish": "Length",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": "thinking"
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "length"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": "thinking"
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "length"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        }
+      ]
+    },
+    {
+      "id": "tool_dsml",
+      "source": {
+        "path": "protocol_fixture_test.go",
+        "test": "protocolBackend.serve",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "disabled"
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "echo",
+                "description": "Echo a value",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ]
+                }
+              }
+            }
+          ],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"echo\">\n<｜DSML｜parameter name=\"value\" string=\"true\">你好🙂</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+      "finish": "Stop",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "tool_calls"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/tools",
+          "equals": [
+            {
+              "index": 0,
+              "name": "echo",
+              "arguments": {
+                "value": "你好🙂"
+              }
+            }
+          ]
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "tool_calls"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/tools",
+          "equals": [
+            {
+              "index": 0,
+              "name": "echo",
+              "arguments": {
+                "value": "你好🙂"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reasoning_then_tool",
+      "source": {
+        "path": "protocol_fixture_test.go",
+        "test": "protocolBackend.serve",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "enabled"
+          },
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "echo",
+                "description": "Echo a value",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ]
+                }
+              }
+            }
+          ],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "Check the tool.\n</think>\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"echo\">\n<｜DSML｜parameter name=\"value\" string=\"true\">你好🙂</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+      "finish": "Stop",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": "Check the tool."
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "tool_calls"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/tools",
+          "equals": [
+            {
+              "index": 0,
+              "name": "echo",
+              "arguments": {
+                "value": "你好🙂"
+              }
+            }
+          ]
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": "Check the tool."
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "tool_calls"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/tools",
+          "equals": [
+            {
+              "index": 0,
+              "name": "echo",
+              "arguments": {
+                "value": "你好🙂"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "length",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "disabled"
+          },
+          "tools": [],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "partial",
+      "finish": "Length",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": "partial"
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "length"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": "partial"
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "length"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        }
+      ]
+    },
+    {
+      "id": "content_filter",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries",
+        "note": "Synthetic raw DeepSeek text for the existing protocol scenario; not reconstructed from SSE and not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "thinking": {
+            "type": "disabled"
+          },
+          "tools": [],
+          "stream_options": {
+            "include_usage": true
+          }
+        }
+      },
+      "policy": "v4_default",
+      "output": "",
+      "finish": "ContentFilter",
+      "checks": [
+        {
+          "path": "/whole/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/whole/canonical/choices/0/finish_reasons",
+          "equals": [
+            "content_filter"
+          ]
+        },
+        {
+          "path": "/whole/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/whole/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/content",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/reasoning",
+          "equals": ""
+        },
+        {
+          "path": "/characters/canonical/choices/0/finish_reasons",
+          "equals": [
+            "content_filter"
+          ]
+        },
+        {
+          "path": "/characters/canonical/tool_ids_valid",
+          "equals": true
+        },
+        {
+          "path": "/characters/aigate/completion_class",
+          "equals": ""
+        }
+      ]
+    }
+  ],
+  "wire_cases": [
+    {
+      "id": "fragmented_tool_call",
+      "source": {
+        "path": "scripts/test_model_admission.py",
+        "test": "test_fragmented_tool_call",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"look\",\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"up\",\"arguments\":\"\\\"test\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\ndata: [DONE]\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/admission/status",
+          "equals": "ok"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "reasoning_only",
+      "source": {
+        "path": "scripts/test_model_admission.py",
+        "test": "test_abnormal_completion",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\ndata: [DONE]\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "missing_done",
+      "source": {
+        "path": "scripts/test_model_admission.py",
+        "test": "test_abnormal_completion",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": "stream_incomplete"
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "unterminated_done",
+      "source": {
+        "path": "scripts/test_model_admission.py",
+        "test": "test_unterminated_data_event",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\ndata: [DONE]\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": "stream_incomplete"
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "output_after_finish",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries/reasoning_after_finish",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"late\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": "protocol_error"
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "duplicate_done",
+      "source": {
+        "path": "sse_completion_test.go",
+        "test": "TestSSECompletionBoundaries/duplicate_done",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\ndata: [DONE]\n\ndata: [DONE]\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": "protocol_error"
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    },
+    {
+      "id": "nan_tool_arguments",
+      "source": {
+        "path": "scripts/test_model_admission.py",
+        "test": "test_non_json_constants",
+        "note": "Minimal fixture extracted from the existing regression; not a live recording."
+      },
+      "request": {
+        "body": {
+          "model": "fixture-model",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello"
+            }
+          ],
+          "stream": true,
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "sse": "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"value\\\":NaN}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\ndata: [DONE]\n\n",
+      "checks": [
+        {
+          "path": "/aigate/completion_class",
+          "equals": ""
+        },
+        {
+          "path": "/admission/status",
+          "equals": "error"
+        },
+        {
+          "path": "/official/status",
+          "equals": "not_applicable"
+        }
+      ]
+    }
+  ]
+}

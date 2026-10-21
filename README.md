@@ -74,6 +74,14 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/
 
 控制协议、配置边界、画像 HTTP/分析队列及预算、观测存储故障、控制进程启动与 SIGTERM 收尾均有离线回归。网络夹具仅使用本机临时监听器，磁盘夹具使用临时目录，不访问部署节点或真实模型。
 
+## DeepSeek 离线兼容性对照
+
+独立 Python 工具使用固定的 `deepseek-recipe==0.2.0`，对照两个固定请求和已有
+问题夹具，通过测试专用 Go 文件入口运行当前适配器与 SSE 观察器。报告记录
+模型别名、转换策略、输入/源码摘要、字段差异及可复现基线差异；不访问线上模型，
+不接入生产链路，也不替代真实模型准入门禁。安装和运行见
+[离线对照说明](docs/DEEPSEEK_RECIPE_COMPARE.md)。
+
 ## 业务响应与旁路观测
 
 OpenAI 适配器的非流式响应采用“正文、状态码及指定响应头透传”；生成阶段的非 2xx 响应也采用此规则。指定头为 `Content-Type`、`Content-Encoding`、`Retry-After`、`WWW-Authenticate`、`Location`，过滤 `Connection` 指定的逐跳头，不传递上游 Cookie 或覆盖网关的请求 ID。`Cache-Control`、`Vary` 等不在透传名单中。Go Transport 自动解压时转发解压后的正文及对应响应头。SSE 成功响应支持未编码、`identity` 和单层 `gzip`；显式请求的 gzip 也会在观察和转发前流式解压，客户端收到未压缩 SSE。其他编码返回 HTTP 502 `invalid_upstream_stream`；流中解压失败沿用读取错误处理，不视为正常完成。观察器已识别并转发 `[DONE]` 后发生读取错误时，仍按读取错误记录，但网关不再追加错误事件；此规则不覆盖观察器因解析上限停止解析而未识别 `[DONE]` 的情况，也不拦截上游在 `[DONE]` 后发送的数据。模板适配器仍执行响应转换。
