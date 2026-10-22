@@ -1,5 +1,17 @@
 # 当前部署身份
 
+## 2026-10-22 A3 本地双网关与统一授时
+
+A3 当前只保留三套在线入口：原 A3-gate `122.52.5.131:9090/v1` 继续服务 A3-1/2；A3-3 新建 `a3-34-local`，接管 `122.20.125.28:8000/v1`；A3-5 新建 `a3-56-local`，接管 `122.20.125.29:8001/v1`。新两套为独立 switch/proxy，使用新的身份、控制密钥和数据，未迁移原网关。两套临时 `9091/9092` switch/proxy 已停止且 restart.policy=no、restart.status=stopped，相关八个端口均无监听；历史容器、数据及平台登记保留，不计为在线入口。原 `9090` 进程和 binding revision=72、admission=true 保持。
+
+新服务使用源码 `03e84d391448ad9626c4a280a2446134d6581c4e`，Go 1.27.1、linux/arm64、CGO_ENABLED=0、离线 vendor、trimpath、vcs.modified=false 构建。switch SHA-256 `7872c3ffdb9279b7f7b703d8b0b531dca3a189745ff4e7c6e507d20b6f6f2ea7`；proxy SHA-256 `1775ab922a8a111d48c528b842a57e8909877152558b2822e4dd86a1fcca5c93`。使用现有 systemd 模板，active/enabled、NRestarts=0；proxy 4 GiB、switch 512 MiB，各 2 CPU。proxy/观测/控制分别为主机地址上的 18084/18082/18083，来源限制持久化；控制仍要求 Bearer。Router 只替换监听和容器启动方式，分别改为 `127.0.0.1:18000/18001`，复用镜像 config `sha256:3c94101c0c3e6527227b46ac41ff7458d1110589377d971b53770265fc7dc286`，P/D、Master、Store、权重及缓存参数未修改。
+
+两套 proxy 的两个完整固定门禁均通过，分别耗时 121.495/41.293 秒和 131.718/18.698 秒，HTTP 200、完整 DONE、合法结构化工具调用及有效 usage。首次平台绑定的九项校验通过，但因节点时钟偏差导致控制器 freshness 判断失败，未提交。按用户要求统一授时后，以新操作 ID `aigate-local-20261022-bind-synced-34/56` 完成绑定，均 completed、committed=true，revision=1、admission=true、desired/observed 一致。最终业务 JSON/SSE、远端无法访问内部 Router、未认证控制 403、来源限制、40 个端点空闲健康、画像 write_errors=0 均通过。
+
+A3-3/4/5/6 原 chronyd 无可用源，分别慢约 150/329/861/103 秒。四台改用 eval 平台与 DCU 既有时间源：主 `122.16.46.15`、备 `122.16.46.16`，主源 prefer、minpoll=4/maxpoll=6，chronyd 开机启用。最终四台 NTPSynchronized=yes、Leap Normal、选择主源，跟踪 System time 偏差均小于 1 毫秒；另核验 test1/2/3、A3-gate、hwA3-1/2、dcu1 也使用同组源。未发布 code-eval 程序改动，未重放回放或准确率任务；原 dual16 保留 awaiting_final_review。
+
+新目录：A3-3、A3-5 各 `/data0/aigate-local-20261022/`、`/etc/aigate/`、`/var/lib/aigate-record/`、各自 `/var/lib/aigate-proxy-a3-34-local-router/` 或 `/var/lib/aigate-proxy-a3-56-local-router/` 及对应两个 systemd 实例 drop-in 目录；test1 `/tmp/aigate-local-20261022/`。两台本地原始门禁和最终检查位于新根目录 `evidence/`，平台操作与业务检查在 test1 新根目录 `evidence/`，临时容器停止收据在 A3-gate 原发布根 `evidence/local-gateways-stopped-20261022.json`。授时四台备份为 `/etc/chrony.conf.aigate-local-20261022.bak`，收据为 `/var/tmp/chrony-unify-20261022.json`。可维护的启动包装与验证脚本见 [A3 本地接管](../../environment/A3/patch/image-pd-router/20261022-aigate-local/README.md)。
+
 ## 2026-10-22 控制回执与录制 pin 修复发布
 
 四套在线 switch/proxy 更新至 main 源码 `b2a772c9a0f18d6f1f6db968fd71383b2c1422cf`。北京时间 00:31:25 开启维护，00:35:03 完成网关验收并恢复原 `maintenance=false`，约 217 秒。XPU 三条已受理 SSE 自然排空后替换；其他空闲网关先替换并分别恢复原绑定。常驻 replay 保持退役，平台固定回放镜像及推理服务未替换。
