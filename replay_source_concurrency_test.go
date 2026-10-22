@@ -1,6 +1,7 @@
 package aigate
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -12,11 +13,19 @@ import (
 )
 
 func TestReplayIndependentRecordingAllowances(t *testing.T) {
-	root, req := overlayFixtureCount(t, 24)
+	for _, count := range []int{2, 3, 4} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) { testRecordingAllowances(t, count) })
+	}
+}
+
+func testRecordingAllowances(t *testing.T, count int) {
+	root, req := recordingsFixture(t, 24, count)
 	req.Mode, req.Concurrency = "concurrency", 8
-	var active, peak, sent [2]atomic.Int64
-	gates := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
-	var release [2]sync.Once
+	active, peak, sent := make([]atomic.Int64, count), make([]atomic.Int64, count), make([]atomic.Int64, count)
+	gates, release := make([]chan struct{}, count), make([]sync.Once, count)
+	for i := range gates {
+		gates[i] = make(chan struct{})
+	}
 	defer func() {
 		for i := range gates {
 			release[i].Do(func() { close(gates[i]) })
@@ -24,7 +33,7 @@ func TestReplayIndependentRecordingAllowances(t *testing.T) {
 	}()
 	target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
 		seq, _ := strconv.Atoi(strings.Split(r.Header.Get(headerReplay), "/")[1])
-		i := (seq - 1) % 2 // Equal offsets interleave the two recorded sources.
+		i := (seq - 1) % count // Equal offsets interleave all recorded sources.
 		n := active[i].Add(1)
 		defer active[i].Add(-1)
 		for old := peak[i].Load(); n > old && !peak[i].CompareAndSwap(old, n); old = peak[i].Load() {
@@ -41,26 +50,35 @@ func TestReplayIndependentRecordingAllowances(t *testing.T) {
 		t.Fatal(status, reason)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for (active[0].Load() != 8 || active[1].Load() != 8) && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	for i := range gates {
+		for active[i].Load() != 8 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if active[i].Load() != 8 {
+			t.Fatalf("source %d allowance not reached: %d", i, active[i].Load())
+		}
 	}
-	if active[0].Load() != 8 || active[1].Load() != 8 {
-		t.Fatalf("source allowances not reached: %d/%d", active[0].Load(), active[1].Load())
-	}
-	release[1].Do(func() { close(gates[1]) })
-	for sent[1].Load() != 24 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if sent[1].Load() != 24 || sent[0].Load() != 8 {
-		t.Fatalf("slow source blocked fast source or borrowed its allowance: %d/%d", sent[0].Load(), sent[1].Load())
+	for i := 1; i < count; i++ {
+		release[i].Do(func() { close(gates[i]) })
+		for sent[i].Load() != 24 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if sent[i].Load() != 24 || sent[0].Load() != 8 {
+			t.Fatalf("source %d blocked or slow source borrowed its allowance: %d/%d", i, sent[i].Load(), sent[0].Load())
+		}
 	}
 	release[0].Do(func() { close(gates[0]) })
 	view := f.wait(t, req.RunID)
-	if view.State != "completed" || view.Progress.Sent != 48 || peak[0].Load() > 8 || peak[1].Load() > 8 {
-		t.Fatal(view, peak[0].Load(), peak[1].Load())
+	if view.State != "completed" || view.Progress.Sent != int64(24*count) || len(view.Sources) != count {
+		t.Fatal(view)
+	}
+	for i := range peak {
+		if peak[i].Load() > 8 {
+			t.Fatal("source exceeded allowance", i, peak[i].Load())
+		}
 	}
 	report := buildReplayReport(f.svc.runDir(req.RunID), view)
-	if len(report.SourceInputs) != 2 {
+	if len(report.SourceInputs) != count {
 		t.Fatal(report.SourceInputs)
 	}
 	for _, source := range req.Recordings {
@@ -77,7 +95,7 @@ func TestReplayIndependentRecordingAllowances(t *testing.T) {
 		}
 		digest, _, _, _ := replayReportInput(dir, replayRunView{Plan: plan})
 		for _, input := range report.SourceInputs {
-			if input.GatewayID == source.GatewayID && input.InputDigest != digest {
+			if input.GatewayID == source.GatewayID && input.RecordingID == source.RecordingID && input.InputDigest != digest {
 				t.Fatal("source digest depends on sender grouping", input, digest)
 			}
 		}

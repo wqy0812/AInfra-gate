@@ -13,6 +13,43 @@ import (
 	"time"
 )
 
+func TestReplayTaskFourRecordings(t *testing.T) {
+	for _, mode := range []string{"timed", "concurrency"} {
+		t.Run(mode, func(t *testing.T) {
+			input, req := recordingsFixture(t, 2, 4)
+			req.Mode, req.Concurrency = mode, 0
+			if mode == "concurrency" {
+				req.Concurrency = 1
+			}
+			target := replayTarget(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+			})
+			root := t.TempDir()
+			t.Setenv("AIGATE_REPLAY_INPUT_ROOT", input)
+			t.Setenv("AIGATE_REPLAY_MARK_KEY", string(testMarkKey))
+			digests := map[string]string{}
+			for _, ref := range req.Recordings {
+				for _, segment := range ref.Segments {
+					digests[ref.GatewayID+"/"+ref.RecordingID+"/"+segment] = runtimeDigest("input")
+				}
+			}
+			task := replayTaskInput{BootID: "boot", PlanID: "plan", Targets: map[string]string{"r1": target.URL}, Recordings: req.Recordings, Digests: digests, Request: req}
+			if _, err := recordingAtomicJSON(root, "task.json", task); err != nil {
+				t.Fatal(err)
+			}
+			if err := RunReplayTask([]string{root}); err != nil {
+				t.Fatal(err)
+			}
+			raw, err := os.ReadFile(filepath.Join(root, "results", "runs", req.RunID, "report.json"))
+			var report replayReport
+			if err != nil || json.Unmarshal(raw, &report) != nil || report.Metrics.Success != 8 || len(report.SourceInputs) != 4 || report.RunState != "completed" {
+				t.Fatalf("four-recording task did not complete: %s, %v", raw, err)
+			}
+		})
+	}
+}
+
 // Keep a response open: UDS must expose live progress without NAS writes.
 func TestReplayTaskQueriesLiveProgress(t *testing.T) {
 	for _, mode := range []string{"timed", "concurrency"} {

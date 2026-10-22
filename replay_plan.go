@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	replayMaxRecordings  = 4
 	replayMaxSegments    = 96
 	replayMaxPlanItems   = 200_000
 	replayHeaderCopyable = "Content-Type,Content-Encoding,Accept,User-Agent"
@@ -71,7 +72,7 @@ func (r replayRequest) sources() []replayRecordingRef {
 
 func (r *replayRequest) normalize() error {
 	if len(r.Recordings) > 0 {
-		if len(r.Recordings) > 2 || r.Recording.GatewayID != "" || r.Recording.RecordingID != "" || len(r.Recording.Segments) != 0 {
+		if len(r.Recordings) > replayMaxRecordings || r.Recording.GatewayID != "" || r.Recording.RecordingID != "" || len(r.Recording.Segments) != 0 {
 			return fmt.Errorf("invalid_recordings")
 		}
 		seen := map[string]bool{}
