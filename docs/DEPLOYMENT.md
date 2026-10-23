@@ -1,5 +1,34 @@
 # 当前部署身份
 
+## 2026-10-24 Prefill 原始指纹持续采集
+
+北京时间 00:19:56 完成五套在线 proxy 的最终核验，并恢复原 `maintenance=false`。源码 `411bc900e8d5163222bc7bc00b660da6c37b5e7a`，包含持续采集、容量轮转、流式导出和按到达时间筛选分段。Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath、vcs.modified=false 构建。实际进程摘要如下：
+
+| 架构 / 节点 | aigate-proxy SHA-256 |
+| --- | --- |
+| linux/amd64：dcu1、xpu1、A3-gate | `b10e95ed7fcd69c7447141ab11abe9899554741a3d8037139881805170cf9c04` |
+| linux/arm64：A3-3、A3-5 | `19e01258f6ec9d0d9fe96005f517a2954de3d85595339dc7a251577e956b5805` |
+
+DCU、XPU、A3-1/2、A3-3/4、A3-5/6 的 binding revision 分别保持 63、36、76、4、4，准入均恢复 true。配置文件、有效 settings/backend、Router/功能服务身份、配置摘要、启动参数及环境逐项一致；原画像策略目录继续可读。switch、推理后端、模型及缓存配置保持原版本，PPU 维持退役状态。XPU proxy Deployment 恢复 1/1；A3-gate 旧 proxy 容器停止且禁止自启，规范化 OCI 配置保持。
+
+采集点为准备发送的适配后 payload，使用 UTF-8 字节、1024 字节边界和 HMAC 前缀链；保留完整输入指纹以及可为空的结果用量。每 Router 默认 10 GiB，仅按容量轮转，与录制会话和短期画像事件存储独立。观测输入不证明后端已执行 Prefill。详细算法、关联方式及导出完整性规则见 [Prefill 指纹说明](PREFILL_PREFIX.md)。
+
+五处采集均为 collecting，写入、队列丢弃、容量丢弃及超大记录计数为零。平台按实际保留起点导出，五个文件的结束标记、记录来源与 SHA-256 均通过，invalid=0、data_complete=true；即时输入/结果分别为 DCU 21/21、A3-1/2 5/5、XPU 14/14、A3-3/4 21/21、A3-5/6 21/21。这些观测记录包含既有自动请求，不视作真实业务压测。初版到最终版重启的四处采集器 key_id 保持；所有目录 0700、密钥 0600/32 字节。没有回填启用前数据。
+
+Go 全量测试、vet、9 项指纹相关 race 测试各重复 3 次通过，覆盖规范化、中文及尾块、不同前缀、适配后 payload、结果缺失、重启、队列/磁盘/容量异常、大记录、导出取消及固定快照、分段筛选。平台 API 和双视口下载验收见 code-eval 发布索引。停用并按发布前快照恢复四条录制计划，所有资源锁已释放；已受理请求自然排空后替换。恢复阶段首次 prepare 因原 revision 不递增而被控制面拒绝；确认五处 switch 当前绑定完整后，使用原 quiesce owner 的 resume 恢复准入，绑定表未改变。
+
+服务器新增发布根及原始数据目录如下；发布根含 bin/private，私有配置与进程环境只保存在服务器。
+
+| 节点 | 新增发布根 | 新增指纹数据目录 |
+| --- | --- | --- |
+| dcu1 | `/data4/aigate/releases/prefill-prefix-20261023/` | `/data4/aigate/proxy-31d935c8d7c6449d85a78ea486ac2912/prefill-prefix/` |
+| xpu1 | `/var/lib/ai-gate/releases/prefill-prefix-20261023/` | `/var/lib/ai-gate/proxy-13415960b76b43378cca684fa51550e3/prefill-prefix/` |
+| A3-gate | `/var/lib/ai-gate/releases/prefill-prefix-20261023/` | `/var/lib/ai-gate/releases/relocate-back-20261019/proxy/prefill-prefix/` |
+| A3-3 | `/var/lib/aigate/releases/prefill-prefix-20261023/` | `/var/lib/aigate-proxy-a3-34-local-router/prefill-prefix/` |
+| A3-5 | `/var/lib/aigate/releases/prefill-prefix-20261023/` | `/var/lib/aigate-proxy-a3-56-local-router/prefill-prefix/` |
+
+配套平台在 test1 新建 `/data2/code-eval/releases/prefill-prefix-20261023-be217bd/`，含受限维护快照和 exports。本地脱敏总回执为 `deploy/prefill-prefix-20261023/verification.json`，逐节点回执在其 `evidence/`；初版构建与验收证据保留，最终源码身份以上述 411bc90 为准。代码位于本地 `codex/prefill-prefix-trace`，未推送。
+
 ## 2026-10-22 A3 本地双网关与统一授时
 
 A3 当前只保留三套在线入口：原 A3-gate `122.52.5.131:9090/v1` 继续服务 A3-1/2；A3-3 新建 `a3-34-local`，接管 `122.20.125.28:8000/v1`；A3-5 新建 `a3-56-local`，接管 `122.20.125.29:8001/v1`。新两套为独立 switch/proxy，使用新的身份、控制密钥和数据，未迁移原网关。两套临时 `9091/9092` switch/proxy 已停止且 restart.policy=no、restart.status=stopped，相关八个端口均无监听；历史容器、数据及平台登记保留，不计为在线入口。原 `9090` 进程和 binding revision=72、admission=true 保持。
