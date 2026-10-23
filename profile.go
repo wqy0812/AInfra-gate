@@ -132,35 +132,37 @@ type profileQuery struct {
 	Model   string  `json:"model,omitempty"`
 }
 type requestProfiler struct {
-	directory      *os.File // exclude other writers and cross-generation cleanup
-	c              ProfileConfig
-	boot           string
-	counterStarted float64
-	started        time.Time
-	emitMu         sync.RWMutex
-	closed         bool
-	mu             sync.Mutex
-	active         map[uint64]profileLiveRequest
-	liveBackends   map[string]bool
-	values         map[string]float64
-	types          map[string]string
-	groups         map[string]bool
-	seq            atomic.Uint64
-	dropped        atomic.Uint64
-	writes         atomic.Uint64
-	queue          chan []byte
-	done           chan struct{}
-	closeOnce      sync.Once
-	diskMu         sync.Mutex
-	files          []string
-	oldest         float64
-	storedBytes    int64
-	lastWrite      float64
-	jobsMu         sync.Mutex
-	jobs           map[string]*profileJob
-	work           chan string
-	cancel         context.CancelFunc
-	workers        sync.WaitGroup
+	prefix            *prefillPrefixStore
+	prefixUnavailable string
+	directory         *os.File // exclude other writers and cross-generation cleanup
+	c                 ProfileConfig
+	boot              string
+	counterStarted    float64
+	started           time.Time
+	emitMu            sync.RWMutex
+	closed            bool
+	mu                sync.Mutex
+	active            map[uint64]profileLiveRequest
+	liveBackends      map[string]bool
+	values            map[string]float64
+	types             map[string]string
+	groups            map[string]bool
+	seq               atomic.Uint64
+	dropped           atomic.Uint64
+	writes            atomic.Uint64
+	queue             chan []byte
+	done              chan struct{}
+	closeOnce         sync.Once
+	diskMu            sync.Mutex
+	files             []string
+	oldest            float64
+	storedBytes       int64
+	lastWrite         float64
+	jobsMu            sync.Mutex
+	jobs              map[string]*profileJob
+	work              chan string
+	cancel            context.CancelFunc
+	workers           sync.WaitGroup
 }
 
 func newRequestProfiler(c ProfileConfig) (*requestProfiler, error) {
@@ -208,6 +210,9 @@ func (p *requestProfiler) close() {
 		close(p.queue)
 		p.emitMu.Unlock()
 		p.workers.Wait()
+		if p.prefix != nil {
+			p.prefix.close()
+		}
 		p.saveCounters()
 		unlockState(p.directory)
 		p.directory.Close()
@@ -330,6 +335,9 @@ func (p *requestProfiler) input(r *profileRequest, payload []byte, b *Backend, b
 	r.e.Kind = "input"
 	r.e.At = profileNow()
 	r.e.Bytes = len(payload)
+	if p.prefix != nil {
+		p.prefix.input(r.e, payload)
+	}
 	p.emit(r.e)
 }
 
@@ -380,6 +388,9 @@ func (p *requestProfiler) end(r *profileRequest, entry *auditEntry, cancelled bo
 	}
 	e.Duration = time.Since(r.start).Seconds()
 	e.Quality = r.quality
+	if p.prefix != nil {
+		p.prefix.end(e, entry.Status)
+	}
 	p.mu.Lock()
 	delete(p.active, r.e.Seq)
 	if r.tags == "" {
@@ -652,6 +663,15 @@ func (p *requestProfiler) handler() http.Handler {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
+		if strings.HasPrefix(r.URL.Path, "/profile/v1/prefill-prefix/") {
+			if p.prefix == nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				json.NewEncoder(w).Encode(map[string]any{"status": "unavailable", "reason": p.prefixUnavailable})
+			} else {
+				p.prefix.serveHTTP(w, r)
+			}
+			return
+		}
 		if r.Method == "GET" && r.URL.Path == "/profile/v1/status" {
 			json.NewEncoder(w).Encode(p.status())
 			return

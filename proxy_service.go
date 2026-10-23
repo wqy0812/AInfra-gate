@@ -119,6 +119,8 @@ func prepareProxyGateway(cfg ProxyConfig, dataRoot string, audit io.Writer, chec
 		settings: policy, backend: *runtime.Backend, admission: true, stop: make(chan struct{}), done: make(chan struct{}), closeDone: make(chan struct{})}
 	// Resolved upstream headers participate in identity without ever being exposed.
 	p.digest = runtimeDigest(map[string]any{"service_id": p.id, "router_id": p.router, "settings": policy, "backend": p.backend, "resolved_headers": p.backend.headers})
+	runtime.PrefillPrefixDirectory = filepath.Join(dataRoot, "prefill-prefix")
+	runtime.ServiceID, runtime.ConfigDigest = p.id, p.digest
 	if checkOnly {
 		p.boot = ""
 		p.admission = false

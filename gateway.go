@@ -58,6 +58,15 @@ func newGateway(c *RuntimeConfig, audit io.Writer) (*Gateway, error) {
 			g.Close()
 			return nil, err
 		}
+		traceDir := c.PrefillPrefixDirectory
+		if traceDir == "" {
+			traceDir = c.Profile.Directory + "-prefill-prefix"
+		}
+		g.profile.prefix, err = newPrefillPrefixStore(traceDir, c.PrefillPrefixMaxDiskBytes, c.RouterID, c.ServiceID, c.ConfigDigest)
+		if err != nil {
+			g.profile.prefixUnavailable = "storage_unavailable"
+			g.audit.Print(`{"event":"prefill_prefix_storage_unavailable"}`)
+		}
 	}
 	if c.SlowRequests.Enabled {
 		g.slow, err = newSlowRequestStore(c.SlowRequests, g.audit)
@@ -286,6 +295,7 @@ func (g *Gateway) chat(w http.ResponseWriter, r *http.Request, entry *auditEntry
 	}
 	if g.profile != nil {
 		pr := g.profile.beginRequest(entry.RequestID, body.stream, entry.Traffic, arrived)
+		pr.e.TestTask = entry.TestTask
 		entry.profile = pr
 		r = r.WithContext(context.WithValue(r.Context(), profileContextKey{}, pr))
 		defer func() { g.profile.end(pr, entry, r.Context().Err() != nil) }()

@@ -15,6 +15,7 @@ import (
 // local configuration file.
 // Deployment paths and the Router snapshot are supplied separately.
 type RuntimeSettings struct {
+	PrefillPrefixMaxDiskBytes int64             `json:"prefill_prefix_max_disk_bytes,omitempty"`
 	StreamCaptureMaxDiskBytes int64             `json:"stream_capture_max_disk_bytes,omitempty"`
 	TimeoutSeconds            float64           `json:"timeout_seconds"`
 	DiscoveryTimeoutSeconds   float64           `json:"discovery_timeout_seconds"`
@@ -31,6 +32,10 @@ type RuntimeConfig struct {
 	RuntimeSettings
 	RouterID string
 	Backend  *Backend
+	// Deployment identity and stable trace path do not enter normalized policy.
+	PrefillPrefixDirectory string
+	ServiceID              string
+	ConfigDigest           string
 }
 
 type PoolConfig struct {
@@ -96,6 +101,9 @@ func parseRuntimeSettings(data []byte) (RuntimeSettings, error) {
 }
 
 func (c *RuntimeConfig) validate() error {
+	if c.PrefillPrefixMaxDiskBytes != 0 && c.PrefillPrefixMaxDiskBytes < 1<<20 {
+		return fmt.Errorf("invalid prefill prefix disk limit")
+	}
 	if c.StreamCaptureMaxDiskBytes < 0 {
 		return fmt.Errorf("invalid stream capture disk limit")
 	}

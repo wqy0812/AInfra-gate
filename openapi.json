@@ -227,6 +227,36 @@
         }
       }
     },
+    "/profile/v1/prefill-prefix/status": {
+      "servers": [{"url": "http://127.0.0.1:18084"}, {"url": "http://127.0.0.1:18082"}],
+      "get": {
+        "security": [],
+        "summary": "Capacity-only Prefill byte-prefix collection status and quality",
+        "responses": {
+          "200": {"description": "Source identity, byte fingerprint algorithm, retained coverage, capacity and lifetime counters"},
+          "503": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/profile/v1/prefill-prefix/export": {
+      "servers": [{"url": "http://127.0.0.1:18084"}, {"url": "http://127.0.0.1:18082"}],
+      "get": {
+        "security": [],
+        "summary": "Stream a fixed snapshot of approximate Prefill input fingerprints",
+        "parameters": [
+          {"name": "start", "in": "query", "required": true, "schema": {"type": "number"}, "description": "Inclusive request arrival Unix seconds"},
+          {"name": "end", "in": "query", "required": true, "schema": {"type": "number"}, "description": "Exclusive request arrival Unix seconds"},
+          {"name": "backend", "in": "query", "schema": {"type": "string", "maxLength": 128}},
+          {"name": "model", "in": "query", "schema": {"type": "string", "maxLength": 256}}
+        ],
+        "responses": {
+          "200": {"description": "NDJSON manifest, input/result records, then complete marker with record checksum; partial historical coverage is explicit", "content": {"application/x-ndjson": {"schema": {"type": "string"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"},
+          "503": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
     "/profile/v1/status": {
       "servers": [
         {

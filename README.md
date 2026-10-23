@@ -55,6 +55,8 @@ GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local go build -mod=vendor -trimpath -o bin/
 
 功能服务业务监听器也提供 `/runtime/v1/status`、`/metrics`、`/profile/v1/*`；`--profile-listen` 默认为 `127.0.0.1:18082`，设为空字符串可关闭独立观测监听器。关闭画像时 `/metrics` 与画像接口返回 503，健康与运行状态仍可查询。画像分析任务是观测查询，不提供配置写入或热更新接口。
 
+画像启用时持续采集 [Prefill 原始输入指纹](docs/PREFILL_PREFIX.md)，提供按时间窗流式导出的 NDJSON；数据按独立容量轮转，输入按 UTF-8 字节近似，供后续自行选择缓存保留时长计算。
+
 切流服务只需要入口 ID、控制密钥和来源 CIDR；密钥由部署环境注入：
 
 ```sh
