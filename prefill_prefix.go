@@ -88,6 +88,7 @@ type prefixState struct {
 type prefixSegment struct {
 	path    string
 	size    int64
+	minimum float64
 	maximum float64
 	readers int
 }
@@ -207,8 +208,8 @@ func newPrefillPrefixStore(root string, maxBytes int64, router, service, cfg str
 		segment := &prefixSegment{path: path, size: info.Size()}
 		meta, _ := os.ReadFile(path + ".meta.json")
 		var saved profileSegmentMeta
-		if json.Unmarshal(meta, &saved) == nil && saved.Bytes == info.Size() && saved.Max > 0 {
-			segment.maximum = saved.Max
+		if json.Unmarshal(meta, &saved) == nil && saved.Bytes == info.Size() && saved.Min > 0 && saved.Max >= saved.Min {
+			segment.minimum, segment.maximum = saved.Min, saved.Max
 		} else {
 			f, err := os.Open(path)
 			if err != nil {
@@ -219,6 +220,9 @@ func newPrefillPrefixStore(root string, maxBytes int64, router, service, cfg str
 			for scanner.Scan() {
 				var record prefixRecord
 				if json.Unmarshal(scanner.Bytes(), &record) == nil && record.ArrivedAt > 0 {
+					if segment.minimum == 0 || record.ArrivedAt < segment.minimum {
+						segment.minimum = record.ArrivedAt
+					}
 					segment.maximum = max(segment.maximum, record.ArrivedAt)
 				} else {
 					s.gapLocked(s.state.Started, now, "invalid_records", 1)
@@ -449,7 +453,7 @@ func (s *prefillPrefixStore) saveSegmentLocked() {
 		return
 	}
 	segment := s.activeSegment
-	data, _ := json.Marshal(profileSegmentMeta{Max: segment.maximum, Bytes: segment.size})
+	data, _ := json.Marshal(profileSegmentMeta{Min: segment.minimum, Max: segment.maximum, Bytes: segment.size})
 	path := segment.path + ".meta.json"
 	if os.WriteFile(path+".tmp", data, 0600) != nil || os.Rename(path+".tmp", path) != nil {
 		s.gapLocked(s.state.Floor, profileNow(), "write_errors", 1)
@@ -510,6 +514,9 @@ func (s *prefillPrefixStore) writeLocked(record prefixRecord, data []byte) {
 	}
 	n, err := s.active.Write(data)
 	s.activeSegment.size += int64(n)
+	if s.activeSegment.minimum == 0 || record.ArrivedAt < s.activeSegment.minimum {
+		s.activeSegment.minimum = record.ArrivedAt
+	}
 	s.activeSegment.maximum = max(s.activeSegment.maximum, record.ArrivedAt)
 	s.stored += int64(n)
 	if err != nil || n != len(data) {
@@ -639,6 +646,9 @@ func (s *prefillPrefixStore) export(w http.ResponseWriter, r *http.Request, star
 	s.exports++
 	files := []snapshot{}
 	for _, segment := range s.segments {
+		if segment.minimum > 0 && (segment.maximum < start || segment.minimum >= end) {
+			continue
+		}
 		segment.readers++
 		files = append(files, snapshot{segment, segment.size})
 	}

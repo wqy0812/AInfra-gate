@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func prefixDrain(t *testing.T, s *prefillPrefixStore) {
 func prefixExport(t *testing.T, s *prefillPrefixStore, start float64) []map[string]any {
 	t.Helper()
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", fmt.Sprintf("/profile/v1/prefill-prefix/export?start=%f&end=%f", start, profileNow()+1), nil)
+	r := httptest.NewRequest("GET", "/profile/v1/prefill-prefix/export?start="+strconv.FormatFloat(start, 'f', -1, 64)+"&end="+strconv.FormatFloat(profileNow()+1, 'f', -1, 64), nil)
 	s.serveHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("export %d %s", w.Code, w.Body.String())
@@ -88,12 +89,73 @@ func TestPrefillPrefixCanonicalAndChain(t *testing.T) {
 	if a.Marks[0] != b.Marks[0] || a.Marks[len(a.Marks)-1].Digest == b.Marks[len(b.Marks)-1].Digest {
 		t.Fatal("prefix or tail mismatch")
 	}
+	// Change only an early byte, keeping every later full block identical.
+	// A digest of an isolated block would incorrectly match the second block.
+	for i, content := range []string{strings.Repeat("a", 3000), "b" + strings.Repeat("a", 2999)} {
+		payload, _ := json.Marshal(map[string]any{"messages": []any{map[string]string{"role": "user", "content": content}}})
+		var row prefixRecord
+		s.fingerprint(&row, payload)
+		if i == 0 {
+			a = row
+		} else if row.Marks[1].Digest == a.Marks[1].Digest {
+			t.Fatal("second block lost preceding context")
+		}
+	}
 	for _, raw := range []string{`[]`, `{"messages":[]}`, `{"messages":[1]}`, `{"prompt":"private"}`} {
 		var row prefixRecord
 		s.fingerprint(&row, []byte(raw))
 		if row.Reason == "" || len(row.Marks) > 0 {
 			t.Fatal(raw, row)
 		}
+	}
+}
+
+type prefixBlockingWriter struct {
+	*httptest.ResponseRecorder
+	started bool
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (w *prefixBlockingWriter) Write(data []byte) (int, error) {
+	if !w.started {
+		w.started = true
+		close(w.ready)
+		<-w.release
+	}
+	return w.ResponseRecorder.Write(data)
+}
+func TestPrefillPrefixExportSnapshotExcludesLaterAppends(t *testing.T) {
+	s := prefixFixture(t)
+	e := profileEvent{ID: "first", Boot: "boot", Seq: 1, Arrived: profileNow(), At: profileNow()}
+	s.input(e, []byte(`{"messages":[{}]}`))
+	prefixDrain(t, s)
+	w := &prefixBlockingWriter{ResponseRecorder: httptest.NewRecorder(), ready: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { s.export(w, httptest.NewRequest("GET", "/", nil), 1, profileNow()+5, "", ""); close(done) }()
+	<-w.ready
+	e.ID = "second"
+	e.Seq = 2
+	e.Arrived = profileNow()
+	e.At = e.Arrived
+	s.input(e, []byte(`{"messages":[{}]}`))
+	prefixDrain(t, s)
+	close(w.release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("export did not finish")
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"request_id":"first"`)) || bytes.Contains(w.Body.Bytes(), []byte(`"request_id":"second"`)) {
+		t.Fatal("export read beyond fixed size")
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"kind":"complete"`)) {
+		t.Fatal("completion marker missing")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exports != 0 || s.segments[0].readers != 0 {
+		t.Fatal("snapshot pins leaked")
 	}
 }
 func TestPrefillPrefixLongInputLifecycleAndRestart(t *testing.T) {
@@ -320,4 +382,29 @@ func TestPrefillPrefixEnqueueDoesNotWaitForStorage(t *testing.T) {
 		t.Fatal("request enqueue waited for storage")
 	}
 	prefixDrain(t, s)
+}
+
+func TestPrefillPrefixExportSkipsSegmentsOutsideArrivalWindow(t *testing.T) {
+	s := prefixFixture(t)
+	now := profileNow()
+	e := profileEvent{ID: "old", Boot: "b", Seq: 1, Arrived: now - 120, At: now}
+	s.input(e, []byte(`{"messages":[{}]}`))
+	prefixDrain(t, s)
+	s.mu.Lock()
+	s.closeActiveLocked()
+	old := s.segments[0].path
+	s.mu.Unlock()
+	e.ID = "recent"
+	e.Seq = 2
+	e.Arrived = now - 60
+	s.input(e, []byte(`{"messages":[{}]}`))
+	prefixDrain(t, s)
+	// This segment cannot contribute to the window and must never be opened.
+	if err := os.Remove(old); err != nil {
+		t.Fatal(err)
+	}
+	rows := prefixExport(t, s, now-90)
+	if len(rows) != 3 || rows[1]["request_id"] != "recent" || rows[2]["complete"] != true {
+		t.Fatal(rows)
+	}
 }
