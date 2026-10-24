@@ -1,5 +1,35 @@
 # 当前部署身份
 
+## 2026-10-24 Prefill 导出修复已合入 main 并发布
+
+北京时间 18:33:41 完成恢复后的在线核验。Prefill 分支及修复已快进合入 main 并推送，实际 proxy 构建源码为 `d013132e110aa89344b1dbafac1243125cc97d45`。修复长导出继承观测服务 10 秒写入截止时间而中断，以及待写丢弃区间暂时不可见、误报数据完整的问题。构建使用 Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath，vcs.modified=false。
+
+| 架构 / 实际更新节点 | aigate-proxy SHA-256 |
+| --- | --- |
+| linux/amd64：dcu1、xpu1、A3-gate | `afc8a01abaedc208635c7bb1391b8040167e39a4c841b3910714cbb39daaf06a` |
+| linux/arm64：A3-3、A3-5 | `34f628a0eab1cb1961d18b020ab47b3f1d9ae906669d100e14c5e689e3348fa2` |
+
+五个实际进程的二进制摘要、配置文件摘要、settings/backend、Router/功能服务身份、启动参数、环境和原 key_id 均核对通过，采集状态 collecting，画像 write_errors=0。XPU 仅更新 proxy Deployment 的 binary hostPath，Recreate 后恢复 1/1。A3-gate 仅替换 proxy，旧容器 `a3-aigate-proxy-before-prefill-prefix-fix-20261024` 停止并禁止自启；规范化 OCI 参数保持。DCU、A3-3、A3-5 沿用原 systemd unit，两个本地服务发布根设为 0711，私有快照仍为 0700/0600。switch、模型服务、缓存、固定执行/判题/回放镜像未更新，独立 Motor 测试 proxy 未触碰。
+
+维护按进入窗口时的实际绑定恢复：DCU、XPU、A3、a3-34-local、a3-56-local 的 revision 为 64、36、76、5、5，admission 均 true。后两个入口在发布前即绑定 A3-1/2 Router `4cc8257f0fec429180d14f220ab816ef`，本轮未重新绑定。四条录制计划恢复原值（两条 XPU 启用、两条 DCU 停用），发布 owner 的锁已释放，原 maintenance=false。正常停止并保留结果的 DCU 准确率任务 `f1e0753f3f86459fbae2ff54c0f6eb6d` 已恢复 running，保留其正常任务占用锁。
+
+平台逐项核对现有 Web 的 130 个生产文件，无差异；配套 code-eval main 为 `7841437f566e34ce68157f1dbe104e153bb5e58e`，修复阶段仅增加测试，无需替换 Web/engine。通过平台下载五个来源最近一小时的 NDJSON，结束标记、来源、记录计数和 SHA-256 均通过，invalid=0。DCU、XPU 的 data_complete=true；A3-3/4、A3-5/6 有既存 input_not_prepared，data_complete=false。A3-1/2 在本轮第一次停止旧容器时新增 unclean_restart=1：发现其 containerd 停止信号标签继承 SIGQUIT，已改为 SIGTERM，随后正常停止退出码为 0，再启动未增加该计数。相关历史缺口如实保留，A3-1/2 此窗口 data_complete=false，不能解释为下载失败或数据已补齐。维护脚本同步显式设置 SIGTERM，相关 4 项测试通过。
+
+本轮复审 Go 全量测试、vet、14 项 Prefill race 回归以及平台 API 24 项通过；真实 TCP 慢读 16.9 MB 导出持续约 27 秒仍取得完整结束标记及正确校验和，真实观测 Handler 的 11 秒回归也通过。新实现的核心回归在旧实现覆盖下按预期失败。没有执行新模型接入或新增真实模型合成请求。
+
+新增服务器发布根如下；五个 proxy 根含 bin/private，test1 根含 exports 和受限 private/platform-window，继续使用原指纹数据目录。
+
+| 节点 | 新增发布根 |
+| --- | --- |
+| dcu1 | `/data4/aigate/releases/prefill-prefix-fix-20261024/` |
+| xpu1 | `/var/lib/ai-gate/releases/prefill-prefix-fix-20261024/` |
+| A3-gate | `/var/lib/ai-gate/releases/prefill-prefix-fix-20261024/` |
+| A3-3 | `/var/lib/aigate/releases/prefill-prefix-fix-20261024/` |
+| A3-5 | `/var/lib/aigate/releases/prefill-prefix-fix-20261024/` |
+| test1 | `/data2/code-eval/releases/prefill-prefix-fix-20261024/` |
+
+本地发布材料与脱敏回执位于原独立工作树 `.worktrees/aigate-prefill-prefix/deploy/prefill-prefix-fix-20261024/`，汇总为 verification.json，逐节点为 evidence/。配置和进程环境原文仅保留在服务器 private 中。以下 00:19 的记录为首版部署历史，其源码、绑定版本及未推送状态不代表当前状态。
+
 ## 2026-10-24 Prefill 原始指纹持续采集
 
 北京时间 00:19:56 完成五套在线 proxy 的最终核验，并恢复原 `maintenance=false`。源码 `411bc900e8d5163222bc7bc00b660da6c37b5e7a`，包含持续采集、容量轮转、流式导出和按到达时间筛选分段。Go 1.27.1、CGO_ENABLED=0、离线显式 vendor、trimpath、vcs.modified=false 构建。实际进程摘要如下：

@@ -74,6 +74,10 @@ if args.action == 'stop':
             command(*nerdctl, 'update', '--restart', 'no', name)
             command('ctr', '-n', 'ai-gateway', 'containers', 'label', obj['Id'],
                     'containerd.io/restart.status=stopped')
+        # Base images can carry SIGQUIT, which makes Go exit without draining
+        # or closing its persistent stores. nerdctl reads this container label.
+        command('ctr', '-n', 'ai-gateway', 'containers', 'label', obj['Id'],
+                'io.containerd.image.config.stop-signal=SIGTERM')
         command(*nerdctl, 'stop', '--time', '3720', name)
     elif args.environment == 'ppu':
         command('ctr', '-n', 'ai-gateway', 'containers', 'label', obj['Id'],

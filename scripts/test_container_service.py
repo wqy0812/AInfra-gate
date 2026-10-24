@@ -9,11 +9,11 @@ from unittest.mock import patch
 
 
 class ContainerServiceTest(unittest.TestCase):
-    def run_stop(self, status):
+    def run_stop(self, status, environment='ppu', role='switch'):
         commands = []
         self.commands = commands
         obj = {'Id': 'container-test', 'State': {'Status': 'running', 'Pid': 123},
-               'Config': {'Labels': {}}}
+               'Config': {'Labels': {'io.containerd.image.config.stop-signal': 'SIGQUIT'}}}
 
         def command(*argv, **kwargs):
             commands.append(list(argv[0]))
@@ -21,10 +21,12 @@ class ContainerServiceTest(unittest.TestCase):
 
         def read_bytes(path):
             if path.name == 'cmdline':
+                if role == 'proxy':
+                    return b'aigate-proxy\x00--listen\x00127.0.0.1:18084\x00'
                 return b'aigate-switch\x00--control-listen\x00127.0.0.1:18083\x00'
             return b'AIGATE_CONTROL_KEY=local-test-only\0'
 
-        with patch.object(sys, 'argv', ['container-service.py', 'ppu', 'stop', 'switch']), \
+        with patch.object(sys, 'argv', ['container-service.py', environment, 'stop', role]), \
              patch('subprocess.check_output', side_effect=command), \
              patch.object(pathlib.Path, 'read_bytes', read_bytes), \
              patch('http.client.HTTPConnection') as connection, \
@@ -44,7 +46,14 @@ class ContainerServiceTest(unittest.TestCase):
                 commands = self.run_stop(self.idle_status(recording))
                 self.assertEqual(commands[1][3:5], ['update', '--restart'])
                 self.assertIn('containerd.io/restart.status=stopped', commands[2])
-                self.assertEqual(commands[3][3:], ['stop', '--time', '3720', 'ppu-aigate-switch'])
+                self.assertIn('io.containerd.image.config.stop-signal=SIGTERM', commands[3])
+                self.assertEqual(commands[4][3:], ['stop', '--time', '3720', 'ppu-aigate-switch'])
+
+    def test_a3_proxy_overrides_inherited_quit_before_stop(self):
+        commands = self.run_stop({'counts': {'business': 0, 'streams': 0}}, 'a3', 'proxy')
+        self.assertEqual(commands[1], ['ctr', '-n', 'ai-gateway', 'containers', 'label',
+                                       'container-test', 'io.containerd.image.config.stop-signal=SIGTERM'])
+        self.assertEqual(commands[2][3:], ['stop', '--time', '3720', 'a3-aigate-proxy'])
 
     def test_busy_switch_is_not_stopped(self):
         states = [self.idle_status({'sessions': [{'id': 'record-test'}], 'active_records': 0}),
