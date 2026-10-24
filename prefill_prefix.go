@@ -5,12 +5,14 @@ package aigate
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -28,6 +30,8 @@ const prefixAlgorithm = "hmac-sha256-chain-utf8-json-v1"
 const prefixBlockBytes = 1024
 const prefixQueueBytes int64 = 64 << 20
 const prefixRecordLimit = 8 << 20
+const prefixExportBufferBytes = 64 << 10
+const prefixExportWriteTimeout = time.Minute
 
 type prefixMark struct {
 	EndBytes int    `json:"end_bytes"`
@@ -309,14 +313,17 @@ func (s *prefillPrefixStore) dropLocked(arrived float64) {
 	s.pendingDrop.Count++
 }
 func (s *prefillPrefixStore) flushDrops() {
+	// Export snapshots hold mu before reading queue state. Keep a loss visible
+	// in pendingDrop until we can publish it to Gaps under that same mutex.
+	// Enqueue only takes queueMu, so storage cannot block business requests.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.queueMu.Lock()
 	gap := s.pendingDrop
 	s.pendingDrop = prefixGap{}
 	s.queueMu.Unlock()
 	if gap.Count != 0 {
-		s.mu.Lock()
 		s.gapLocked(gap.Start, gap.End, "queue_dropped", gap.Count)
-		s.mu.Unlock()
 	}
 }
 func (s *prefillPrefixStore) queueStatus() (int64, uint64) {
@@ -629,7 +636,61 @@ func (s *prefillPrefixStore) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.export(w, r, start, end, backend, model)
 }
 
+// Bound each network write/flush, rather than the entire retained-data export.
+// The buffer above this writer batches small records; even a large JSONL record
+// reaches the transport in bounded chunks with a renewed idle deadline.
+type prefixExportWriter struct {
+	writer     http.ResponseWriter
+	controller *http.ResponseController
+	ctx        context.Context
+	timeout    time.Duration
+}
+
+func (w *prefixExportWriter) refreshDeadline() error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	err := w.controller.SetWriteDeadline(time.Now().Add(w.timeout))
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil // In-memory/test writers have no network deadline.
+	}
+	return err
+}
+
+func (w *prefixExportWriter) Write(data []byte) (written int, err error) {
+	for len(data) > 0 {
+		if err = w.refreshDeadline(); err != nil {
+			return written, err
+		}
+		size := min(len(data), prefixExportBufferBytes)
+		n, err := w.writer.Write(data[:size])
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n != size {
+			return written, io.ErrShortWrite
+		}
+		if err = w.controller.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return written, err
+		}
+		data = data[size:]
+	}
+	return written, nil
+}
+
 func (s *prefillPrefixStore) export(w http.ResponseWriter, r *http.Request, start, end float64, backend, model string) {
+	controller := http.NewResponseController(w)
+	output := &prefixExportWriter{writer: w, controller: controller, ctx: r.Context(), timeout: prefixExportWriteTimeout}
+	if output.refreshDeadline() != nil {
+		return
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		// An empty GET has no upload to time out. Leave disconnect detection
+		// active without letting the observation listener's short read deadline
+		// cancel a healthy long response through net/http's background read.
+		_ = controller.SetReadDeadline(time.Time{})
+	}
 	type snapshot struct {
 		segment *prefixSegment
 		size    int64
@@ -677,12 +738,16 @@ func (s *prefillPrefixStore) export(w http.ResponseWriter, r *http.Request, star
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Content-Disposition", `attachment; filename="prefill-prefix.ndjson"`)
 	w.Header().Set("Cache-Control", "no-store")
-	enc := json.NewEncoder(w)
+	buffer := bufio.NewWriterSize(output, prefixExportBufferBytes)
+	enc := json.NewEncoder(buffer)
 	if enc.Encode(map[string]any{"kind": "manifest", "schema": prefixSchema, "source": status,
 		"start": start, "end": end, "snapshot_at": asof, "backend": backend, "model": model,
 		"window_end_after_snapshot": end > asof,
 		"window_partially_expired":  partial, "gaps": gaps, "queued_bytes_at_snapshot": queued,
 		"complete": false, "completion_marker_required": true, "pending_queue_drops": pendingDrops}) != nil {
+		return
+	}
+	if buffer.Flush() != nil {
 		return
 	}
 	checksum := sha256.New()
@@ -712,7 +777,7 @@ func (s *prefillPrefixStore) export(w http.ResponseWriter, r *http.Request, star
 				// Files are append ordered, not arrival ordered. Consumers sort by
 				// arrived_at, boot_id, sequence and join result records independently.
 				line = append(append([]byte{}, line...), '\n')
-				if _, err := w.Write(line); err != nil {
+				if _, err := buffer.Write(line); err != nil {
 					return err
 				}
 				checksum.Write(line)
@@ -724,8 +789,14 @@ func (s *prefillPrefixStore) export(w http.ResponseWriter, r *http.Request, star
 			return
 		} // no completion marker on read failure
 	}
-	enc.Encode(map[string]any{"kind": "complete", "schema": prefixSchema, "complete": true,
+	// Surface buffered transport errors before appending the completion marker.
+	if buffer.Flush() != nil || r.Context().Err() != nil {
+		return
+	}
+	if enc.Encode(map[string]any{"kind": "complete", "schema": prefixSchema, "complete": true,
 		"data_complete":            !partial && end <= asof && len(gaps) == 0 && queued == 0 && pendingDrops == 0 && counts["invalid"] == 0,
 		"window_partially_expired": partial, "counts": counts, "records_sha256": hex.EncodeToString(checksum.Sum(nil)),
-		"results_may_be_pending": true})
+		"results_may_be_pending": true}) == nil {
+		_ = buffer.Flush()
+	}
 }
